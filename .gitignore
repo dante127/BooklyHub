@@ -1,0 +1,40 @@
+## .NET Core
+bin/
+obj/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.dbmdl
+*.jfm
+*.pfx
+
+## Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+## Visual Studio / Rider / VSCode
+.vs/
+.idea/
+.vscode/
+*.DotSettings.user
+
+## Test results
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+## Docker
+.dockerignore

@@ -1,0 +1,65 @@
+name: BooklyHub CI Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-test:
+    name: Build & Verify (Unit + Integration Tests)
+    runs-on: ubuntu-latest
+
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Your_Strong_Password123!"
+          MSSQL_PID: "Developer"
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Your_Strong_Password123!' -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup .NET 10 SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Restore NuGet Cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+
+    - name: Restore Dependencies
+      run: dotnet restore BooklyHub.sln
+
+    - name: Build Solution
+      run: dotnet build BooklyHub.sln -c Release --no-restore
+
+    - name: Run Unit Tests
+      run: dotnet test tests/BooklyHub.UnitTests/BooklyHub.UnitTests.csproj -c Release --no-build --verbosity normal --logger "trx;LogFileName=unit-tests.trx"
+
+    - name: Run Integration Tests (Real SQL Server)
+      env:
+        ConnectionStrings__DefaultConnection: "Server=localhost,1433;Database=BooklyHubTestDb;User Id=sa;Password=Your_Strong_Password123!;TrustServerCertificate=True;MultipleActiveResultSets=True;"
+      run: dotnet test tests/BooklyHub.IntegrationTests/BooklyHub.IntegrationTests.csproj -c Release --no-build --verbosity normal --logger "trx;LogFileName=integration-tests.trx"
+
+    - name: Publish Test Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: '**/TestResults/*.trx'
