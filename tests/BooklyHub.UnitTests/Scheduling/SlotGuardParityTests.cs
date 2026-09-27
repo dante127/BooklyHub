@@ -449,7 +449,8 @@ public class SlotGuardParityTests
                 scenario.TenantId, scenario.LocationId, scenario.ServiceId, scenario.StaffId,
                 candidates[i].StartAtUtc, candidates[i].EndAtUtc);
 
-            single.Should().Be(bulk[i], $"slot {candidates[i].StartAtUtc:yyyy-MM-dd HH:mm} must be judged identically in bulk");
+            single.Reason.Should().Be(bulk[i].Reason, $"slot {candidates[i].StartAtUtc:yyyy-MM-dd HH:mm} must be judged identically in bulk");
+            single.ResourceIds.Should().Equal(bulk[i].ResourceIds, $"slot {candidates[i].StartAtUtc:yyyy-MM-dd HH:mm} must be allocated the same resources in bulk");
         }
     }
 
@@ -492,5 +493,218 @@ public class SlotGuardParityTests
             Guid.NewGuid(), scenario.LocationId, scenario.ServiceId, scenario.StaffId,
             scenario.Utc(9), scenario.Utc(9, 30));
         unknownTenant.Reason.Should().Be(SlotUnavailableReason.Closed);
+    }
+
+    private static Guid SeedRoom(
+        ApplicationDbContext db,
+        Scenario scenario,
+        string name,
+        int quantityRequired = 1)
+    {
+        var groupId = Guid.NewGuid();
+        var roomId = Guid.NewGuid();
+
+        db.ResourceGroups.Add(new ResourceGroup { Id = groupId, TenantId = scenario.TenantId, Name = "Rooms" });
+        db.Resources.Add(new Resource
+        {
+            Id = roomId,
+            TenantId = scenario.TenantId,
+            ResourceGroupId = groupId,
+            LocationId = scenario.LocationId,
+            Name = name
+        });
+
+        db.Services.Local.Single(x => x.Id == scenario.ServiceId).ResourceRequirements.Add(new ServiceResourceRequirement
+        {
+            TenantId = scenario.TenantId,
+            ServiceId = scenario.ServiceId,
+            ResourceGroupId = groupId,
+            QuantityRequired = quantityRequired
+        });
+
+        return roomId;
+    }
+
+    private static Appointment AppointmentHoldingResource(
+        ApplicationDbContext db,
+        Scenario scenario,
+        int startHour,
+        Guid resourceId,
+        AppointmentStatus status = AppointmentStatus.Confirmed,
+        Guid? staffId = null)
+    {
+        var start = scenario.Utc(startHour);
+
+        var appointment = Appointment.Create(
+            scenario.TenantId,
+            scenario.LocationId,
+            scenario.ServiceId,
+            staffId ?? scenario.StaffId,
+            Guid.NewGuid(),
+            start,
+            start.AddMinutes(30),
+            30,
+            90.00m);
+
+        appointment.TransitionTo(status);
+        appointment.AppointmentResources.Add(new AppointmentResource
+        {
+            TenantId = scenario.TenantId,
+            AppointmentId = appointment.Id,
+            ResourceId = resourceId
+        });
+
+        db.Appointments.Add(appointment);
+        return appointment;
+    }
+
+    [Fact]
+    public async Task CheckSlot_RescheduleIntoOverlappingSlot_MustNotBeBlockedByItsOwnRoom()
+    {
+        SetClock(new DateTime(2026, 10, 5, 6, 0, 0, DateTimeKind.Utc));
+
+        Guid roomId = Guid.Empty;
+        Appointment? moving = null;
+
+        var scenario = await SeedAsync((db, s) =>
+        {
+            roomId = SeedRoom(db, s, "Room 1");
+            moving = AppointmentHoldingResource(db, s, 10, roomId);
+        });
+
+        var service = scenario.CreateService(_clock, _currentUser);
+
+        // The location has one room and this appointment holds it 10:00-10:30. Moving it to 10:15 keeps
+        // the room, so the overlap it creates with itself must not be read as somebody else's booking.
+        // The staff pass already honoured the exclusion, so drop it from the resource pass and this same
+        // call comes back ResourceUnavailable: the appointment competes with itself for its own room.
+        var moved = await service.CheckSlotAsync(
+            scenario.TenantId, scenario.LocationId, scenario.ServiceId, scenario.StaffId,
+            scenario.Utc(10, 15), scenario.Utc(10, 45),
+            excludeAppointmentId: moving!.Id);
+
+        moved.IsAvailable.Should().BeTrue(moved.Message);
+        moved.ResourceIds.Should().Equal(roomId);
+    }
+
+    [Fact]
+    public async Task CheckSlot_MustHandBackTheResourcesTheBookingHasToPersist()
+    {
+        SetClock(new DateTime(2026, 10, 5, 6, 0, 0, DateTimeKind.Utc));
+
+        Guid roomA = Guid.Empty;
+        Guid roomB = Guid.Empty;
+        var groupId = Guid.NewGuid();
+
+        var scenario = await SeedAsync((db, s) =>
+        {
+            db.ResourceGroups.Add(new ResourceGroup { Id = groupId, TenantId = s.TenantId, Name = "Rooms" });
+
+            roomA = Guid.NewGuid();
+            roomB = Guid.NewGuid();
+
+            db.Resources.Add(new Resource { Id = roomA, TenantId = s.TenantId, ResourceGroupId = groupId, LocationId = s.LocationId, Name = "Room A" });
+            db.Resources.Add(new Resource { Id = roomB, TenantId = s.TenantId, ResourceGroupId = groupId, LocationId = s.LocationId, Name = "Room B" });
+
+            db.Services.Local.Single(x => x.Id == s.ServiceId).ResourceRequirements.Add(new ServiceResourceRequirement
+            {
+                TenantId = s.TenantId,
+                ServiceId = s.ServiceId,
+                ResourceGroupId = groupId,
+                QuantityRequired = 2
+            });
+        });
+
+        var service = scenario.CreateService(_clock, _currentUser);
+
+        var result = await service.CheckSlotAsync(
+            scenario.TenantId, scenario.LocationId, scenario.ServiceId, scenario.StaffId,
+            scenario.Utc(9), scenario.Utc(9, 30));
+
+        result.IsAvailable.Should().BeTrue(result.Message);
+        result.ResourceIds.Should().BeEquivalentTo(new[] { roomA, roomB });
+    }
+
+    [Fact]
+    public async Task CheckSlot_ResourceBusyForAnotherStaff_MustBeRefusedForThisOne()
+    {
+        SetClock(new DateTime(2026, 10, 5, 6, 0, 0, DateTimeKind.Utc));
+
+        Guid roomId = Guid.Empty;
+
+        var scenario = await SeedAsync((db, s) =>
+        {
+            roomId = SeedRoom(db, s, "Room 1");
+
+            // A different staff member holds the location's only room at 10:00. This staff member is
+            // free, so only the location-wide resource rule can refuse the slot.
+            AppointmentHoldingResource(db, s, 10, roomId, staffId: Guid.NewGuid());
+        });
+
+        var service = scenario.CreateService(_clock, _currentUser);
+
+        var result = await service.CheckSlotAsync(
+            scenario.TenantId, scenario.LocationId, scenario.ServiceId, scenario.StaffId,
+            scenario.Utc(10), scenario.Utc(10, 30));
+
+        result.Reason.Should().Be(SlotUnavailableReason.ResourceUnavailable);
+
+        var preview = await service.GetAvailabilityAsync(new GetAvailabilityQuery(
+            scenario.TenantId, scenario.LocationId, scenario.ServiceId, scenario.StaffId, scenario.Date));
+        preview.Slots.Should().NotContain(slot => slot.StartAtUtc == scenario.Utc(10),
+            "the preview must not offer a slot whose room is already taken");
+    }
+
+    [Fact]
+    public async Task CheckSlot_ResourceReleasedByCancelledAppointment_MustBeBookable()
+    {
+        SetClock(new DateTime(2026, 10, 5, 6, 0, 0, DateTimeKind.Utc));
+
+        Guid roomId = Guid.Empty;
+
+        var scenario = await SeedAsync((db, s) =>
+        {
+            roomId = SeedRoom(db, s, "Room 1");
+            AppointmentHoldingResource(db, s, 10, roomId, AppointmentStatus.Cancelled);
+        });
+
+        var service = scenario.CreateService(_clock, _currentUser);
+
+        var result = await service.CheckSlotAsync(
+            scenario.TenantId, scenario.LocationId, scenario.ServiceId, scenario.StaffId,
+            scenario.Utc(10), scenario.Utc(10, 30));
+
+        result.IsAvailable.Should().BeTrue(result.Message);
+        result.ResourceIds.Should().Equal(roomId);
+    }
+
+    [Fact]
+    public async Task CheckSlots_OverlappingCandidates_MustOnlyReserveTheSlotThatComesFirst()
+    {
+        SetClock(new DateTime(2026, 10, 5, 6, 0, 0, DateTimeKind.Utc));
+        var scenario = await SeedAsync();
+        var service = scenario.CreateService(_clock, _currentUser);
+
+        var checks = await service.CheckSlotsAsync(
+            scenario.TenantId, scenario.LocationId, scenario.ServiceId, scenario.StaffId,
+            [
+                new SlotCandidate(scenario.Utc(14), scenario.Utc(14, 30)),
+                new SlotCandidate(scenario.Utc(14, 15), scenario.Utc(14, 45))
+            ]);
+
+        checks[0].IsAvailable.Should().BeTrue(checks[0].Message);
+        checks[1].Reason.Should().Be(SlotUnavailableReason.StaffBusy,
+            "one request must never book the same staff member twice over");
+
+        // The batch is judged in time order but answered by input index.
+        var reversed = await service.CheckSlotsAsync(
+            scenario.TenantId, scenario.LocationId, scenario.ServiceId, scenario.StaffId,
+            [
+                new SlotCandidate(scenario.Utc(14, 15), scenario.Utc(14, 45)),
+                new SlotCandidate(scenario.Utc(14), scenario.Utc(14, 30))
+            ]);
+
+        reversed[1].IsAvailable.Should().BeTrue(reversed[1].Message);
+        reversed[0].Reason.Should().Be(SlotUnavailableReason.StaffBusy);
     }
 }

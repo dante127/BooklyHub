@@ -181,7 +181,7 @@ public class AvailabilityService : IAvailabilityService
             tenantId, locationId, serviceId, staffId,
             [new SlotCandidate(startAtUtc, endAtUtc)], excludeAppointmentId, cancellationToken);
 
-        return new SlotCheckResult(evaluations[0].Reason);
+        return new SlotCheckResult(evaluations[0].Reason, evaluations[0].ResourceIds ?? []);
     }
 
     public async Task<IReadOnlyList<SlotCheckResult>> CheckSlotsAsync(
@@ -196,7 +196,7 @@ public class AvailabilityService : IAvailabilityService
         var evaluations = await EvaluateAsync(
             tenantId, locationId, serviceId, staffId, candidates, excludeAppointmentId, cancellationToken);
 
-        return evaluations.Select(e => new SlotCheckResult(e.Reason)).ToList();
+        return evaluations.Select(e => new SlotCheckResult(e.Reason, e.ResourceIds ?? [])).ToList();
     }
 
     private async Task<IReadOnlyList<SlotEvaluation>> EvaluateAsync(
@@ -268,11 +268,38 @@ public class AvailabilityService : IAvailabilityService
         var maxBookingTimeUtc = _clock.UtcNow.AddDays(context.MaxAdvanceDays);
         var resourcesByGroup = await LoadResourcesByGroupAsync(context, ct);
 
-        foreach (var (candidate, index) in pending)
+        // The calendar only holds committed bookings, so a batch that was not written yet is invisible to
+        // its own later candidates. Each accepted candidate is replayed as a synthetic occupancy, in time
+        // order, so one request can never reserve the same minute or the same room twice. Guid.Empty
+        // stands in for the appointment id because no caller may exclude a slot it has not booked.
+        var reservations = new List<Occupancy>();
+
+        foreach (var (candidate, index) in pending
+                     .OrderBy(x => x.candidate.StartAtUtc)
+                     .ThenBy(x => x.index))
         {
-            evaluations[index] = Classify(
-                context, calendar, staffId, candidate.StartAtUtc, candidate.EndAtUtc,
-                minBookingTimeUtc, maxBookingTimeUtc, excludeAppointmentId, resourcesByGroup);
+            var evaluation = Classify(
+                context,
+                calendar with { Occupancy = [.. calendar.Occupancy, .. reservations] },
+                staffId,
+                candidate.StartAtUtc,
+                candidate.EndAtUtc,
+                minBookingTimeUtc,
+                maxBookingTimeUtc,
+                excludeAppointmentId,
+                resourcesByGroup);
+
+            evaluations[index] = evaluation;
+
+            if (evaluation.Reason is null)
+            {
+                reservations.Add(new Occupancy(
+                    Guid.Empty,
+                    staffId,
+                    candidate.StartAtUtc,
+                    candidate.EndAtUtc,
+                    evaluation.ResourceIds ?? []));
+            }
         }
 
         return evaluations.Select(e => e!).ToList();
@@ -349,7 +376,8 @@ public class AvailabilityService : IAvailabilityService
             return SlotEvaluation.Rejected(SlotUnavailableReason.StaffNotAvailable);
         }
 
-        var allocatedResourceIds = TryAllocateResources(context, calendar.Occupancy, core.StartUtc, core.EndUtc, resourcesByGroup);
+        var allocatedResourceIds = TryAllocateResources(
+            context, calendar.Occupancy, core.StartUtc, core.EndUtc, excludeAppointmentId, resourcesByGroup);
 
         return allocatedResourceIds is null
             ? SlotEvaluation.Rejected(SlotUnavailableReason.ResourceUnavailable)
@@ -584,11 +612,18 @@ public class AvailabilityService : IAvailabilityService
             .ToDictionary(g => g.Key, g => g.Select(r => r.Id).ToList());
     }
 
+    /// <summary>
+    /// Picks one free resource per required group, or null when the location cannot supply them. Existing
+    /// bookings reserve their resources for their core span only: buffers belong to the staff member, not
+    /// the room. <paramref name="excludeAppointmentId"/> is dropped just like in the staff check, so a
+    /// reschedule is never blocked by the room it already holds.
+    /// </summary>
     private static List<Guid>? TryAllocateResources(
         BookingContext context,
         IReadOnlyCollection<Occupancy> occupancy,
         DateTime startUtc,
         DateTime endUtc,
+        Guid? excludeAppointmentId,
         Dictionary<Guid, List<Guid>> resourcesByGroup)
     {
         if (context.ResourceRequirements.Count == 0)
@@ -597,7 +632,7 @@ public class AvailabilityService : IAvailabilityService
         }
 
         var busyResourceIds = occupancy
-            .Where(a => a.StartUtc < endUtc && a.EndUtc > startUtc)
+            .Where(a => a.AppointmentId != excludeAppointmentId && a.StartUtc < endUtc && a.EndUtc > startUtc)
             .SelectMany(a => a.ResourceIds)
             .ToHashSet();
 

@@ -2,6 +2,7 @@ using BooklyHub.Application.Appointments.Dtos;
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Application.Scheduling;
 using BooklyHub.Domain.Entities.Appointments;
+using BooklyHub.Domain.Entities.Resources;
 using BooklyHub.Domain.Enums;
 using BooklyHub.Domain.Exceptions;
 using FluentValidation;
@@ -125,9 +126,16 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
             })
             .ToList();
 
+        ValidateOccurrences(targetDates, request.StartTimeOfDay, durationMinutes);
+
         var recurringApptId = Guid.NewGuid();
+
         var (createdAppointments, skippedCount) = await _db.ExecuteInTransactionAsync(async () =>
         {
+            // Lock order is location then staff, everywhere a booking is written.
+            await _db.AcquireLocationBookingLockAsync(request.TenantId, request.LocationId, cancellationToken);
+            await _db.AcquireStaffLockAsync(request.StaffId, request.TenantId, cancellationToken);
+
             var recurringAppt = new RecurringAppointment
             {
                 Id = recurringApptId,
@@ -141,8 +149,6 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
             };
 
             _db.RecurringAppointments.Add(recurringAppt);
-
-            await _db.AcquireStaffLockAsync(request.StaffId, request.TenantId, cancellationToken);
 
             // Every occurrence is judged in one pass: the guard loads the calendar once for the whole span.
             var slotChecks = await _availabilityService.CheckSlotsAsync(
@@ -191,6 +197,16 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
 
                 appt.TransitionTo(AppointmentStatus.Confirmed, "Confirmed recurring appointment", _currentUser.UserId?.ToString());
 
+                foreach (var resourceId in slotCheck.ResourceIds)
+                {
+                    appt.AppointmentResources.Add(new AppointmentResource
+                    {
+                        TenantId = request.TenantId,
+                        AppointmentId = appt.Id,
+                        ResourceId = resourceId
+                    });
+                }
+
                 created.Add(appt);
                 _db.Appointments.Add(appt);
             }
@@ -220,7 +236,7 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
             a.Status,
             a.Notes,
             a.CancellationReason,
-            [],
+            a.AppointmentResources.Select(ar => ar.ResourceId).ToList(),
             a.CreatedAtUtc)).ToList();
 
         return new RecurringAppointmentResultDto(
@@ -229,6 +245,39 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
             createdAppointments.Count,
             skippedCount,
             dtos);
+    }
+
+    /// <summary>
+    /// The guard reports an occupied slot as a conflict, so occurrences that overlap each other would be
+    /// silently skipped under SkipConflicts or blamed on an existing appointment under AbortSeries. The
+    /// pattern itself is what is unschedulable, so it is rejected here with the dates that collide.
+    /// </summary>
+    private static void ValidateOccurrences(
+        List<DateOnly> dates,
+        TimeOnly timeOfDay,
+        int durationMinutes)
+    {
+        var spans = dates
+            .Select(date => (date.ToDateTime(timeOfDay), date.ToDateTime(timeOfDay).AddMinutes(durationMinutes)))
+            .ToList();
+
+        var colliding = new List<string>();
+
+        for (var i = 1; i < spans.Count; i++)
+        {
+            if (spans[i - 1].Item2 > spans[i].Item1)
+            {
+                colliding.Add($"{dates[i - 1]:yyyy-MM-dd} and {dates[i]:yyyy-MM-dd}");
+            }
+        }
+
+        if (colliding.Count > 0)
+        {
+            throw new BusinessRuleValidationException(
+                "RecurrenceOccurrencesOverlap",
+                $"This recurrence places appointments on top of each other because the service duration " +
+                $"({durationMinutes} minutes) is longer than the gap between occurrences: {string.Join("; ", colliding)}.");
+        }
     }
 
     public static List<DateOnly> GenerateDates(

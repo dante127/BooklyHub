@@ -253,15 +253,24 @@ public class ApplicationDbContext : DbContext, IApplicationDbContext
         });
     }
 
-    public async Task AcquireStaffLockAsync(Guid staffId, Guid tenantId, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Serializes every booking write inside one location. Resource groups are shared by all staff at a
+    /// location, so a staff-scoped lock leaves the last room free for two concurrent bookings by two
+    /// different staff members. Take this lock before AcquireStaffLockAsync, never after.
+    /// </summary>
+    public Task AcquireLocationBookingLockAsync(Guid tenantId, Guid locationId, CancellationToken cancellationToken = default)
+        => ExecuteAppLockAsync($"Booking_Location_{tenantId:N}_{locationId:N}", cancellationToken);
+
+    public Task AcquireStaffLockAsync(Guid staffId, Guid tenantId, CancellationToken cancellationToken = default)
+        => ExecuteAppLockAsync($"Booking_Staff_{tenantId:N}_{staffId:N}", cancellationToken);
+
+    private async Task ExecuteAppLockAsync(string lockKey, CancellationToken cancellationToken)
     {
-        if (Database.IsSqlServer())
-        {
-            var lockKey = $"Booking_Staff_{tenantId:N}_{staffId:N}";
-            await Database.ExecuteSqlRawAsync(
-                "DECLARE @res INT; EXEC @res = sp_getapplock @Resource = {0}, @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 15000; IF @res < 0 THROW 50000, 'Staff booking lock acquisition failed', 1;",
-                [lockKey],
-                cancellationToken);
-        }
+        if (!Database.IsSqlServer()) return;
+
+        await Database.ExecuteSqlRawAsync(
+            "DECLARE @res INT; EXEC @res = sp_getapplock @Resource = {0}, @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 15000; IF @res < 0 THROW 50000, 'Booking lock acquisition failed', 1;",
+            [lockKey],
+            cancellationToken);
     }
 }

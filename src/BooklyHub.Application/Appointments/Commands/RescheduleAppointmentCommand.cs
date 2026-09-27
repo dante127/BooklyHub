@@ -1,6 +1,7 @@
 using BooklyHub.Application.Appointments.Dtos;
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Application.Scheduling;
+using BooklyHub.Domain.Entities.Resources;
 using BooklyHub.Domain.Exceptions;
 using FluentValidation;
 using MediatR;
@@ -74,6 +75,8 @@ public class RescheduleAppointmentCommandHandler : IRequestHandler<RescheduleApp
         // Atomic transaction: verify new slot and reserve within transaction
         await _db.ExecuteInTransactionAsync(async () =>
         {
+            // Lock order is location then staff, everywhere a booking is written.
+            await _db.AcquireLocationBookingLockAsync(request.TenantId, appointment.LocationId, cancellationToken);
             await _db.AcquireStaffLockAsync(appointment.StaffId, request.TenantId, cancellationToken);
 
             var slotCheck = await _availabilityService.CheckSlotAsync(
@@ -93,6 +96,19 @@ public class RescheduleAppointmentCommandHandler : IRequestHandler<RescheduleApp
 
             // Apply domain rescheduling (keeps original slot intact until committed)
             appointment.Reschedule(request.NewStartAtUtc, newEndAtUtc, request.Reason, _currentUser.UserId?.ToString());
+
+            // The guard allocated rooms for the new time while holding the location lock. Keeping the old
+            // rows instead would leave the appointment on a resource someone else took in the meantime.
+            appointment.AppointmentResources.Clear();
+            foreach (var resourceId in slotCheck.ResourceIds)
+            {
+                appointment.AppointmentResources.Add(new AppointmentResource
+                {
+                    TenantId = request.TenantId,
+                    AppointmentId = appointment.Id,
+                    ResourceId = resourceId
+                });
+            }
 
             await _db.SaveChangesAsync(cancellationToken);
             return true;

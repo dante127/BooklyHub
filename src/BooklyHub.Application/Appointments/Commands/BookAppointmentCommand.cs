@@ -65,10 +65,9 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
             .FirstOrDefaultAsync(t => t.Id == request.TenantId, cancellationToken)
             ?? throw new NotFoundException($"Tenant with ID {request.TenantId} was not found.");
 
-        // 2. Load service & resource requirements
+        // 2. Load service
         var service = await _db.Services
             .AsNoTracking()
-            .Include(s => s.ResourceRequirements)
             .FirstOrDefaultAsync(s => s.Id == request.ServiceId && s.TenantId == request.TenantId, cancellationToken)
             ?? throw new NotFoundException($"Service with ID {request.ServiceId} was not found.");
 
@@ -128,7 +127,8 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
         // 7. Atomic transaction with concurrency check
         return await _db.ExecuteInTransactionAsync(async () =>
         {
-            // Acquire transactional concurrency lock on the staff member
+            // Lock order is location then staff, everywhere a booking is written.
+            await _db.AcquireLocationBookingLockAsync(request.TenantId, request.LocationId, cancellationToken);
             await _db.AcquireStaffLockAsync(request.StaffId, request.TenantId, cancellationToken);
 
             // Concurrency Guard: re-check availability inside transaction
@@ -147,42 +147,9 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
                 throw new BookingConflictException(slotCheck.Message);
             }
 
-            // Allocate required resources
-            var allocatedResourceIds = new List<Guid>();
-            if (service.ResourceRequirements.Count > 0)
-            {
-                var busyResources = await _db.Appointments
-                    .Where(a => a.TenantId == request.TenantId &&
-                                a.LocationId == request.LocationId &&
-                                a.Status != AppointmentStatus.Cancelled &&
-                                a.Status != AppointmentStatus.Rescheduled &&
-                                a.StartAtUtc < endAtUtc &&
-                                a.EndAtUtc > request.StartAtUtc)
-                    .SelectMany(a => a.AppointmentResources.Select(ar => ar.ResourceId))
-                    .ToListAsync(cancellationToken);
-
-                var busyResourceSet = busyResources.ToHashSet();
-
-                foreach (var req in service.ResourceRequirements)
-                {
-                    var candidateResource = await _db.Resources
-                        .Where(r => r.TenantId == request.TenantId &&
-                                    r.LocationId == request.LocationId &&
-                                    r.ResourceGroupId == req.ResourceGroupId &&
-                                    r.IsActive &&
-                                    !busyResourceSet.Contains(r.Id))
-                        .Take(req.QuantityRequired)
-                        .Select(r => r.Id)
-                        .ToListAsync(cancellationToken);
-
-                    if (candidateResource.Count < req.QuantityRequired)
-                    {
-                        throw new BookingConflictException("Required resource is no longer available.");
-                    }
-
-                    allocatedResourceIds.AddRange(candidateResource);
-                }
-            }
+            // The guard picked the resources while holding the location lock; persisting its choice is
+            // what keeps two concurrent bookings from taking the same room.
+            var allocatedResourceIds = slotCheck.ResourceIds;
 
             // Create appointment
             var appointment = Appointment.Create(

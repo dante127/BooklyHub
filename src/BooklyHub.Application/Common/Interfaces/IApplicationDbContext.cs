@@ -59,5 +59,12 @@ public interface IApplicationDbContext
     Task RollbackTransactionAsync(IDbContextTransaction transaction, CancellationToken cancellationToken = default);
     Task<TResult> ExecuteInTransactionAsync<TResult>(Func<Task<TResult>> operation, CancellationToken cancellationToken = default);
     Task ExecuteInTransactionAsync(Func<Task> operation, CancellationToken cancellationToken = default);
+    /// <summary>
+    /// Serializes every booking write inside one location. Resource contention is location-wide, so a
+    /// staff-scoped lock alone lets two staff members take the same room simultaneously.
+    /// Always acquired before <see cref="AcquireStaffLockAsync"/>; never the other way round.
+    /// </summary>
+    Task AcquireLocationBookingLockAsync(Guid tenantId, Guid locationId, CancellationToken cancellationToken = default);
+
     Task AcquireStaffLockAsync(Guid staffId, Guid tenantId, CancellationToken cancellationToken = default);
 }

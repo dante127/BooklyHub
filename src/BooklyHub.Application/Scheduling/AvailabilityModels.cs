@@ -45,11 +45,14 @@ public enum SlotUnavailableReason
     ResourceUnavailable
 }
 
-public readonly record struct SlotCheckResult(SlotUnavailableReason? Reason)
+/// <summary>
+/// Why a slot was refused, and — when it was not — the resources the guard allocated for it. The caller
+/// must persist <see cref="ResourceIds"/> rather than picking resources itself: picking outside the guard's
+/// lock is how two concurrent bookings end up with the same room.
+/// </summary>
+public readonly record struct SlotCheckResult(SlotUnavailableReason? Reason, IReadOnlyList<Guid> ResourceIds)
 {
     public bool IsAvailable => Reason is null;
-
-    public static readonly SlotCheckResult Available = new(null);
 
     public string Message => Reason switch
     {
@@ -87,7 +90,9 @@ public interface IAvailabilityService
     /// <summary>
     /// Bulk form of CheckSlotAsync for one staff member: the calendar loads once for the whole span, so a
     /// recurring series costs a single round of queries instead of one per occurrence. Results line up with
-    /// <paramref name="candidates"/> by index and match what CheckSlotAsync returns for each slot alone.
+    /// <paramref name="candidates"/> by index. Candidates are judged in time order and each accepted one
+    /// holds its time and its rooms for the rest of the batch, so the whole batch can be written in one
+    /// transaction; only the slot that comes first in time wins an overlap.
     /// </summary>
     Task<IReadOnlyList<SlotCheckResult>> CheckSlotsAsync(
         Guid tenantId,
