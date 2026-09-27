@@ -1,11 +1,18 @@
 using BooklyHub.Application.Common.Helpers;
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Application.Scheduling;
+using BooklyHub.Domain.Entities.Organizations;
+using BooklyHub.Domain.Entities.Scheduling;
 using BooklyHub.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 
 namespace BooklyHub.Infrastructure.Services;
 
+/// <summary>
+/// Single source of truth for when a staff member can be booked. GetAvailabilityAsync enumerates the
+/// day's candidate slots and CheckSlotAsync validates one slot, both through the same Classify method,
+/// so the preview cannot offer a slot that the booking guard would reject.
+/// </summary>
 public class AvailabilityService : IAvailabilityService
 {
     private readonly IApplicationDbContext _db;
@@ -17,73 +24,61 @@ public class AvailabilityService : IAvailabilityService
         _clock = clock;
     }
 
+    private sealed record ResourceRequirement(Guid ResourceGroupId, int QuantityRequired);
+
+    private sealed record Occupancy(Guid AppointmentId, Guid StaffId, DateTime StartUtc, DateTime EndUtc, List<Guid> ResourceIds);
+
+    /// <summary>Shift time the staff member owns, and time inside it they do not (breaks, approved absence).</summary>
+    private sealed record StaffSchedule(List<TimeInterval> ShiftWindows, List<TimeInterval> Blocked);
+
+    /// <summary>Tenant, location and service facts that do not vary by date.</summary>
+    private sealed record BookingContext(
+        bool IsBookable,
+        Guid TenantId,
+        Guid LocationId,
+        string TimeZoneId,
+        TimeZoneInfo TimeZone,
+        string ServiceName,
+        int ServiceDurationMinutes,
+        decimal Price,
+        string Currency,
+        int BufferBeforeMinutes,
+        int BufferAfterMinutes,
+        List<ResourceRequirement> ResourceRequirements,
+        int MinNoticeMinutes,
+        int MaxAdvanceDays,
+        int SlotIntervalMinutes)
+    {
+        public static BookingContext NotBookable(string timeZoneId) => new(
+            false, Guid.Empty, Guid.Empty, timeZoneId, TimeZoneHelper.ResolveTimeZone(timeZoneId),
+            string.Empty, 0, 0m, "USD", 0, 0, [], 0, 0, 1);
+    }
+
+    /// <summary>
+    /// Roster and occupancy for the queried date plus its neighbours, merged per staff member so a
+    /// booking whose buffers cross local midnight is judged against the shift pattern it actually spans.
+    /// </summary>
+    private sealed record DayCalendar(
+        IReadOnlySet<DateOnly> ClosedDates,
+        IReadOnlyDictionary<Guid, StaffSchedule> Schedules,
+        IReadOnlyList<Occupancy> Occupancy);
+
+    /// <summary>The reason a slot was refused, and the resources it would hold when it was not.</summary>
+    private sealed record SlotEvaluation(SlotUnavailableReason? Reason, List<Guid>? ResourceIds)
+    {
+        public static SlotEvaluation Rejected(SlotUnavailableReason reason) => new(reason, null);
+        public static SlotEvaluation Accepted(List<Guid> resourceIds) => new(null, resourceIds);
+    }
+
     public async Task<DayAvailabilityDto> GetAvailabilityAsync(
         GetAvailabilityQuery query,
         CancellationToken cancellationToken = default)
     {
-        var tenant = await _db.Tenants
-            .AsNoTracking()
-            .Include(t => t.Settings)
-            .FirstOrDefaultAsync(t => t.Id == query.TenantId, cancellationToken);
-
-        if (tenant == null || !tenant.IsActive)
-        {
-            return new DayAvailabilityDto(query.Date, "UTC", false, []);
-        }
-
-        var location = await _db.Locations
-            .AsNoTracking()
-            .FirstOrDefaultAsync(l => l.Id == query.LocationId && l.TenantId == query.TenantId, cancellationToken);
-
-        if (location == null || !location.IsActive)
-        {
-            return new DayAvailabilityDto(query.Date, "UTC", false, []);
-        }
-
-        var timeZone = TimeZoneHelper.ResolveTimeZone(location.TimeZoneId);
-
-        var service = await _db.Services
-            .AsNoTracking()
-            .Include(s => s.ResourceRequirements)
-            .FirstOrDefaultAsync(s => s.Id == query.ServiceId && s.TenantId == query.TenantId, cancellationToken);
-
-        if (service == null || !service.IsActive)
-        {
-            return new DayAvailabilityDto(query.Date, location.TimeZoneId, false, []);
-        }
-
-        // Check Holidays
-        var isHoliday = await _db.Holidays
-            .AsNoTracking()
-            .AnyAsync(h => h.TenantId == query.TenantId &&
-                           (h.LocationId == null || h.LocationId == query.LocationId) &&
-                           ((h.Date == query.Date) || (h.RecurringAnnually && h.Date.Month == query.Date.Month && h.Date.Day == query.Date.Day)),
-                      cancellationToken);
-
-        if (isHoliday)
-        {
-            return new DayAvailabilityDto(query.Date, location.TimeZoneId, false, []);
-        }
-
-        // Calculate UTC day window
-        var localDayStart = query.Date.ToDateTime(TimeOnly.MinValue);
-        var localDayEnd = query.Date.ToDateTime(TimeOnly.MaxValue);
-
-        var dayStartUtc = TimeZoneHelper.ToUtc(localDayStart, timeZone);
-        var dayEndUtc = TimeZoneHelper.ToUtc(localDayEnd, timeZone);
-
-        // Booking notice & advance bounds
-        var minNoticeMinutes = tenant.Settings?.MinBookingNoticeMinutes ?? 120;
-        var maxAdvanceDays = tenant.Settings?.MaxAdvanceBookingDays ?? 60;
-        var slotIntervalMinutes = tenant.Settings?.SlotIntervalMinutes ?? 15;
-
-        var minBookingTimeUtc = _clock.UtcNow.AddMinutes(minNoticeMinutes);
-        var maxBookingTimeUtc = _clock.UtcNow.AddDays(maxAdvanceDays);
-
-        // Resolve staff candidates
         var staffQuery = _db.StaffMembers
             .AsNoTracking()
-            .Where(s => s.TenantId == query.TenantId && s.LocationId == query.LocationId && s.IsActive)
+            .Where(s => s.TenantId == query.TenantId &&
+                        s.LocationId == query.LocationId &&
+                        s.IsActive)
             .Where(s => s.StaffServices.Any(ss => ss.ServiceId == query.ServiceId));
 
         if (query.StaffId.HasValue)
@@ -102,225 +97,77 @@ public class AvailabilityService : IAvailabilityService
             })
             .ToListAsync(cancellationToken);
 
-        if (candidateStaffList.Count == 0)
+        var context = await LoadBookingContextAsync(query.TenantId, query.LocationId, query.ServiceId, cancellationToken);
+
+        if (!context.IsBookable)
         {
-            return new DayAvailabilityDto(query.Date, location.TimeZoneId, true, []);
+            return new DayAvailabilityDto(query.Date, context.TimeZoneId, false, []);
         }
 
-        // Query resources for this location
-        var rawResources = await _db.Resources
-            .AsNoTracking()
-            .Where(r => r.TenantId == query.TenantId && r.LocationId == query.LocationId && r.IsActive)
-            .Select(r => new { r.ResourceGroupId, r.Id })
-            .ToListAsync(cancellationToken);
+        // One day either side: a slot's buffers can reach over local midnight.
+        var calendar = await LoadCalendarAsync(
+            context,
+            candidateStaffList.Select(s => s.Id).ToList(),
+            new[] { query.Date.AddDays(-1), query.Date, query.Date.AddDays(1) },
+            cancellationToken);
 
-        var resourcesByGroup = rawResources
-            .GroupBy(r => r.ResourceGroupId)
-            .ToDictionary(g => g.Key, g => g.Select(r => r.Id).ToList());
+        if (calendar.ClosedDates.Contains(query.Date))
+        {
+            return new DayAvailabilityDto(query.Date, context.TimeZoneId, false, []);
+        }
 
-        // Query overlapping appointments for the day to check resource and staff occupation
-        var dayAppointments = await _db.Appointments
-            .AsNoTracking()
-            .Include(a => a.AppointmentResources)
-            .Where(a => a.TenantId == query.TenantId &&
-                        a.LocationId == query.LocationId &&
-                        a.Status != AppointmentStatus.Cancelled &&
-                        a.Status != AppointmentStatus.Rescheduled &&
-                        a.StartAtUtc < dayEndUtc &&
-                        a.EndAtUtc > dayStartUtc)
-            .Select(a => new
-            {
-                a.Id,
-                a.StaffId,
-                a.StartAtUtc,
-                a.EndAtUtc,
-                AllocatedResourceIds = a.AppointmentResources.Select(ar => ar.ResourceId).ToList()
-            })
-            .ToListAsync(cancellationToken);
+        if (candidateStaffList.Count == 0)
+        {
+            return new DayAvailabilityDto(query.Date, context.TimeZoneId, true, []);
+        }
 
-        var allAvailableSlots = new List<AvailableSlotDto>();
+        var minBookingTimeUtc = _clock.UtcNow.AddMinutes(context.MinNoticeMinutes);
+        var maxBookingTimeUtc = _clock.UtcNow.AddDays(context.MaxAdvanceDays);
+        var resourcesByGroup = await LoadResourcesByGroupAsync(context, cancellationToken);
+
+        var slots = new List<AvailableSlotDto>();
 
         foreach (var staff in candidateStaffList)
         {
-            var duration = staff.CustomDuration ?? service.DurationMinutes;
-            var price = staff.CustomPrice ?? service.Price;
+            var duration = staff.CustomDuration ?? context.ServiceDurationMinutes;
+            var price = staff.CustomPrice ?? context.Price;
 
-            // Load staff working hours for this day of week
-            var targetDayOfWeek = query.Date.DayOfWeek;
-            var workingHour = await _db.WorkingHours
-                .AsNoTracking()
-                .Include(w => w.Intervals)
-                .FirstOrDefaultAsync(w => w.TenantId == query.TenantId &&
-                                          w.StaffId == staff.Id &&
-                                          w.LocationId == query.LocationId &&
-                                          w.DayOfWeek == targetDayOfWeek,
-                                     cancellationToken);
-
-            if (workingHour == null || !workingHour.IsWorkingDay)
+            foreach (var start in CandidateStartsUtc(query.Date, context))
             {
-                continue;
-            }
+                var evaluation = Classify(
+                    context, calendar, staff.Id, start, start.AddMinutes(duration),
+                    minBookingTimeUtc, maxBookingTimeUtc, excludeAppointmentId: null, resourcesByGroup);
 
-            // Convert working shifts to UTC intervals
-            var workingIntervals = new List<TimeInterval>();
-            var breakIntervals = new List<TimeInterval>();
-
-            foreach (var interval in workingHour.Intervals)
-            {
-                var intervalStartLocal = query.Date.ToDateTime(TimeOnly.FromTimeSpan(interval.StartTime));
-                var intervalEndLocal = query.Date.ToDateTime(TimeOnly.FromTimeSpan(interval.EndTime));
-
-                var intervalStartUtc = TimeZoneHelper.ToUtc(intervalStartLocal, timeZone);
-                var intervalEndUtc = TimeZoneHelper.ToUtc(intervalEndLocal, timeZone);
-
-                if (interval.IsBreak)
+                if (evaluation.Reason is not null)
                 {
-                    breakIntervals.Add(new TimeInterval(intervalStartUtc, intervalEndUtc));
-                }
-                else
-                {
-                    workingIntervals.Add(new TimeInterval(intervalStartUtc, intervalEndUtc));
-                }
-            }
-
-            // If no explicit intervals configured, default to location business hours
-            if (workingIntervals.Count == 0)
-            {
-                var businessHour = await _db.BusinessHours
-                    .AsNoTracking()
-                    .FirstOrDefaultAsync(b => b.TenantId == query.TenantId &&
-                                              b.LocationId == query.LocationId &&
-                                              b.DayOfWeek == targetDayOfWeek,
-                                         cancellationToken);
-
-                if (businessHour != null && !businessHour.IsClosed)
-                {
-                    var openUtc = TimeZoneHelper.ToUtc(query.Date.ToDateTime(TimeOnly.FromTimeSpan(businessHour.OpenTime)), timeZone);
-                    var closeUtc = TimeZoneHelper.ToUtc(query.Date.ToDateTime(TimeOnly.FromTimeSpan(businessHour.CloseTime)), timeZone);
-                    workingIntervals.Add(new TimeInterval(openUtc, closeUtc));
-                }
-            }
-
-            if (workingIntervals.Count == 0) continue;
-
-            // Subtract breaks
-            var availableIntervals = TimeInterval.SubtractMany(workingIntervals, breakIntervals);
-
-            // Apply availability exceptions
-            var exceptions = await _db.AvailabilityExceptions
-                .AsNoTracking()
-                .Where(e => e.TenantId == query.TenantId &&
-                            e.StaffId == staff.Id &&
-                            e.StartDateTimeUtc < dayEndUtc &&
-                            e.EndDateTimeUtc > dayStartUtc)
-                .ToListAsync(cancellationToken);
-
-            var exceptionTimeOffs = exceptions
-                .Where(e => !e.IsAvailable)
-                .Select(e => new TimeInterval(e.StartDateTimeUtc, e.EndDateTimeUtc))
-                .ToList();
-
-            availableIntervals = TimeInterval.SubtractMany(availableIntervals, exceptionTimeOffs);
-
-            // Subtract existing appointments for this staff member
-            var staffBlockedIntervals = dayAppointments
-                .Where(a => a.StaffId == staff.Id)
-                .Select(a => new TimeInterval(
-                    a.StartAtUtc.AddMinutes(-service.BufferBeforeMinutes),
-                    a.EndAtUtc.AddMinutes(service.BufferAfterMinutes)))
-                .ToList();
-
-            availableIntervals = TimeInterval.SubtractMany(availableIntervals, staffBlockedIntervals);
-
-            // Discretize available intervals into valid appointment slots
-            foreach (var interval in availableIntervals)
-            {
-                // Slot start must allow buffer before
-                var currentSlotStart = interval.StartUtc.AddMinutes(service.BufferBeforeMinutes);
-
-                // Align to slotIntervalMinutes
-                var minutesMod = currentSlotStart.Minute % slotIntervalMinutes;
-                if (minutesMod != 0)
-                {
-                    currentSlotStart = currentSlotStart.AddMinutes(slotIntervalMinutes - minutesMod);
+                    continue;
                 }
 
-                while (currentSlotStart.AddMinutes(duration + service.BufferAfterMinutes) <= interval.EndUtc)
-                {
-                    var slotEnd = currentSlotStart.AddMinutes(duration);
-
-                    // Check notice and advance limits
-                    if (currentSlotStart >= minBookingTimeUtc && slotEnd <= maxBookingTimeUtc)
-                    {
-                        // Check resource allocation
-                        var resourcesAvailable = true;
-                        var allocatedResourceIds = new List<Guid>();
-
-                        if (service.ResourceRequirements.Count > 0)
-                        {
-                            foreach (var req in service.ResourceRequirements)
-                            {
-                                if (!resourcesByGroup.TryGetValue(req.ResourceGroupId, out var groupResourceIds))
-                                {
-                                    resourcesAvailable = false;
-                                    break;
-                                }
-
-                                // Find which resources in this group are already booked during currentSlotStart -> slotEnd
-                                var busyResourceIds = dayAppointments
-                                    .Where(a => a.StartAtUtc < slotEnd && a.EndAtUtc > currentSlotStart)
-                                    .SelectMany(a => a.AllocatedResourceIds)
-                                    .ToHashSet();
-
-                                var freeResourceIds = groupResourceIds
-                                    .Where(rId => !busyResourceIds.Contains(rId))
-                                    .ToList();
-
-                                if (freeResourceIds.Count < req.QuantityRequired)
-                                {
-                                    resourcesAvailable = false;
-                                    break;
-                                }
-
-                                allocatedResourceIds.AddRange(freeResourceIds.Take(req.QuantityRequired));
-                            }
-                        }
-
-                        if (resourcesAvailable)
-                        {
-                            var localSlotStart = TimeZoneHelper.ToLocal(currentSlotStart, timeZone);
-                            var localSlotEnd = TimeZoneHelper.ToLocal(slotEnd, timeZone);
-
-                            allAvailableSlots.Add(new AvailableSlotDto(
-                                StartAtUtc: currentSlotStart,
-                                EndAtUtc: slotEnd,
-                                StartAtLocal: localSlotStart,
-                                EndAtLocal: localSlotEnd,
-                                StaffId: staff.Id,
-                                StaffName: $"{staff.FirstName} {staff.LastName}".Trim(),
-                                ServiceId: service.Id,
-                                ServiceName: service.Name,
-                                DurationMinutes: duration,
-                                Price: price,
-                                Currency: service.Currency,
-                                AvailableResourceIds: allocatedResourceIds));
-                        }
-                    }
-
-                    currentSlotStart = currentSlotStart.AddMinutes(slotIntervalMinutes);
-                }
+                slots.Add(new AvailableSlotDto(
+                    StartAtUtc: start,
+                    EndAtUtc: start.AddMinutes(duration),
+                    StartAtLocal: TimeZoneHelper.ToLocal(start, context.TimeZone),
+                    EndAtLocal: TimeZoneHelper.ToLocal(start.AddMinutes(duration), context.TimeZone),
+                    StaffId: staff.Id,
+                    StaffName: $"{staff.FirstName} {staff.LastName}".Trim(),
+                    ServiceId: query.ServiceId,
+                    ServiceName: context.ServiceName,
+                    DurationMinutes: duration,
+                    Price: price,
+                    Currency: context.Currency,
+                    AvailableResourceIds: evaluation.ResourceIds ?? []));
             }
         }
 
-        var sortedSlots = allAvailableSlots
+        var sortedSlots = slots
             .OrderBy(s => s.StartAtUtc)
             .ThenBy(s => s.StaffName)
             .ToList();
 
-        return new DayAvailabilityDto(query.Date, location.TimeZoneId, true, sortedSlots);
+        return new DayAvailabilityDto(query.Date, context.TimeZoneId, true, sortedSlots);
     }
 
-    public async Task<bool> IsSlotAvailableAsync(
+    public async Task<SlotCheckResult> CheckSlotAsync(
         Guid tenantId,
         Guid locationId,
         Guid serviceId,
@@ -330,66 +177,451 @@ public class AvailabilityService : IAvailabilityService
         Guid? excludeAppointmentId = null,
         CancellationToken cancellationToken = default)
     {
-        var service = await _db.Services
-            .AsNoTracking()
-            .Include(s => s.ResourceRequirements)
-            .FirstOrDefaultAsync(s => s.Id == serviceId && s.TenantId == tenantId, cancellationToken);
+        var evaluations = await EvaluateAsync(
+            tenantId, locationId, serviceId, staffId,
+            [new SlotCandidate(startAtUtc, endAtUtc)], excludeAppointmentId, cancellationToken);
 
-        if (service == null || !service.IsActive) return false;
+        return new SlotCheckResult(evaluations[0].Reason);
+    }
 
-        // Check for conflicting appointments for the staff (including buffer times)
-        var bufferStart = startAtUtc.AddMinutes(-service.BufferBeforeMinutes);
-        var bufferEnd = endAtUtc.AddMinutes(service.BufferAfterMinutes);
+    public async Task<IReadOnlyList<SlotCheckResult>> CheckSlotsAsync(
+        Guid tenantId,
+        Guid locationId,
+        Guid serviceId,
+        Guid staffId,
+        IReadOnlyList<SlotCandidate> candidates,
+        Guid? excludeAppointmentId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var evaluations = await EvaluateAsync(
+            tenantId, locationId, serviceId, staffId, candidates, excludeAppointmentId, cancellationToken);
 
-        var staffConflict = await _db.Appointments
-            .AsNoTracking()
-            .AnyAsync(a => a.TenantId == tenantId &&
-                           a.StaffId == staffId &&
-                           a.Id != excludeAppointmentId &&
-                           a.Status != AppointmentStatus.Cancelled &&
-                           a.Status != AppointmentStatus.Rescheduled &&
-                           a.StartAtUtc < bufferEnd &&
-                           a.EndAtUtc > bufferStart,
-                      cancellationToken);
+        return evaluations.Select(e => new SlotCheckResult(e.Reason)).ToList();
+    }
 
-        if (staffConflict) return false;
+    private async Task<IReadOnlyList<SlotEvaluation>> EvaluateAsync(
+        Guid tenantId,
+        Guid locationId,
+        Guid serviceId,
+        Guid staffId,
+        IReadOnlyList<SlotCandidate> candidates,
+        Guid? excludeAppointmentId,
+        CancellationToken ct)
+    {
+        var evaluations = new SlotEvaluation?[candidates.Count];
 
-        // Check resources conflict
-        if (service.ResourceRequirements.Count > 0)
+        for (var i = 0; i < candidates.Count; i++)
         {
-            var overlappingAppointments = await _db.Appointments
-                .AsNoTracking()
-                .Include(a => a.AppointmentResources)
-                .Where(a => a.TenantId == tenantId &&
-                            a.LocationId == locationId &&
-                            a.Id != excludeAppointmentId &&
-                            a.Status != AppointmentStatus.Cancelled &&
-                            a.Status != AppointmentStatus.Rescheduled &&
-                            a.StartAtUtc < endAtUtc &&
-                            a.EndAtUtc > startAtUtc)
-                .SelectMany(a => a.AppointmentResources.Select(ar => ar.ResourceId))
-                .ToListAsync(cancellationToken);
-
-            var busyResources = overlappingAppointments.ToHashSet();
-
-            foreach (var req in service.ResourceRequirements)
+            if (candidates[i].EndAtUtc <= candidates[i].StartAtUtc)
             {
-                var totalAvailableInGroup = await _db.Resources
-                    .AsNoTracking()
-                    .CountAsync(r => r.TenantId == tenantId &&
-                                     r.LocationId == locationId &&
-                                     r.ResourceGroupId == req.ResourceGroupId &&
-                                     r.IsActive &&
-                                     !busyResources.Contains(r.Id),
-                                cancellationToken);
-
-                if (totalAvailableInGroup < req.QuantityRequired)
-                {
-                    return false;
-                }
+                evaluations[i] = SlotEvaluation.Rejected(SlotUnavailableReason.StaffNotAvailable);
             }
         }
 
-        return true;
+        var pending = candidates
+            .Select((candidate, index) => (candidate, index))
+            .Where(x => evaluations[x.index] is null)
+            .ToList();
+
+        if (pending.Count == 0)
+        {
+            return evaluations.Select(e => e!).ToList();
+        }
+
+        var context = await LoadBookingContextAsync(tenantId, locationId, serviceId, ct);
+
+        if (!context.IsBookable)
+        {
+            return Fill(evaluations, pending, SlotUnavailableReason.Closed);
+        }
+
+        // Booking and reschedule validate eligibility themselves; this is the only check the recurring
+        // series path applies, and it mirrors the staff filter the availability preview uses.
+        var isEligible = await _db.StaffMembers
+            .AsNoTracking()
+            .AnyAsync(s => s.Id == staffId &&
+                           s.TenantId == tenantId &&
+                           s.LocationId == locationId &&
+                           s.IsActive &&
+                           s.StaffServices.Any(ss => ss.ServiceId == serviceId),
+                      ct);
+
+        if (!isEligible)
+        {
+            return Fill(evaluations, pending, SlotUnavailableReason.StaffNotAvailable);
+        }
+
+        // Buffers can reach across local midnight, where the shift pattern belongs to another date.
+        var dates = new HashSet<DateOnly>();
+
+        foreach (var (candidate, _) in pending)
+        {
+            dates.Add(LocalDate(candidate.StartAtUtc, context));
+            dates.Add(LocalDate(candidate.EndAtUtc, context));
+            dates.Add(LocalDate(candidate.StartAtUtc.AddMinutes(-context.BufferBeforeMinutes), context));
+            dates.Add(LocalDate(candidate.EndAtUtc.AddMinutes(context.BufferAfterMinutes), context));
+        }
+
+        var calendar = await LoadCalendarAsync(context, [staffId], dates, ct);
+
+        var minBookingTimeUtc = _clock.UtcNow.AddMinutes(context.MinNoticeMinutes);
+        var maxBookingTimeUtc = _clock.UtcNow.AddDays(context.MaxAdvanceDays);
+        var resourcesByGroup = await LoadResourcesByGroupAsync(context, ct);
+
+        foreach (var (candidate, index) in pending)
+        {
+            evaluations[index] = Classify(
+                context, calendar, staffId, candidate.StartAtUtc, candidate.EndAtUtc,
+                minBookingTimeUtc, maxBookingTimeUtc, excludeAppointmentId, resourcesByGroup);
+        }
+
+        return evaluations.Select(e => e!).ToList();
+    }
+
+    private static IReadOnlyList<SlotEvaluation> Fill(
+        SlotEvaluation?[] evaluations,
+        List<(SlotCandidate candidate, int index)> pending,
+        SlotUnavailableReason reason)
+    {
+        foreach (var (_, index) in pending)
+        {
+            evaluations[index] = SlotEvaluation.Rejected(reason);
+        }
+
+        return evaluations.Select(e => e!).ToList();
+    }
+
+    private static DateOnly LocalDate(DateTime utc, BookingContext context)
+        => DateOnly.FromDateTime(TimeZoneHelper.ToLocal(utc, context.TimeZone));
+
+    /// <summary>
+    /// The one rule set both entry points share. Buffers are charged once: the candidate's prep and
+    /// cleanup time must fit inside the staff member's own shift, and the candidate's core must not
+    /// intrude on the buffer-expanded time an existing appointment already reserves.
+    /// </summary>
+    private static SlotEvaluation Classify(
+        BookingContext context,
+        DayCalendar calendar,
+        Guid staffId,
+        DateTime startAtUtc,
+        DateTime endAtUtc,
+        DateTime minBookingTimeUtc,
+        DateTime maxBookingTimeUtc,
+        Guid? excludeAppointmentId,
+        Dictionary<Guid, List<Guid>> resourcesByGroup)
+    {
+        var startDate = LocalDate(startAtUtc, context);
+
+        if (calendar.ClosedDates.Contains(startDate))
+        {
+            return SlotEvaluation.Rejected(SlotUnavailableReason.Closed);
+        }
+
+        if (!calendar.Schedules.TryGetValue(staffId, out var schedule))
+        {
+            return SlotEvaluation.Rejected(SlotUnavailableReason.StaffNotAvailable);
+        }
+
+        var core = new TimeInterval(startAtUtc, endAtUtc);
+        var buffered = new TimeInterval(
+            startAtUtc.AddMinutes(-context.BufferBeforeMinutes),
+            endAtUtc.AddMinutes(context.BufferAfterMinutes));
+
+        if (!schedule.ShiftWindows.Any(w => Contains(w, buffered)))
+        {
+            return SlotEvaluation.Rejected(SlotUnavailableReason.StaffNotAvailable);
+        }
+
+        if (core.StartUtc < minBookingTimeUtc || core.EndUtc > maxBookingTimeUtc)
+        {
+            return SlotEvaluation.Rejected(SlotUnavailableReason.OutsideBookingWindow);
+        }
+
+        var busy = BusyIntervals(context, calendar.Occupancy, staffId, excludeAppointmentId);
+
+        if (busy.Any(b => b.Overlaps(core)))
+        {
+            return SlotEvaluation.Rejected(SlotUnavailableReason.StaffBusy);
+        }
+
+        if (schedule.Blocked.Any(b => b.Overlaps(buffered)))
+        {
+            return SlotEvaluation.Rejected(SlotUnavailableReason.StaffNotAvailable);
+        }
+
+        var allocatedResourceIds = TryAllocateResources(context, calendar.Occupancy, core.StartUtc, core.EndUtc, resourcesByGroup);
+
+        return allocatedResourceIds is null
+            ? SlotEvaluation.Rejected(SlotUnavailableReason.ResourceUnavailable)
+            : SlotEvaluation.Accepted(allocatedResourceIds);
+    }
+
+    /// <summary>Slot grid for one local day, anchored on local midnight so slots stay round in the location's own time.</summary>
+    private static IEnumerable<DateTime> CandidateStartsUtc(DateOnly date, BookingContext context)
+    {
+        var localMidnight = date.ToDateTime(TimeOnly.MinValue);
+
+        for (var offsetMinutes = 0; offsetMinutes < 24 * 60; offsetMinutes += context.SlotIntervalMinutes)
+        {
+            yield return TimeZoneHelper.ToUtc(localMidnight.AddMinutes(offsetMinutes), context.TimeZone);
+        }
+    }
+
+    private async Task<BookingContext> LoadBookingContextAsync(
+        Guid tenantId,
+        Guid locationId,
+        Guid serviceId,
+        CancellationToken ct)
+    {
+        var tenant = await _db.Tenants
+            .AsNoTracking()
+            .Include(t => t.Settings)
+            .FirstOrDefaultAsync(t => t.Id == tenantId, ct);
+
+        if (tenant is null || !tenant.IsActive)
+        {
+            return BookingContext.NotBookable("UTC");
+        }
+
+        var location = await _db.Locations
+            .AsNoTracking()
+            .FirstOrDefaultAsync(l => l.Id == locationId && l.TenantId == tenantId, ct);
+
+        if (location is null || !location.IsActive)
+        {
+            return BookingContext.NotBookable("UTC");
+        }
+
+        var service = await _db.Services
+            .AsNoTracking()
+            .Include(s => s.ResourceRequirements)
+            .FirstOrDefaultAsync(s => s.Id == serviceId && s.TenantId == tenantId, ct);
+
+        if (service is null || !service.IsActive)
+        {
+            return BookingContext.NotBookable(location.TimeZoneId);
+        }
+
+        return new BookingContext(
+            true,
+            tenantId,
+            locationId,
+            location.TimeZoneId,
+            TimeZoneHelper.ResolveTimeZone(location.TimeZoneId),
+            service.Name,
+            service.DurationMinutes,
+            service.Price,
+            service.Currency,
+            service.BufferBeforeMinutes,
+            service.BufferAfterMinutes,
+            service.ResourceRequirements
+                .Select(r => new ResourceRequirement(r.ResourceGroupId, r.QuantityRequired))
+                .ToList(),
+            tenant.Settings?.MinBookingNoticeMinutes ?? 120,
+            tenant.Settings?.MaxAdvanceBookingDays ?? 60,
+            Math.Max(1, tenant.Settings?.SlotIntervalMinutes ?? 15));
+    }
+
+    private async Task<DayCalendar> LoadCalendarAsync(
+        BookingContext context,
+        IReadOnlyCollection<Guid> staffIds,
+        IReadOnlyCollection<DateOnly> dates,
+        CancellationToken ct)
+    {
+        var orderedDates = dates.Distinct().Order().ToList();
+        var firstDate = orderedDates[0];
+        var lastDate = orderedDates[^1];
+        var rangeStartUtc = TimeZoneHelper.ToUtc(firstDate.ToDateTime(TimeOnly.MinValue), context.TimeZone);
+        var rangeEndUtc = TimeZoneHelper.ToUtc(lastDate.ToDateTime(TimeOnly.MaxValue), context.TimeZone);
+        var daysOfWeek = orderedDates.Select(d => d.DayOfWeek).Distinct().ToList();
+
+        // Bounded by the range rather than an IN-list of dates, so a year-long series stays one query.
+        var holidays = await _db.Holidays
+            .AsNoTracking()
+            .Where(h => h.TenantId == context.TenantId &&
+                        (h.LocationId == null || h.LocationId == context.LocationId) &&
+                        ((h.Date >= firstDate && h.Date <= lastDate) || h.RecurringAnnually))
+            .Select(h => new { h.Date, h.RecurringAnnually })
+            .ToListAsync(ct);
+
+        var closedDates = orderedDates
+            .Where(d => holidays.Any(h => h.Date == d ||
+                                          (h.RecurringAnnually && h.Date.Month == d.Month && h.Date.Day == d.Day)))
+            .ToHashSet();
+
+        // Resource contention is location-wide, so appointments are loaded regardless of which staff
+        // member is being evaluated, and closed days still contribute their existing bookings.
+        var occupancy = await _db.Appointments
+            .AsNoTracking()
+            .Include(a => a.AppointmentResources)
+            .Where(a => a.TenantId == context.TenantId &&
+                        a.LocationId == context.LocationId &&
+                        a.Status != AppointmentStatus.Cancelled &&
+                        a.Status != AppointmentStatus.Rescheduled &&
+                        a.StartAtUtc < rangeEndUtc &&
+                        a.EndAtUtc > rangeStartUtc)
+            .Select(a => new Occupancy(
+                a.Id,
+                a.StaffId,
+                a.StartAtUtc,
+                a.EndAtUtc,
+                a.AppointmentResources.Select(ar => ar.ResourceId).ToList()))
+            .ToListAsync(ct);
+
+        var workingHours = await _db.WorkingHours
+            .AsNoTracking()
+            .Include(w => w.Intervals)
+            .Where(w => w.TenantId == context.TenantId &&
+                        w.LocationId == context.LocationId &&
+                        daysOfWeek.Contains(w.DayOfWeek) &&
+                        staffIds.Contains(w.StaffId))
+            .ToListAsync(ct);
+
+        var businessHours = await _db.BusinessHours
+            .AsNoTracking()
+            .Where(b => b.TenantId == context.TenantId &&
+                        b.LocationId == context.LocationId &&
+                        daysOfWeek.Contains(b.DayOfWeek) &&
+                        !b.IsClosed)
+            .ToListAsync(ct);
+
+        var exceptions = await _db.AvailabilityExceptions
+            .AsNoTracking()
+            .Where(e => e.TenantId == context.TenantId &&
+                        staffIds.Contains(e.StaffId) &&
+                        e.StartDateTimeUtc < rangeEndUtc &&
+                        e.EndDateTimeUtc > rangeStartUtc)
+            .ToListAsync(ct);
+
+        var schedules = new Dictionary<Guid, StaffSchedule>();
+
+        foreach (var staffId in staffIds)
+        {
+            var shiftWindows = new List<TimeInterval>();
+            var blocked = new List<TimeInterval>();
+
+            foreach (var date in orderedDates)
+            {
+                if (closedDates.Contains(date))
+                {
+                    continue;
+                }
+
+                var workingHour = workingHours.FirstOrDefault(w => w.StaffId == staffId && w.DayOfWeek == date.DayOfWeek);
+
+                if (workingHour is not null && workingHour.IsWorkingDay)
+                {
+                    var dayShift = ToUtcDayIntervals(workingHour.Intervals.Where(i => !i.IsBreak), date, context.TimeZone);
+                    var dayBreaks = ToUtcDayIntervals(workingHour.Intervals.Where(i => i.IsBreak), date, context.TimeZone);
+
+                    shiftWindows.AddRange(dayShift);
+                    blocked.AddRange(dayBreaks);
+
+                    // A roster row carrying only breaks defers to the location's opening hours; a row
+                    // with no intervals at all means the staff member is not bookable that day.
+                    if (dayShift.Count == 0 && dayBreaks.Count > 0)
+                    {
+                        shiftWindows.AddRange(BusinessWindows(date, businessHours, context));
+                    }
+                }
+            }
+
+            blocked.AddRange(exceptions
+                .Where(e => e.StaffId == staffId && !e.IsAvailable)
+                .Select(e => new TimeInterval(e.StartDateTimeUtc, e.EndDateTimeUtc)));
+
+            schedules[staffId] = new StaffSchedule(shiftWindows, blocked);
+        }
+
+        return new DayCalendar(closedDates, schedules, occupancy);
+    }
+
+    private static IEnumerable<TimeInterval> BusinessWindows(
+        DateOnly date,
+        List<BusinessHour> businessHours,
+        BookingContext context)
+        => businessHours
+            .Where(b => b.DayOfWeek == date.DayOfWeek)
+            .Select(b => new TimeInterval(
+                TimeZoneHelper.ToUtc(date.ToDateTime(TimeOnly.FromTimeSpan(b.OpenTime)), context.TimeZone),
+                TimeZoneHelper.ToUtc(date.ToDateTime(TimeOnly.FromTimeSpan(b.CloseTime)), context.TimeZone)));
+
+    private static List<TimeInterval> BusyIntervals(
+        BookingContext context,
+        IReadOnlyCollection<Occupancy> occupancy,
+        Guid staffId,
+        Guid? excludeAppointmentId)
+        => occupancy
+            .Where(a => a.StaffId == staffId && a.AppointmentId != excludeAppointmentId)
+            .Select(a => new TimeInterval(
+                a.StartUtc.AddMinutes(-context.BufferBeforeMinutes),
+                a.EndUtc.AddMinutes(context.BufferAfterMinutes)))
+            .ToList();
+
+    private static bool Contains(TimeInterval window, TimeInterval candidate)
+        => window.StartUtc <= candidate.StartUtc && candidate.EndUtc <= window.EndUtc;
+
+    private static List<TimeInterval> ToUtcDayIntervals(
+        IEnumerable<WorkingHourInterval> intervals,
+        DateOnly date,
+        TimeZoneInfo timeZone)
+        => intervals
+            .Select(i => new TimeInterval(
+                TimeZoneHelper.ToUtc(date.ToDateTime(TimeOnly.FromTimeSpan(i.StartTime)), timeZone),
+                TimeZoneHelper.ToUtc(date.ToDateTime(TimeOnly.FromTimeSpan(i.EndTime)), timeZone)))
+            .ToList();
+
+    private async Task<Dictionary<Guid, List<Guid>>> LoadResourcesByGroupAsync(BookingContext context, CancellationToken ct)
+    {
+        var rawResources = await _db.Resources
+            .AsNoTracking()
+            .Where(r => r.TenantId == context.TenantId && r.LocationId == context.LocationId && r.IsActive)
+            .Select(r => new { r.ResourceGroupId, r.Id })
+            .ToListAsync(ct);
+
+        return rawResources
+            .GroupBy(r => r.ResourceGroupId)
+            .ToDictionary(g => g.Key, g => g.Select(r => r.Id).ToList());
+    }
+
+    private static List<Guid>? TryAllocateResources(
+        BookingContext context,
+        IReadOnlyCollection<Occupancy> occupancy,
+        DateTime startUtc,
+        DateTime endUtc,
+        Dictionary<Guid, List<Guid>> resourcesByGroup)
+    {
+        if (context.ResourceRequirements.Count == 0)
+        {
+            return [];
+        }
+
+        var busyResourceIds = occupancy
+            .Where(a => a.StartUtc < endUtc && a.EndUtc > startUtc)
+            .SelectMany(a => a.ResourceIds)
+            .ToHashSet();
+
+        var allocatedResourceIds = new List<Guid>();
+
+        foreach (var req in context.ResourceRequirements)
+        {
+            if (!resourcesByGroup.TryGetValue(req.ResourceGroupId, out var groupResourceIds))
+            {
+                return null;
+            }
+
+            var freeResourceIds = groupResourceIds
+                .Where(rId => !busyResourceIds.Contains(rId))
+                .ToList();
+
+            if (freeResourceIds.Count < req.QuantityRequired)
+            {
+                return null;
+            }
+
+            allocatedResourceIds.AddRange(freeResourceIds.Take(req.QuantityRequired));
+        }
+
+        return allocatedResourceIds;
     }
 }

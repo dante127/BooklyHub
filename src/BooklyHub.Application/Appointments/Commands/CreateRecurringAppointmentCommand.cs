@@ -70,14 +70,37 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
         var location = await _db.Locations.AsNoTracking().FirstOrDefaultAsync(l => l.Id == request.LocationId && l.TenantId == request.TenantId, cancellationToken)
             ?? throw new NotFoundException($"Location with ID {request.LocationId} was not found.");
 
+        if (!location.IsActive)
+        {
+            throw new BusinessRuleValidationException("LocationInactive", "This location is not currently open for booking.");
+        }
+
         var service = await _db.Services.AsNoTracking().FirstOrDefaultAsync(s => s.Id == request.ServiceId && s.TenantId == request.TenantId, cancellationToken)
             ?? throw new NotFoundException($"Service with ID {request.ServiceId} was not found.");
 
-        var staff = await _db.StaffMembers.AsNoTracking().FirstOrDefaultAsync(s => s.Id == request.StaffId && s.TenantId == request.TenantId, cancellationToken)
-            ?? throw new NotFoundException($"Staff member with ID {request.StaffId} was not found.");
+        if (!service.IsActive)
+        {
+            throw new BusinessRuleValidationException("ServiceInactive", "The requested service is not currently active.");
+        }
+
+        var staff = await _db.StaffMembers
+            .AsNoTracking()
+            .Include(s => s.StaffServices)
+            .FirstOrDefaultAsync(s => s.Id == request.StaffId && s.TenantId == request.TenantId && s.LocationId == request.LocationId, cancellationToken)
+            ?? throw new NotFoundException($"Staff member with ID {request.StaffId} was not found at this location.");
+
+        if (!staff.IsActive)
+        {
+            throw new BusinessRuleValidationException("StaffInactive", "The requested staff member is not currently active.");
+        }
 
         var customer = await _db.Customers.AsNoTracking().FirstOrDefaultAsync(c => c.Id == request.CustomerId && c.TenantId == request.TenantId, cancellationToken)
             ?? throw new NotFoundException($"Customer with ID {request.CustomerId} was not found.");
+
+        if (customer.IsBlocked)
+        {
+            throw new BusinessRuleValidationException("CustomerBlocked", "This customer account has been blocked from booking appointments.");
+        }
 
         // Generate target dates
         var targetDates = GenerateDates(request.Pattern, request.Interval, request.StartDate, request.EndDate, request.MaxOccurrences);
@@ -86,6 +109,21 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
         {
             throw new BusinessRuleValidationException("NoDatesGenerated", "Recurrence rules produced no valid appointment dates.");
         }
+
+        var staffService = staff.StaffServices.FirstOrDefault(ss => ss.ServiceId == request.ServiceId)
+            ?? throw new BusinessRuleValidationException("StaffServiceMismatch", "This staff member does not provide the selected service.");
+
+        var durationMinutes = staffService.CustomDurationMinutes ?? service.DurationMinutes;
+        var price = staffService.CustomPrice ?? service.Price;
+        var timeZone = Common.Helpers.TimeZoneHelper.ResolveTimeZone(location.TimeZoneId);
+
+        var candidates = targetDates
+            .Select(date =>
+            {
+                var startAtUtc = Common.Helpers.TimeZoneHelper.ToUtc(date.ToDateTime(request.StartTimeOfDay), timeZone);
+                return new SlotCandidate(startAtUtc, startAtUtc.AddMinutes(durationMinutes));
+            })
+            .ToList();
 
         var recurringApptId = Guid.NewGuid();
         var (createdAppointments, skippedCount) = await _db.ExecuteInTransactionAsync(async () =>
@@ -106,31 +144,30 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
 
             await _db.AcquireStaffLockAsync(request.StaffId, request.TenantId, cancellationToken);
 
+            // Every occurrence is judged in one pass: the guard loads the calendar once for the whole span.
+            var slotChecks = await _availabilityService.CheckSlotsAsync(
+                request.TenantId,
+                request.LocationId,
+                request.ServiceId,
+                request.StaffId,
+                candidates,
+                excludeAppointmentId: null,
+                cancellationToken);
+
             var created = new List<Appointment>();
             var skipped = 0;
 
-            foreach (var date in targetDates)
+            for (var i = 0; i < candidates.Count; i++)
             {
-                var localDateTime = date.ToDateTime(request.StartTimeOfDay);
-                var tz = Common.Helpers.TimeZoneHelper.ResolveTimeZone(location.TimeZoneId);
-                var startAtUtc = Common.Helpers.TimeZoneHelper.ToUtc(localDateTime, tz);
-                var endAtUtc = startAtUtc.AddMinutes(service.DurationMinutes);
+                var date = targetDates[i];
+                var (startAtUtc, endAtUtc) = candidates[i];
+                var slotCheck = slotChecks[i];
 
-                var isAvailable = await _availabilityService.IsSlotAvailableAsync(
-                    request.TenantId,
-                    request.LocationId,
-                    request.ServiceId,
-                    request.StaffId,
-                    startAtUtc,
-                    endAtUtc,
-                    excludeAppointmentId: null,
-                    cancellationToken);
-
-                if (!isAvailable)
+                if (!slotCheck.IsAvailable)
                 {
                     if (request.ConflictPolicy == RecurrenceConflictPolicy.AbortSeries)
                     {
-                        throw new BookingConflictException($"Conflict detected on {date:yyyy-MM-dd}. Recurring series was aborted.");
+                        throw new BookingConflictException($"Conflict detected on {date:yyyy-MM-dd}: {slotCheck.Message} Recurring series was aborted.");
                     }
 
                     skipped++;
@@ -145,8 +182,8 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
                     request.CustomerId,
                     startAtUtc,
                     endAtUtc,
-                    service.DurationMinutes,
-                    service.Price,
+                    durationMinutes,
+                    price,
                     service.Currency,
                     request.Notes,
                     recurringAppointmentId: recurringApptId,

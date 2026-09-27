@@ -2,8 +2,7 @@ using System.Linq.Expressions;
 using System.Text.Json;
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Domain.Common;
-using BooklyHub.Domain.Entities.Appointments;
-using BooklyHub.Domain.Entities.Customers;
+using BooklyHub.Domain.Entities.Appointments;using BooklyHub.Domain.Entities.Customers;
 using BooklyHub.Domain.Entities.Identity;
 using BooklyHub.Domain.Entities.Organizations;
 using BooklyHub.Domain.Entities.Payments;
@@ -14,6 +13,7 @@ using BooklyHub.Domain.Entities.Services;
 using BooklyHub.Domain.Entities.StaffMembers;
 using BooklyHub.Domain.Entities.System;
 using BooklyHub.Domain.Entities.Tenancy;
+using BooklyHub.Domain.Exceptions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 
@@ -137,11 +137,23 @@ public class ApplicationDbContext : DbContext, IApplicationDbContext
         // Handle Auditable, Soft Delete, and Tenant Assignment
         foreach (var entry in ChangeTracker.Entries())
         {
-            if (entry.Entity is ITenantEntity tenantEntity && entry.State == EntityState.Added)
+            if (entry.Entity is ITenantEntity tenantEntity)
             {
-                if (tenantEntity.TenantId == Guid.Empty && _tenantContext.TenantId.HasValue)
+                if (tenantEntity.TenantId == Guid.Empty && entry.State == EntityState.Added && _tenantContext.TenantId.HasValue)
                 {
                     tenantEntity.TenantId = _tenantContext.TenantId.Value;
+                }
+
+                // Read queries are already scoped by the global filter; this closes the write path, so a
+                // tenant principal cannot persist an entity stamped with another tenant even if a handler
+                // or a future code path forgets to validate the identifier it was handed.
+                if (!_tenantContext.IsPlatformAdmin &&
+                    _tenantContext.TenantId is Guid currentTenantId &&
+                    tenantEntity.TenantId != currentTenantId &&
+                    entry.State is EntityState.Added or EntityState.Modified or EntityState.Deleted)
+                {
+                    throw new CrossTenantAccessViolationException(
+                        $"Cannot write {entry.Metadata.ClrType.Name} belonging to tenant {tenantEntity.TenantId}.");
                 }
             }
 

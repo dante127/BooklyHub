@@ -76,7 +76,7 @@ public class RescheduleAppointmentCommandHandler : IRequestHandler<RescheduleApp
         {
             await _db.AcquireStaffLockAsync(appointment.StaffId, request.TenantId, cancellationToken);
 
-            var isAvailable = await _availabilityService.IsSlotAvailableAsync(
+            var slotCheck = await _availabilityService.CheckSlotAsync(
                 request.TenantId,
                 appointment.LocationId,
                 appointment.ServiceId,
@@ -86,9 +86,9 @@ public class RescheduleAppointmentCommandHandler : IRequestHandler<RescheduleApp
                 excludeAppointmentId: appointment.Id,
                 cancellationToken);
 
-            if (!isAvailable)
+            if (!slotCheck.IsAvailable)
             {
-                throw new BookingConflictException("The selected new slot is not available for rescheduling.");
+                throw new BookingConflictException($"The selected new slot is not available: {slotCheck.Message}");
             }
 
             // Apply domain rescheduling (keeps original slot intact until committed)

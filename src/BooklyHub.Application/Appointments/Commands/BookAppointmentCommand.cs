@@ -132,7 +132,7 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
             await _db.AcquireStaffLockAsync(request.StaffId, request.TenantId, cancellationToken);
 
             // Concurrency Guard: re-check availability inside transaction
-            var isAvailable = await _availabilityService.IsSlotAvailableAsync(
+            var slotCheck = await _availabilityService.CheckSlotAsync(
                 request.TenantId,
                 request.LocationId,
                 request.ServiceId,
@@ -142,9 +142,9 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
                 excludeAppointmentId: null,
                 cancellationToken);
 
-            if (!isAvailable)
+            if (!slotCheck.IsAvailable)
             {
-                throw new BookingConflictException("The selected appointment slot or required resource is no longer available.");
+                throw new BookingConflictException(slotCheck.Message);
             }
 
             // Allocate required resources
