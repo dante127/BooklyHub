@@ -98,10 +98,20 @@ graph TD
    ```
 
 3. **Run Database Migrations & Seed Data**:
-   Database migrations and realistic multi-tenant demo data are automatically applied on startup in development mode:
+   Migration and seeding are driven by the `AutoMigrateAndSeed` setting, which is `true` in `appsettings.Development.json` and `false` everywhere else. In Development the demo data also needs `Seed:AdminEmail` and `Seed:AdminPassword`; a failed migration aborts startup instead of serving traffic on a broken schema.
    ```bash
    dotnet run --project src/BooklyHub.Api
    ```
+
+   For any non-development run you must supply configuration explicitly — there are no fallback secrets or connection strings baked into the build:
+
+   | Setting | Purpose |
+   | :--- | :--- |
+   | `ConnectionStrings__DefaultConnection` | SQL Server database |
+   | `ConnectionStrings__Redis` | Distributed cache; required in Production |
+   | `Jwt__Secret` | HMAC signing key, at least 32 bytes |
+   | `Jwt__Issuer`, `Jwt__Audience` | Must match the tokens you mint |
+   | `AutoMigrateAndSeed` | `true` migrates and seeds on startup; prefer `dotnet run --project src/BooklyHub.Api -- --migrate-only` |
 
 4. **Access Swagger UI**:
    Open [http://localhost:5000/swagger](http://localhost:5000/swagger) in your browser.
@@ -113,10 +123,14 @@ graph TD
 To spin up the entire production-like environment with SQL Server 2022, Redis, and the API:
 
 ```bash
+cp .env.example .env   # then set MSSQL_SA_PASSWORD and JWT_SECRET
 docker-compose up --build -d
 ```
 
-The API will be available at [http://localhost:5000](http://localhost:5000).
+The API will be available at [http://localhost:5000](http://localhost:5000). Compose refuses to start without
+those variables, and SQL Server, Redis and the API port are published on `127.0.0.1` only. Schema creation and
+demo seeding happen in a one-shot `migrator` container (`--migrate-only`) that must exit successfully before the
+API starts; the API container itself never migrates or seeds.
 
 ---
 

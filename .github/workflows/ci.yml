@@ -54,7 +54,7 @@ jobs:
 
     - name: Run Integration Tests (Real SQL Server)
       env:
-        ConnectionStrings__DefaultConnection: "Server=localhost,1433;Database=BooklyHubTestDb;User Id=sa;Password=Your_Strong_Password123!;TrustServerCertificate=True;MultipleActiveResultSets=True;"
+        BOOKLYHUB_TEST_CONNECTIONSTRING: "Server=localhost,1433;Database=BooklyHubTest;User Id=sa;Password=Your_Strong_Password123!;TrustServerCertificate=True;MultipleActiveResultSets=True;"
       run: dotnet test tests/BooklyHub.IntegrationTests/BooklyHub.IntegrationTests.csproj -c Release --no-build --verbosity normal --logger "trx;LogFileName=integration-tests.trx"
 
     - name: Publish Test Results

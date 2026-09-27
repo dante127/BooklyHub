@@ -11,19 +11,23 @@ using BooklyHub.Domain.Entities.StaffMembers;
 using BooklyHub.Domain.Entities.Tenancy;
 using BooklyHub.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
 namespace BooklyHub.Infrastructure.Data.Seeding;
 
 public static class DatabaseSeeder
 {
-    public static async Task SeedAsync(ApplicationDbContext db, IPasswordHasher hasher, ILogger logger)
+    public static async Task SeedAsync(ApplicationDbContext db, IPasswordHasher hasher, IConfiguration configuration, ILogger logger)
     {
         if (await db.Tenants.IgnoreQueryFilters().AnyAsync())
         {
             logger.LogInformation("Database already seeded. Skipping initial seeding.");
             return;
         }
+
+        var adminEmail = RequireConfiguration(configuration, "Seed:AdminEmail");
+        var adminPassword = RequireConfiguration(configuration, "Seed:AdminPassword");
 
         logger.LogInformation("Starting database seeding for 3 realistic tenants...");
 
@@ -58,10 +62,10 @@ public static class DatabaseSeeder
         var platformAdminUser = new User
         {
             Id = Guid.NewGuid(),
-            Email = "admin@booklyhub.com",
+            Email = adminEmail,
             FirstName = "Super",
             LastName = "Admin",
-            PasswordHash = hasher.HashPassword("Admin12345!"),
+            PasswordHash = hasher.HashPassword(adminPassword),
             IsActive = true
         };
         platformAdminUser.UserRoles.Add(new UserRole { UserId = platformAdminUser.Id, RoleId = platformAdminRole.Id });
@@ -235,5 +239,16 @@ public static class DatabaseSeeder
 
         await db.SaveChangesAsync();
         logger.LogInformation("Database seeding completed successfully for 3 tenants.");
+    }
+
+    private static string RequireConfiguration(IConfiguration configuration, string key)
+    {
+        var value = configuration[key];
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new InvalidOperationException($"Configuration key '{key}' is required to seed an administrator account.");
+        }
+
+        return value;
     }
 }

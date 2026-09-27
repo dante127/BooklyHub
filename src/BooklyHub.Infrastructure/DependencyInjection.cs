@@ -6,15 +6,20 @@ using BooklyHub.Infrastructure.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace BooklyHub.Infrastructure;
 
 public static class DependencyInjection
 {
-    public static IServiceCollection AddInfrastructure(this IServiceCollection services, IConfiguration configuration)
+    public static IServiceCollection AddInfrastructure(this IServiceCollection services, IConfiguration configuration, IHostEnvironment environment)
     {
-        var connectionString = configuration.GetConnectionString("DefaultConnection") 
-                               ?? "Server=(localdb)\\mssqllocaldb;Database=BooklyHubDb;Trusted_Connection=True;MultipleActiveResultSets=true;TrustServerCertificate=True";
+        var connectionString = configuration.GetConnectionString("DefaultConnection");
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            throw new InvalidOperationException(
+                "Configuration key 'ConnectionStrings:DefaultConnection' is missing or empty. There is no built-in fallback connection string.");
+        }
 
         services.AddDbContext<ApplicationDbContext>((sp, options) =>
         {
@@ -33,7 +38,8 @@ public static class DependencyInjection
         services.AddScoped<ICurrentUser, CurrentUser>();
         services.AddSingleton<IClock, SystemClock>();
 
-        // Distributed Cache (Redis or fallback MemoryCache)
+        // Distributed cache. The in-process fallback is per-instance, so cached state is not
+        // shared between nodes and is lost on restart.
         var redisConnection = configuration.GetConnectionString("Redis");
         if (!string.IsNullOrWhiteSpace(redisConnection))
         {
@@ -42,6 +48,11 @@ public static class DependencyInjection
                 options.Configuration = redisConnection;
                 options.InstanceName = "BooklyHub:";
             });
+        }
+        else if (environment.IsProduction())
+        {
+            throw new InvalidOperationException(
+                "Configuration key 'ConnectionStrings:Redis' is required in Production. The in-memory fallback is single-node only.");
         }
         else
         {
@@ -59,9 +70,8 @@ public static class DependencyInjection
         services.AddSingleton<Microsoft.AspNetCore.Authorization.IAuthorizationPolicyProvider, PermissionPolicyProvider>();
         services.AddScoped<Microsoft.AspNetCore.Authorization.IAuthorizationHandler, PermissionAuthorizationHandler>();
 
-        var jwtSecret = configuration["Jwt:Secret"] ?? "BooklyHub_SuperSecret_Jwt_SigningKey_For_Production_Saas_2026!";
-        var jwtIssuer = configuration["Jwt:Issuer"] ?? "BooklyHub";
-        var jwtAudience = configuration["Jwt:Audience"] ?? "BooklyHubClients";
+        // Eager check so a missing or weak signing key aborts startup instead of failing the first request.
+        JwtSigningSettings.FromConfiguration(configuration);
 
         services.AddAuthentication(options =>
         {
@@ -70,15 +80,19 @@ public static class DependencyInjection
         })
         .AddJwtBearer(options =>
         {
+            // Resolved inside the options callback, not at registration time: configuration sources
+            // added later must be visible so validation uses the same key the token generator reads.
+            var jwtSettings = JwtSigningSettings.FromConfiguration(configuration);
+
             options.TokenValidationParameters = new Microsoft.IdentityModel.Tokens.TokenValidationParameters
             {
                 ValidateIssuer = true,
                 ValidateAudience = true,
                 ValidateLifetime = true,
                 ValidateIssuerSigningKey = true,
-                ValidIssuer = jwtIssuer,
-                ValidAudience = jwtAudience,
-                IssuerSigningKey = new Microsoft.IdentityModel.Tokens.SymmetricSecurityKey(System.Text.Encoding.UTF8.GetBytes(jwtSecret)),
+                ValidIssuer = jwtSettings.Issuer,
+                ValidAudience = jwtSettings.Audience,
+                IssuerSigningKey = new Microsoft.IdentityModel.Tokens.SymmetricSecurityKey(System.Text.Encoding.UTF8.GetBytes(jwtSettings.Secret)),
                 ClockSkew = TimeSpan.FromSeconds(30)
             };
         });

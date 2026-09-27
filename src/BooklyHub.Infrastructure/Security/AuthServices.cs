@@ -21,12 +21,9 @@ public class JwtTokenGenerator : IJwtTokenGenerator
 
     public string GenerateAccessToken(User user, IReadOnlyList<string> roles, IReadOnlyList<string> permissions)
     {
-        var secret = _configuration["Jwt:Secret"] ?? "BooklyHub_SuperSecret_Jwt_SigningKey_For_Production_Saas_2026!";
-        var issuer = _configuration["Jwt:Issuer"] ?? "BooklyHub";
-        var audience = _configuration["Jwt:Audience"] ?? "BooklyHubClients";
-        var expirationMinutes = int.TryParse(_configuration["Jwt:ExpirationMinutes"], out var exp) ? exp : 60;
+        var settings = JwtSigningSettings.FromConfiguration(_configuration);
 
-        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(settings.Secret));
         var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
         var claims = new List<Claim>
@@ -54,10 +51,10 @@ public class JwtTokenGenerator : IJwtTokenGenerator
         }
 
         var token = new JwtSecurityToken(
-            issuer: issuer,
-            audience: audience,
+            issuer: settings.Issuer,
+            audience: settings.Audience,
             claims: claims,
-            expires: DateTime.UtcNow.AddMinutes(expirationMinutes),
+            expires: DateTime.UtcNow.AddMinutes(settings.ExpirationMinutes),
             signingCredentials: credentials);
 
         return new JwtSecurityTokenHandler().WriteToken(token);

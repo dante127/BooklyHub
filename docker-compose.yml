@@ -4,14 +4,14 @@ services:
     container_name: booklyhub-sqlserver
     environment:
       - ACCEPT_EULA=Y
-      - MSSQL_SA_PASSWORD=Your_Strong_Password123!
+      - MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD:?MSSQL_SA_PASSWORD must be set (see .env.example)}
       - MSSQL_PID=Developer
     ports:
-      - "1433:1433"
+      - "127.0.0.1:1433:1433"
     volumes:
       - sqlserver-data:/var/opt/mssql
     healthcheck:
-      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Your_Strong_Password123!' -C -Q 'SELECT 1' || exit 1"]
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -22,7 +22,7 @@ services:
     image: redis:7-alpine
     container_name: booklyhub-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -32,6 +32,26 @@ services:
       retries: 5
     restart: unless-stopped
 
+  migrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: booklyhub-migrator
+    command: ["--migrate-only"]
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=BooklyHubDb;User Id=sa;Password=${MSSQL_SA_PASSWORD:?MSSQL_SA_PASSWORD must be set};TrustServerCertificate=True;MultipleActiveResultSets=True;
+      - ConnectionStrings__Redis=redis:6379,abortConnect=false
+      - Jwt__Secret=${JWT_SECRET:?JWT_SECRET must be set to a unique value of at least 32 bytes}
+      - Jwt__Issuer=BooklyHub
+      - Jwt__Audience=BooklyHubClients
+      - Seed__AdminEmail=${SEED_ADMIN_EMAIL:?SEED_ADMIN_EMAIL must be set}
+      - Seed__AdminPassword=${SEED_ADMIN_PASSWORD:?SEED_ADMIN_PASSWORD must be set}
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build:
       context: .
@@ -39,18 +59,17 @@ services:
     container_name: booklyhub-api
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
-      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=BooklyHubDb;User Id=sa;Password=Your_Strong_Password123!;TrustServerCertificate=True;MultipleActiveResultSets=True;
+      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=BooklyHubDb;User Id=sa;Password=${MSSQL_SA_PASSWORD:?MSSQL_SA_PASSWORD must be set};TrustServerCertificate=True;MultipleActiveResultSets=True;
       - ConnectionStrings__Redis=redis:6379,abortConnect=false
-      - JwtSettings__Secret=BooklyHubSuperSecretProductionSigningKey2026!WithHighEntropy32CharsMinimum
-      - JwtSettings__Issuer=BooklyHub
-      - JwtSettings__Audience=BooklyHubApi
-      - JwtSettings__AccessTokenExpirationMinutes=60
-      - JwtSettings__RefreshTokenExpirationDays=30
+      - Jwt__Secret=${JWT_SECRET:?JWT_SECRET must be set to a unique value of at least 32 bytes}
+      - Jwt__Issuer=BooklyHub
+      - Jwt__Audience=BooklyHubClients
+      - Jwt__ExpirationMinutes=60
     ports:
-      - "5000:8080"
+      - "127.0.0.1:5000:8080"
     depends_on:
-      sqlserver:
-        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     restart: unless-stopped

@@ -32,6 +32,7 @@ public class CrossTenantSecurityTests : IClassFixture<BooklyHubWebApplicationFac
         var tenantAId = Guid.NewGuid();
         var tenantBId = Guid.NewGuid();
         Guid tenantBApptId;
+        Guid tenantAApptId;
 
         // Seed data for Tenant A and Tenant B
         using (var scope = _factory.Services.CreateScope())
@@ -67,11 +68,42 @@ public class CrossTenantSecurityTests : IClassFixture<BooklyHubWebApplicationFac
             db.Appointments.Add(apptB);
             tenantBApptId = apptB.Id;
 
+            // Tenant A's own appointment: proves the filter resolves to the caller's tenant rather
+            // than to whatever tenant the (cached) model happened to be built for.
+            var locA = new Location { Id = Guid.NewGuid(), TenantId = tenantAId, Name = "Loc A", Address = "A", City = "A", Country = "US" };
+            var srvA = new Service { Id = Guid.NewGuid(), TenantId = tenantAId, Name = "Srv A", DurationMinutes = 30, Price = 50 };
+            var staffA = new Staff { Id = Guid.NewGuid(), TenantId = tenantAId, LocationId = locA.Id, FirstName = "Staff", LastName = "A", Email = "a@a.com" };
+            var custA = new Customer { Id = Guid.NewGuid(), TenantId = tenantAId, FirstName = "Cust", LastName = "A", Email = "custa@a.com" };
+
+            db.Locations.Add(locA);
+            db.Services.Add(srvA);
+            db.StaffMembers.Add(staffA);
+            db.Customers.Add(custA);
+
+            var apptA = Appointment.Create(
+                tenantAId,
+                locA.Id,
+                srvA.Id,
+                staffA.Id,
+                custA.Id,
+                DateTime.UtcNow.AddDays(1),
+                DateTime.UtcNow.AddDays(1).AddMinutes(30),
+                30,
+                50.00m);
+            apptA.TransitionTo(AppointmentStatus.Confirmed);
+
+            db.Appointments.Add(apptA);
+            tenantAApptId = apptA.Id;
+
             await db.SaveChangesAsync();
         }
 
         // Authenticate as Tenant A
         var clientA = _factory.CreateClientForTenant(tenantAId, Roles.TenantAdmin);
+
+        // Positive control: Tenant A must see its own appointment
+        var ownResponse = await clientA.GetAsync($"/api/v1/appointments/{tenantAApptId}");
+        ownResponse.StatusCode.Should().Be(HttpStatusCode.OK);
 
         // Attempt 1: Directly request Tenant B's appointment by ID
         var response = await clientA.GetAsync($"/api/v1/appointments/{tenantBApptId}");

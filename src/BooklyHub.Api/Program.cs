@@ -25,7 +25,7 @@ builder.Host.UseSerilog();
 
 // Add Layers
 builder.Services.AddApplication();
-builder.Services.AddInfrastructure(builder.Configuration);
+builder.Services.AddInfrastructure(builder.Configuration, builder.Environment);
 
 // Add Controllers with JSON Enum Converters
 builder.Services.AddControllers()
@@ -87,29 +87,32 @@ builder.Services.AddSwaggerGen(c =>
 
 var app = builder.Build();
 
-// Auto-migrate & seed in development or on command
-if (app.Environment.IsDevelopment() || builder.Configuration.GetValue<bool>("AutoMigrateAndSeed"))
+// Database preparation is opt-in, never implied by the environment: an instance must not migrate
+// or seed itself on boot unless an operator asked for it. `--migrate-only` performs the same step
+// as a one-shot job and exits before the web server starts.
+// Failures are deliberately unhandled so the process exits instead of serving traffic against an
+// out-of-date or empty schema.
+if (args.Contains("--migrate-only") || builder.Configuration.GetValue<bool>("AutoMigrateAndSeed"))
 {
     using var scope = app.Services.CreateScope();
     var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
     var hasher = scope.ServiceProvider.GetRequiredService<IPasswordHasher>();
     var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
 
-    try
+    if (db.Database.IsRelational())
     {
-        if (db.Database.IsRelational())
-        {
-            await db.Database.MigrateAsync();
-        }
-        else
-        {
-            await db.Database.EnsureCreatedAsync();
-        }
-        await DatabaseSeeder.SeedAsync(db, hasher, logger);
+        await db.Database.MigrateAsync();
     }
-    catch (Exception ex)
+    else
     {
-        logger.LogError(ex, "Failed applying database migrations or seeding.");
+        await db.Database.EnsureCreatedAsync();
+    }
+
+    await DatabaseSeeder.SeedAsync(db, hasher, builder.Configuration, logger);
+
+    if (args.Contains("--migrate-only"))
+    {
+        return;
     }
 }
 
