@@ -1,6 +1,7 @@
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Domain.Entities.System;
 using BooklyHub.Domain.Enums;
+using BooklyHub.Infrastructure.MultiTenancy;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -43,9 +44,9 @@ public class AppointmentReminderBackgroundService : BackgroundService
         _logger.LogInformation("AppointmentReminderBackgroundService stopped.");
     }
 
-    private async Task ProcessUpcomingRemindersAsync(CancellationToken cancellationToken)
+    public async Task<int> ProcessUpcomingRemindersAsync(CancellationToken cancellationToken)
     {
-        using var scope = _scopeFactory.CreateScope();
+        using var scope = _scopeFactory.CreateSystemScope();
         var db = scope.ServiceProvider.GetRequiredService<IApplicationDbContext>();
         var emailSender = scope.ServiceProvider.GetRequiredService<IEmailSender>();
         var clock = scope.ServiceProvider.GetRequiredService<IClock>();
@@ -63,7 +64,9 @@ public class AppointmentReminderBackgroundService : BackgroundService
                         a.StartAtUtc <= reminderWindowEnd)
             .ToListAsync(cancellationToken);
 
-        if (upcomingAppointments.Count == 0) return;
+        if (upcomingAppointments.Count == 0) return 0;
+
+        var remindersSent = 0;
 
         foreach (var appt in upcomingAppointments)
         {
@@ -99,6 +102,8 @@ public class AppointmentReminderBackgroundService : BackgroundService
                     SentAtUtc = clock.UtcNow,
                     CreatedAtUtc = clock.UtcNow
                 });
+
+                remindersSent++;
             }
             catch (Exception ex)
             {
@@ -107,5 +112,7 @@ public class AppointmentReminderBackgroundService : BackgroundService
         }
 
         await db.SaveChangesAsync(cancellationToken);
+
+        return remindersSent;
     }
 }

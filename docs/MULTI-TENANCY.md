@@ -66,3 +66,29 @@ In BooklyHub:
 - SQL Server returns 0 matching rows.
 - The API handler triggers a `NotFoundException` (HTTP 404), completely concealing Tenant A's data.
 - This behavior is continuously verified in `tests/BooklyHub.IntegrationTests/Security/CrossTenantSecurityTests.cs`.
+
+---
+
+## 5. Write-Path Enforcement and Host Workers
+
+The global query filter only constrains reads, so two further rules close the loop:
+
+**Cross-tenant write invariant (`ApplicationDbContext.SaveChangesAsync`).**
+Any `Added`, `Modified` or `Deleted` entity whose `TenantId` differs from the bound tenant throws
+`CrossTenantAccessViolationException` (HTTP 403). It applies only when a tenant is bound and the caller is
+not a platform administrator, so request handlers get a second net behind their own validation while
+seeding and host work still operate across tenants.
+
+**System scope for background workers (`SystemTenantScope.CreateSystemScope`).**
+Workers resolve `IServiceScopeFactory.CreateScope()`, which carries an **unbound** `ITenantContext`:
+`TenantId == null` and `IsPlatformAdmin == false`, so the filter matches nothing and a sweep would silently
+process zero rows. Both `OutboxProcessorBackgroundService` and `AppointmentReminderBackgroundService`
+therefore open a system scope, which binds `SetTenant(Guid.Empty, isPlatformAdmin: true)` for that scope only.
+
+- `IgnoreQueryFilters()` was rejected as the fix: it also drops the `!IsDeleted` soft-delete filter and has to be remembered per query.
+- Binding the scope to one tenant was rejected too: `OutboxMessage` carries no `TenantId`, and the reminder sweep is cross-tenant by design.
+- Request-path code must never call `CreateSystemScope()`; the middleware owns tenant binding for HTTP calls.
+
+Verified by `tests/BooklyHub.IntegrationTests/Notifications/NotificationDeliveryTests.cs`, which fails when
+either worker is switched back to a plain scope (zero rows read, and the outbox message is marked processed
+without any email being sent).

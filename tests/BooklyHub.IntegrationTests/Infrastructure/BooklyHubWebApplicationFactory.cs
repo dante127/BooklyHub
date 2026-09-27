@@ -26,6 +26,15 @@ public class BooklyHubWebApplicationFactory : WebApplicationFactory<Program>, IA
 
     public QueryCountInterceptor QueryInterceptor { get; } = new();
 
+    /// <summary>
+    /// Last-mile service overrides (recording email senders and the like), applied after the test host has
+    /// replaced the connection string and removed the polling workers. A virtual hook rather than a
+    /// constructor argument because xUnit class fixtures must be constructible with no parameters.
+    /// </summary>
+    protected virtual void ConfigureTestServices(IServiceCollection services)
+    {
+    }
+
     public BooklyHubWebApplicationFactory()
     {
         var injected =
@@ -91,6 +100,8 @@ public class BooklyHubWebApplicationFactory : WebApplicationFactory<Program>, IA
                 });
                 options.AddInterceptors(QueryInterceptor);
             });
+
+            ConfigureTestServices(services);
         });
     }
 

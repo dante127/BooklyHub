@@ -1,6 +1,7 @@
 using System.Text.Json;
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Domain.Events;
+using BooklyHub.Infrastructure.MultiTenancy;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -44,9 +45,9 @@ public class OutboxProcessorBackgroundService : BackgroundService
         _logger.LogInformation("OutboxProcessorBackgroundService stopped.");
     }
 
-    private async Task ProcessPendingMessagesAsync(CancellationToken cancellationToken)
+    public async Task<int> ProcessPendingMessagesAsync(CancellationToken cancellationToken)
     {
-        using var scope = _scopeFactory.CreateScope();
+        using var scope = _scopeFactory.CreateSystemScope();
         var db = scope.ServiceProvider.GetRequiredService<IApplicationDbContext>();
         var publisher = scope.ServiceProvider.GetRequiredService<IPublisher>();
         var clock = scope.ServiceProvider.GetRequiredService<IClock>();
@@ -60,7 +61,7 @@ public class OutboxProcessorBackgroundService : BackgroundService
             .Take(20)
             .ToListAsync(cancellationToken);
 
-        if (messages.Count == 0) return;
+        if (messages.Count == 0) return 0;
 
         foreach (var message in messages)
         {
@@ -110,6 +111,8 @@ public class OutboxProcessorBackgroundService : BackgroundService
         }
 
         await db.SaveChangesAsync(cancellationToken);
+
+        return messages.Count;
     }
 
     private static Type? ResolveEventType(string typeName)
