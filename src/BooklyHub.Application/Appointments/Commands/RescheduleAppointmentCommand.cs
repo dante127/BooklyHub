@@ -63,12 +63,9 @@ public class RescheduleAppointmentCommandHandler : IRequestHandler<RescheduleApp
             .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == request.TenantId, cancellationToken)
             ?? throw new NotFoundException($"Appointment with ID {request.AppointmentId} was not found.");
 
-        // Rescheduling cutoff check
-        var cutoffHours = tenant.Settings?.ReschedulingCutoffHours ?? 12;
-        if (appointment.StartAtUtc - _clock.UtcNow < TimeSpan.FromHours(cutoffHours))
-        {
-            throw new BusinessRuleValidationException("RescheduleCutoffExceeded", $"Appointments cannot be rescheduled within {cutoffHours} hours of the start time.");
-        }
+        // The tenant's rescheduling cutoff, from the same policy object that guards cancellation, and with
+        // the same override roles: a manager trusted to cancel late is trusted to move an appointment late.
+        AppointmentCutoffPolicy.EnsureReschedulable(tenant.Settings, appointment.StartAtUtc, _clock.UtcNow, _currentUser);
 
         var newEndAtUtc = request.NewStartAtUtc.AddMinutes(appointment.DurationMinutes);
 

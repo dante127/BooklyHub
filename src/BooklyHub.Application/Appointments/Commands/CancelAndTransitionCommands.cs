@@ -53,16 +53,9 @@ public class CancelAppointmentCommandHandler : IRequestHandler<CancelAppointment
                 .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == request.TenantId, cancellationToken)
                 ?? throw new NotFoundException($"Appointment with ID {request.AppointmentId} was not found.");
 
-            // Check cancellation cutoff for customers/non-admin staff
-            var isStaffOrAdmin = _currentUser.IsInRole("PlatformAdmin") || _currentUser.IsInRole("TenantOwner") || _currentUser.IsInRole("TenantAdmin") || _currentUser.IsInRole("Manager");
-            if (!isStaffOrAdmin)
-            {
-                var cutoffHours = tenant.Settings?.CancellationCutoffHours ?? 24;
-                if (appointment.StartAtUtc - _clock.UtcNow < TimeSpan.FromHours(cutoffHours))
-                {
-                    throw new BusinessRuleValidationException("CancellationCutoffExceeded", $"Appointments cannot be cancelled within {cutoffHours} hours of the start time.");
-                }
-            }
+            // The tenant's cancellation cutoff, asked from the one policy object so the generic transition
+            // to Cancelled cannot be used to sidestep it. Owners, admins and managers may override.
+            AppointmentCutoffPolicy.EnsureCancellable(tenant.Settings, appointment.StartAtUtc, _clock.UtcNow, _currentUser);
 
             // TransitionTo returns the history row it appended; it must be registered as new, not discovered
             // through the navigation (see the domain method).
@@ -99,11 +92,13 @@ public class TransitionAppointmentStatusCommandHandler : IRequestHandler<Transit
 {
     private readonly IApplicationDbContext _db;
     private readonly ICurrentUser _currentUser;
+    private readonly IClock _clock;
 
-    public TransitionAppointmentStatusCommandHandler(IApplicationDbContext db, ICurrentUser currentUser)
+    public TransitionAppointmentStatusCommandHandler(IApplicationDbContext db, ICurrentUser currentUser, IClock clock)
     {
         _db = db;
         _currentUser = currentUser;
+        _clock = clock;
     }
 
     public async Task<AppointmentDto> Handle(TransitionAppointmentStatusCommand request, CancellationToken cancellationToken)
@@ -120,6 +115,20 @@ public class TransitionAppointmentStatusCommandHandler : IRequestHandler<Transit
                 .Include(a => a.AppointmentResources)
                 .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == request.TenantId, cancellationToken)
                 ?? throw new NotFoundException($"Appointment with ID {request.AppointmentId} was not found.");
+
+            // Cancelling through this endpoint used to skip the tenant's cancellation cutoff, which made the
+            // rule advisory: any actor holding appointments.update could cancel minutes before the start
+            // time by choosing this URL over /cancel.
+            if (request.NewStatus == AppointmentStatus.Cancelled)
+            {
+                var settings = await _db.Tenants
+                    .AsNoTracking()
+                    .Where(t => t.Id == request.TenantId)
+                    .Select(t => t.Settings)
+                    .FirstOrDefaultAsync(cancellationToken);
+
+                AppointmentCutoffPolicy.EnsureCancellable(settings, loaded.StartAtUtc, _clock.UtcNow, _currentUser);
+            }
 
             // TransitionTo returns the history row it appended; it must be registered as new, not discovered
             // through the navigation (see the domain method).
