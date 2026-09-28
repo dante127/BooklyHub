@@ -128,11 +128,12 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
             (AppointmentStatus.Pending, AppointmentStatus.Cancelled) => true,
 
             (AppointmentStatus.Confirmed, AppointmentStatus.CheckedIn) => true,
-            (AppointmentStatus.Confirmed, AppointmentStatus.Rescheduled) => true,
+            (AppointmentStatus.Confirmed, AppointmentStatus.Completed) => true,
             (AppointmentStatus.Confirmed, AppointmentStatus.Cancelled) => true,
             (AppointmentStatus.Confirmed, AppointmentStatus.NoShow) => true,
 
             (AppointmentStatus.CheckedIn, AppointmentStatus.InProgress) => true,
+            (AppointmentStatus.CheckedIn, AppointmentStatus.Completed) => true,
             (AppointmentStatus.CheckedIn, AppointmentStatus.Cancelled) => true,
             (AppointmentStatus.CheckedIn, AppointmentStatus.NoShow) => true,
 
@@ -144,24 +145,39 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
     }
 
     /// <summary>
-    /// Returns the appended history row, or null when the status is unchanged. A caller changing an
-    /// appointment that is already stored has to register that row with the context as new: a row that
-    /// reaches the change tracker only through the StatusHistories navigation of a tracked appointment is
-    /// treated as an existing row, and the update it generates matches nothing.
+    /// Returns the appended history row. A caller changing an appointment that is already stored has to
+    /// register that row with the context as new: a row that reaches the change tracker only through the
+    /// StatusHistories navigation of a tracked appointment is treated as an existing row, and the update
+    /// it generates matches nothing.
     /// </summary>
-    public AppointmentStatusHistory? TransitionTo(AppointmentStatus newStatus, string? reason = null, string? changedBy = null)
+    public AppointmentStatusHistory TransitionTo(AppointmentStatus newStatus, string? reason = null, string? changedBy = null)
     {
-        if (Status == newStatus)
-        {
-            return null;
-        }
-
         if (!CanTransitionTo(newStatus))
         {
             throw new InvalidStateTransitionException(
                 Status.ToString(),
                 newStatus.ToString(),
                 $"Transition from {Status} to {newStatus} is not permitted.");
+        }
+
+        // Execution statuses describe something happening at the appointment, so they may not be set
+        // before the appointment could conceivably be happening; anything earlier is a data entry error
+        // that would corrupt reporting and the reminder sweep.
+        var now = DateTime.UtcNow;
+        var tooEarly = newStatus switch
+        {
+            AppointmentStatus.CheckedIn => now < StartAtUtc - TimeSpan.FromHours(1),
+            AppointmentStatus.InProgress => now < StartAtUtc - TimeSpan.FromMinutes(15),
+            AppointmentStatus.Completed => now < StartAtUtc,
+            AppointmentStatus.NoShow => now < StartAtUtc,
+            _ => false
+        };
+
+        if (tooEarly)
+        {
+            throw new BusinessRuleValidationException(
+                "TransitionTooEarly",
+                $"Cannot mark an appointment as {newStatus} before its start time ({StartAtUtc:O}).");
         }
 
         var previousStatus = Status;

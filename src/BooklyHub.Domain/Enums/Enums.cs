@@ -9,6 +9,8 @@ public enum AppointmentStatus
     Completed = 5,
     Cancelled = 6,
     NoShow = 7,
+    // Reserved for historical rows. Reschedule() moves the appointment in place and keeps it
+    // Pending/Confirmed, so no flow may set this status; it still occupies its slot if present.
     Rescheduled = 8
 }
 

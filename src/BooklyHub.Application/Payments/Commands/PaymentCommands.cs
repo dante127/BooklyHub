@@ -151,11 +151,8 @@ public class ProcessPaymentCommandHandler : IRequestHandler<ProcessPaymentComman
             {
                 if (appointment.Status == AppointmentStatus.Pending)
                 {
-                    var history = appointment.TransitionTo(AppointmentStatus.Confirmed, "Payment received", _currentUser.UserId?.ToString());
-                    if (history is not null)
-                    {
-                        _db.AppointmentStatusHistories.Add(history);
-                    }
+                    _db.AppointmentStatusHistories.Add(
+                        appointment.TransitionTo(AppointmentStatus.Confirmed, "Payment received", _currentUser.UserId?.ToString()));
                 }
 
                 await _db.AdjustTotalSpentAsync(request.TenantId, appointment.CustomerId, request.Amount, cancellationToken);

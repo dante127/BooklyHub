@@ -214,7 +214,8 @@ public class AppointmentLifecycleTests : IClassFixture<BooklyHubWebApplicationFa
     public async Task Transition_ConfirmedToCheckedIn_MustPersistAndWriteHistory()
     {
         var graph = await SeedGraphAsync();
-        var appointmentId = await SeedConfirmedAppointmentAsync(graph, DateTime.UtcNow.Date.AddDays(2).AddHours(9));
+        // Check-in is temporally gated, so the appointment must be close enough to now to be check-in-able.
+        var appointmentId = await SeedConfirmedAppointmentAsync(graph, DateTime.UtcNow.AddMinutes(20));
 
         var response = await ManagerClient(graph).PostAsJsonAsync(
             $"/api/v1/appointments/{appointmentId}/transition",
@@ -227,6 +228,83 @@ public class AppointmentLifecycleTests : IClassFixture<BooklyHubWebApplicationFa
 
         var history = await ReadHistoryAsync(appointmentId);
         history.Should().Contain(h => h.ToStatus == AppointmentStatus.CheckedIn);
+    }
+
+    [Fact]
+    public async Task Transition_ConfirmedToCompleted_MustPersistAndWriteHistory()
+    {
+        var graph = await SeedGraphAsync();
+        var appointmentId = await SeedConfirmedAppointmentAsync(graph, DateTime.UtcNow.AddHours(-2));
+
+        var response = await ManagerClient(graph).PostAsJsonAsync(
+            $"/api/v1/appointments/{appointmentId}/transition",
+            new AppointmentsController.TransitionStatusRequest(AppointmentStatus.Completed, "visit done, no check-in ceremony"));
+
+        Assert.True(response.StatusCode == HttpStatusCode.OK,
+            $"expected 200, got {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync()}");
+
+        (await ReadAppointmentAsync(appointmentId)).Status.Should().Be(AppointmentStatus.Completed);
+
+        var history = await ReadHistoryAsync(appointmentId);
+        history.Should().Contain(h => h.ToStatus == AppointmentStatus.Completed && h.FromStatus == AppointmentStatus.Confirmed);
+    }
+
+    [Fact]
+    public async Task Transition_ToRescheduled_MustBeRejected()
+    {
+        var graph = await SeedGraphAsync();
+        var appointmentId = await SeedConfirmedAppointmentAsync(graph, DateTime.UtcNow.Date.AddDays(2).AddHours(9));
+
+        var response = await ManagerClient(graph).PostAsJsonAsync(
+            $"/api/v1/appointments/{appointmentId}/transition",
+            new AppointmentsController.TransitionStatusRequest(AppointmentStatus.Rescheduled, "moved by hand"));
+
+        Assert.True(response.StatusCode == HttpStatusCode.UnprocessableEntity,
+            $"expected 422, got {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync()}");
+
+        (await ReadAppointmentAsync(appointmentId)).Status.Should().Be(AppointmentStatus.Confirmed,
+            "Reschedule() moves the time in place, so nothing may ever set the Rescheduled status");
+    }
+
+    [Fact]
+    public async Task Transition_CheckInForFutureAppointment_MustBeRejected()
+    {
+        var graph = await SeedGraphAsync();
+        var appointmentId = await SeedConfirmedAppointmentAsync(graph, DateTime.UtcNow.Date.AddDays(2).AddHours(9));
+
+        var response = await ManagerClient(graph).PostAsJsonAsync(
+            $"/api/v1/appointments/{appointmentId}/transition",
+            new AppointmentsController.TransitionStatusRequest(AppointmentStatus.CheckedIn, "arrived two days early"));
+
+        Assert.True(response.StatusCode == HttpStatusCode.UnprocessableEntity,
+            $"expected 422, got {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync()}");
+
+        (await ReadAppointmentAsync(appointmentId)).Status.Should().Be(AppointmentStatus.Confirmed,
+            "a rejected transition must leave the stored status untouched");
+    }
+
+    [Fact]
+    public async Task RescheduledRow_StillOccupiesItsSlot()
+    {
+        // A legacy row in the reserved Rescheduled state still holds a real customer and a real time.
+        // If availability ignored it, the slot would double-book while the row is still displayed.
+        var graph = await SeedGraphAsync();
+        var slotStart = DateTime.UtcNow.Date.AddDays(2).AddHours(9);
+        var appointmentId = await SeedConfirmedAppointmentAsync(graph, slotStart);
+
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            await db.Database.ExecuteSqlAsync($"UPDATE Appointments SET Status = {(int)AppointmentStatus.Rescheduled} WHERE Id = {appointmentId}");
+        }
+
+        var client = _factory.CreateClientForTenant(graph.TenantId, Roles.Staff);
+        var response = await client.PostAsJsonAsync("/api/v1/appointments",
+            new AppointmentsController.BookAppointmentRequest(
+                graph.LocationId, graph.ServiceId, graph.StaffId, graph.CustomerId, slotStart, "overlap attempt"));
+
+        Assert.True(response.StatusCode == HttpStatusCode.Conflict,
+            $"expected 409, got {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync()}");
     }
 
     [Fact]

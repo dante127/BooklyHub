@@ -478,14 +478,14 @@ public class AvailabilityService : IAvailabilityService
             .ToHashSet();
 
         // Resource contention is location-wide, so appointments are loaded regardless of which staff
-        // member is being evaluated, and closed days still contribute their existing bookings.
+        // member is being evaluated, and closed days still contribute their existing bookings. Only a
+        // cancellation frees a slot: any other live row (including a legacy Rescheduled one) still blocks it.
         var occupancy = await _db.Appointments
             .AsNoTracking()
             .Include(a => a.AppointmentResources)
             .Where(a => a.TenantId == context.TenantId &&
                         a.LocationId == context.LocationId &&
                         a.Status != AppointmentStatus.Cancelled &&
-                        a.Status != AppointmentStatus.Rescheduled &&
                         a.StartAtUtc < rangeEndUtc &&
                         a.EndAtUtc > rangeStartUtc)
             .Select(a => new Occupancy(

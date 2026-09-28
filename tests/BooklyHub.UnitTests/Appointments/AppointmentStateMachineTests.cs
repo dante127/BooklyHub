@@ -11,14 +11,17 @@ public class AppointmentStateMachineTests
 {
     private Appointment CreateSampleAppointment()
     {
+        // Started two hours ago: the execution statuses (CheckedIn/InProgress/Completed/NoShow) are
+        // temporally gated, so a lifecycle test needs an appointment whose time has come.
+        var start = DateTime.UtcNow.AddHours(-2);
         return Appointment.Create(
             tenantId: Guid.NewGuid(),
             locationId: Guid.NewGuid(),
             serviceId: Guid.NewGuid(),
             staffId: Guid.NewGuid(),
             customerId: Guid.NewGuid(),
-            startAtUtc: new DateTime(2026, 11, 10, 10, 0, 0, DateTimeKind.Utc),
-            endAtUtc: new DateTime(2026, 11, 10, 10, 45, 0, DateTimeKind.Utc),
+            startAtUtc: start,
+            endAtUtc: start.AddMinutes(45),
             durationMinutes: 45,
             price: 75.00m,
             notes: "Test booking");
@@ -96,8 +99,8 @@ public class AppointmentStateMachineTests
         var appt = CreateSampleAppointment();
         appt.TransitionTo(AppointmentStatus.Confirmed);
 
-        var newStart = new DateTime(2026, 11, 12, 14, 0, 0, DateTimeKind.Utc);
-        var newEnd = new DateTime(2026, 11, 12, 14, 45, 0, DateTimeKind.Utc);
+        var newStart = DateTime.UtcNow.AddDays(2).Date.AddHours(14);
+        var newEnd = newStart.AddMinutes(45);
 
         appt.Reschedule(newStart, newEnd, "Customer requested new time", "Receptionist");
 
@@ -115,11 +118,106 @@ public class AppointmentStateMachineTests
         var appt = CreateSampleAppointment();
         appt.TransitionTo(AppointmentStatus.Confirmed);
 
-        var newStart = new DateTime(2026, 11, 12, 14, 0, 0, DateTimeKind.Utc);
-        var newEnd = new DateTime(2026, 11, 12, 13, 0, 0, DateTimeKind.Utc); // Earlier than start!
+        var newStart = DateTime.UtcNow.AddDays(2).Date.AddHours(14);
+        var newEnd = newStart.AddHours(-1); // Earlier than start!
 
         var act = () => appt.Reschedule(newStart, newEnd);
 
         act.Should().Throw<BusinessRuleValidationException>();
+    }
+
+    [Fact]
+    public void Transition_ConfirmedToCompleted_AfterStart_ShouldSucceed()
+    {
+        var appt = CreateSampleAppointment();
+        appt.TransitionTo(AppointmentStatus.Confirmed);
+
+        appt.TransitionTo(AppointmentStatus.Completed, "Walk-in handled without check-in ceremony");
+
+        appt.Status.Should().Be(AppointmentStatus.Completed);
+        appt.DomainEvents.Should().Contain(e => e is AppointmentCompletedEvent);
+    }
+
+    [Fact]
+    public void Transition_CheckedInToCompleted_AfterStart_ShouldSucceed()
+    {
+        var appt = CreateSampleAppointment();
+        appt.TransitionTo(AppointmentStatus.Confirmed);
+        appt.TransitionTo(AppointmentStatus.CheckedIn);
+
+        appt.TransitionTo(AppointmentStatus.Completed);
+
+        appt.Status.Should().Be(AppointmentStatus.Completed);
+    }
+
+    [Fact]
+    public void Transition_ToRescheduled_ShouldAlwaysThrow()
+    {
+        // Reschedule() moves the appointment in place and keeps it active, so nothing may ever set the
+        // Rescheduled status: a row moved there by hand became non-cancellable and invisible to
+        // availability while still being displayed as a live booking.
+        var appt = CreateSampleAppointment();
+        appt.TransitionTo(AppointmentStatus.Confirmed);
+
+        var act = () => appt.TransitionTo(AppointmentStatus.Rescheduled);
+
+        act.Should().Throw<InvalidStateTransitionException>()
+            .WithMessage("*not permitted*");
+    }
+
+    [Fact]
+    public void Transition_ToSameStatus_ShouldThrow()
+    {
+        var appt = CreateSampleAppointment();
+        appt.TransitionTo(AppointmentStatus.Confirmed);
+
+        var act = () => appt.TransitionTo(AppointmentStatus.Confirmed);
+
+        act.Should().Throw<InvalidStateTransitionException>()
+            .WithMessage("*not permitted*");
+    }
+
+    [Fact]
+    public void Transition_CheckInLongBeforeStart_ShouldThrow()
+    {
+        var appt = CreateFutureAppointment();
+        appt.TransitionTo(AppointmentStatus.Confirmed);
+
+        var act = () => appt.TransitionTo(AppointmentStatus.CheckedIn);
+
+        act.Should().Throw<BusinessRuleValidationException>()
+            .Where(e => e.RuleName == "TransitionTooEarly");
+    }
+
+    [Fact]
+    public void Transition_CompleteBeforeStart_ShouldThrow()
+    {
+        var appt = CreateFutureAppointment();
+        appt.TransitionTo(AppointmentStatus.Confirmed);
+
+        var act = () => appt.TransitionTo(AppointmentStatus.Completed);
+
+        act.Should().Throw<BusinessRuleValidationException>()
+            .Where(e => e.RuleName == "TransitionTooEarly");
+    }
+
+    [Fact]
+    public void Transition_NoShowBeforeStart_ShouldThrow()
+    {
+        var appt = CreateFutureAppointment();
+        appt.TransitionTo(AppointmentStatus.Confirmed);
+
+        var act = () => appt.TransitionTo(AppointmentStatus.NoShow);
+
+        act.Should().Throw<BusinessRuleValidationException>()
+            .Where(e => e.RuleName == "TransitionTooEarly");
+    }
+
+    private static Appointment CreateFutureAppointment()
+    {
+        var start = DateTime.UtcNow.AddDays(2);
+        return Appointment.Create(
+            Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(),
+            start, start.AddMinutes(45), 45, 75.00m);
     }
 }

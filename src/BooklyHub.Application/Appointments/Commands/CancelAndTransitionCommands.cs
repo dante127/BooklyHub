@@ -61,11 +61,8 @@ public class CancelAppointmentCommandHandler : IRequestHandler<CancelAppointment
 
         // TransitionTo returns the history row it appended; it must be registered as new, not discovered
         // through the navigation (see the domain method).
-        var history = appointment.TransitionTo(AppointmentStatus.Cancelled, request.Reason, _currentUser.UserId?.ToString());
-        if (history is not null)
-        {
-            _db.AppointmentStatusHistories.Add(history);
-        }
+        _db.AppointmentStatusHistories.Add(
+            appointment.TransitionTo(AppointmentStatus.Cancelled, request.Reason, _currentUser.UserId?.ToString()));
 
         await _db.SaveChangesAsync(cancellationToken);
         return true;
@@ -77,6 +74,17 @@ public record TransitionAppointmentStatusCommand(
     Guid AppointmentId,
     AppointmentStatus NewStatus,
     string? Reason = null) : IRequest<AppointmentDto>;
+
+public class TransitionAppointmentStatusCommandValidator : AbstractValidator<TransitionAppointmentStatusCommand>
+{
+    public TransitionAppointmentStatusCommandValidator()
+    {
+        RuleFor(x => x.TenantId).NotEmpty();
+        RuleFor(x => x.AppointmentId).NotEmpty();
+        RuleFor(x => x.NewStatus).IsInEnum();
+        RuleFor(x => x.Reason).MaximumLength(500);
+    }
+}
 
 public class TransitionAppointmentStatusCommandHandler : IRequestHandler<TransitionAppointmentStatusCommand, AppointmentDto>
 {
@@ -102,11 +110,8 @@ public class TransitionAppointmentStatusCommandHandler : IRequestHandler<Transit
 
         // TransitionTo returns the history row it appended; it must be registered as new, not discovered
         // through the navigation (see the domain method).
-        var history = appointment.TransitionTo(request.NewStatus, request.Reason, _currentUser.UserId?.ToString());
-        if (history is not null)
-        {
-            _db.AppointmentStatusHistories.Add(history);
-        }
+        _db.AppointmentStatusHistories.Add(
+            appointment.TransitionTo(request.NewStatus, request.Reason, _currentUser.UserId?.ToString()));
 
         await _db.SaveChangesAsync(cancellationToken);
 
