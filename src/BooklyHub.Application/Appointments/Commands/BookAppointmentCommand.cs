@@ -131,6 +131,64 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
             await _db.AcquireLocationBookingLockAsync(request.TenantId, request.LocationId, cancellationToken);
             await _db.AcquireStaffLockAsync(request.StaffId, request.TenantId, cancellationToken);
 
+            if (request.IdempotencyKey is { Length: > 0 } idempotencyKey)
+            {
+                // One key buys one booking. A retry that arrives while the first request is still in
+                // flight waits on the locks above and finds the committed row here, so the client gets its
+                // booking back instead of a conflict for a slot it already owns.
+                var keyed = await _db.Appointments
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(a => a.TenantId == request.TenantId && a.IdempotencyKey == idempotencyKey, cancellationToken);
+
+                if (keyed != null)
+                {
+                    if (keyed.LocationId != request.LocationId ||
+                        keyed.ServiceId != request.ServiceId ||
+                        keyed.StaffId != request.StaffId ||
+                        keyed.CustomerId != request.CustomerId ||
+                        keyed.StartAtUtc != request.StartAtUtc)
+                    {
+                        throw new BusinessRuleValidationException(
+                            "IdempotencyKeyReused",
+                            "This idempotency key already booked a different appointment.");
+                    }
+
+                    var keyedResourceIds = await _db.AppointmentResources
+                        .AsNoTracking()
+                        .Where(ar => ar.AppointmentId == keyed.Id)
+                        .Select(ar => ar.ResourceId)
+                        .ToListAsync(cancellationToken);
+
+                    var keyedLocationName = await _db.Locations
+                        .AsNoTracking()
+                        .Where(l => l.Id == keyed.LocationId)
+                        .Select(l => l.Name)
+                        .FirstOrDefaultAsync(cancellationToken) ?? "";
+
+                    return new AppointmentDto(
+                        keyed.Id,
+                        keyed.TenantId,
+                        keyed.LocationId,
+                        keyedLocationName,
+                        keyed.ServiceId,
+                        service.Name,
+                        keyed.StaffId,
+                        staff.FullName,
+                        keyed.CustomerId,
+                        customer.FullName,
+                        keyed.StartAtUtc,
+                        keyed.EndAtUtc,
+                        keyed.DurationMinutes,
+                        keyed.Price,
+                        keyed.Currency,
+                        keyed.Status,
+                        keyed.Notes,
+                        keyed.CancellationReason,
+                        keyedResourceIds,
+                        keyed.CreatedAtUtc);
+                }
+            }
+
             // Concurrency Guard: re-check availability inside transaction
             var slotCheck = await _availabilityService.CheckSlotAsync(
                 request.TenantId,
@@ -166,6 +224,7 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
                 request.Notes,
                 recurringAppointmentId: null,
                 createdBy: _currentUser.UserId?.ToString() ?? "System");
+            appointment.IdempotencyKey = request.IdempotencyKey;
 
             // Automatically confirm if upfront payment is not required
             if (tenant.Settings?.RequireUpfrontPayment != true)

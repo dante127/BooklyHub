@@ -280,6 +280,7 @@ public class OperationalConfigurations :
         builder.Property(a => a.Notes).HasMaxLength(1000);
         builder.Property(a => a.InternalNotes).HasMaxLength(1000);
         builder.Property(a => a.CancellationReason).HasMaxLength(500);
+        builder.Property(a => a.IdempotencyKey).HasMaxLength(256);
 
         builder.Property(a => a.RowVersion)
             .IsRowVersion();
@@ -318,6 +319,9 @@ public class OperationalConfigurations :
 
         builder.HasIndex(a => new { a.TenantId, a.Status, a.StartAtUtc })
             .HasDatabaseName("IX_Appointments_Tenant_Status_StartAt");
+
+        builder.HasIndex(a => new { a.TenantId, a.IdempotencyKey })
+            .HasDatabaseName("IX_Appointments_Tenant_IdempotencyKey");
     }
 
     public void Configure(EntityTypeBuilder<AppointmentStatusHistory> builder)

@@ -54,65 +54,75 @@ public class OutboxProcessorBackgroundService : BackgroundService
 
         var now = clock.UtcNow;
 
-        // Fetch batch of unprocessed messages that are due
-        var messages = await db.OutboxMessages
-            .Where(m => m.ProcessedOnUtc == null && (m.NextRetryTimeUtc == null || m.NextRetryTimeUtc <= now))
-            .OrderBy(m => m.OccurredOnUtc)
-            .Take(20)
-            .ToListAsync(cancellationToken);
-
-        if (messages.Count == 0) return 0;
-
-        foreach (var message in messages)
+        // The batch is claimed before it is worked: the lock lives for the whole transaction, so a second
+        // instance polling the same pending rows can only skip this tick, never publish the same message.
+        return await db.ExecuteInTransactionAsync(async () =>
         {
-            try
+            if (!await db.TryAcquireOutboxProcessorLockAsync(cancellationToken))
             {
-                var eventType = ResolveEventType(message.Type);
-                if (eventType != null)
-                {
-                    var domainEvent = JsonSerializer.Deserialize(message.Content, eventType);
-                    INotification? notification = domainEvent switch
-                    {
-                        AppointmentCreatedEvent e => new BooklyHub.Application.Notifications.AppointmentCreatedNotification(e),
-                        AppointmentCancelledEvent e => new BooklyHub.Application.Notifications.AppointmentCancelledNotification(e),
-                        AppointmentRescheduledEvent e => new BooklyHub.Application.Notifications.AppointmentRescheduledNotification(e),
-                        _ => null
-                    };
+                return 0;
+            }
 
-                    if (notification != null)
+            // Fetch batch of unprocessed messages that are due
+            var messages = await db.OutboxMessages
+                .Where(m => m.ProcessedOnUtc == null && (m.NextRetryTimeUtc == null || m.NextRetryTimeUtc <= now))
+                .OrderBy(m => m.OccurredOnUtc)
+                .Take(20)
+                .ToListAsync(cancellationToken);
+
+            if (messages.Count == 0) return 0;
+
+            foreach (var message in messages)
+            {
+                try
+                {
+                    var eventType = ResolveEventType(message.Type);
+                    if (eventType != null)
                     {
-                        await publisher.Publish(notification, cancellationToken);
+                        var domainEvent = JsonSerializer.Deserialize(message.Content, eventType);
+                        INotification? notification = domainEvent switch
+                        {
+                            AppointmentCreatedEvent e => new BooklyHub.Application.Notifications.AppointmentCreatedNotification(e),
+                            AppointmentCancelledEvent e => new BooklyHub.Application.Notifications.AppointmentCancelledNotification(e),
+                            AppointmentRescheduledEvent e => new BooklyHub.Application.Notifications.AppointmentRescheduledNotification(e),
+                            _ => null
+                        };
+
+                        if (notification != null)
+                        {
+                            await publisher.Publish(notification, cancellationToken);
+                        }
+                    }
+
+                    message.ProcessedOnUtc = clock.UtcNow;
+                    message.Error = null;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to process outbox message {MessageId} of type {Type}", message.Id, message.Type);
+
+                    message.RetryCount++;
+                    message.Error = ex.Message;
+
+                    if (message.RetryCount >= 5)
+                    {
+                        // Mark as permanently failed after 5 retries to avoid poisoning the queue
+                        message.ProcessedOnUtc = clock.UtcNow;
+                        _logger.LogCritical("Outbox message {MessageId} permanently failed after 5 retries.", message.Id);
+                    }
+                    else
+                    {
+                        // Exponential backoff: 10s, 20s, 40s, 80s
+                        var backoffSeconds = Math.Pow(2, message.RetryCount) * 5;
+                        message.NextRetryTimeUtc = now.AddSeconds(backoffSeconds);
                     }
                 }
-
-                message.ProcessedOnUtc = clock.UtcNow;
-                message.Error = null;
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to process outbox message {MessageId} of type {Type}", message.Id, message.Type);
 
-                message.RetryCount++;
-                message.Error = ex.Message;
+            await db.SaveChangesAsync(cancellationToken);
 
-                if (message.RetryCount >= 5)
-                {
-                    // Mark as permanently failed after 5 retries to avoid poisoning the queue
-                    message.ProcessedOnUtc = clock.UtcNow;
-                    _logger.LogCritical("Outbox message {MessageId} permanently failed after 5 retries.", message.Id);
-                }
-                else
-                {
-                    // Exponential backoff: 10s, 20s, 40s, 80s
-                    var backoffSeconds = Math.Pow(2, message.RetryCount) * 5;
-                    message.NextRetryTimeUtc = now.AddSeconds(backoffSeconds);
-                }
-            }
-        }
-
-        await db.SaveChangesAsync(cancellationToken);
-
-        return messages.Count;
+            return messages.Count;
+        }, cancellationToken);
     }
 
     private static Type? ResolveEventType(string typeName)

@@ -74,4 +74,10 @@ public interface IApplicationDbContext
     /// so it gets its own key instead of widening the booking locks.
     /// </summary>
     Task AcquireAppointmentPaymentLockAsync(Guid tenantId, Guid appointmentId, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Try semantics for background sweeps: returns false instead of waiting when another instance already
+    /// owns the outbox batch, because a skipped tick is harmless and a duplicated delivery is not.
+    /// </summary>
+    Task<bool> TryAcquireOutboxProcessorLockAsync(CancellationToken cancellationToken = default);
 }

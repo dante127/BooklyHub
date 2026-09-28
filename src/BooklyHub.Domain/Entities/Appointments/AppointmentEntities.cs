@@ -40,6 +40,9 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
     public string? Notes { get; set; }
     public string? InternalNotes { get; set; }
 
+    /// <summary>One key buys one booking; see the charge path on Payment for the same contract.</summary>
+    public string? IdempotencyKey { get; set; }
+
     public byte[] RowVersion { get; set; } = [];
 
     public ICollection<AppointmentResource> AppointmentResources { get; set; } = [];

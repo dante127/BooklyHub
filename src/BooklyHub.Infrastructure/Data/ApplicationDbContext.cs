@@ -272,6 +272,17 @@ public class ApplicationDbContext : DbContext, IApplicationDbContext
     public Task AcquireAppointmentPaymentLockAsync(Guid tenantId, Guid appointmentId, CancellationToken cancellationToken = default)
         => ExecuteAppLockAsync($"Booking_Payment_{tenantId:N}_{appointmentId:N}", cancellationToken);
 
+    public async Task<bool> TryAcquireOutboxProcessorLockAsync(CancellationToken cancellationToken = default)
+    {
+        if (!Database.IsSqlServer()) return true;
+
+        var results = await Database
+            .SqlQuery<int>($"DECLARE @res INT; EXEC @res = sp_getapplock @Resource = {"Outbox_Processor"}, @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 0; SELECT @res AS [Value];")
+            .ToListAsync(cancellationToken);
+
+        return results.Count > 0 && results[0] >= 0;
+    }
+
     private async Task ExecuteAppLockAsync(string lockKey, CancellationToken cancellationToken)
     {
         if (!Database.IsSqlServer()) return;

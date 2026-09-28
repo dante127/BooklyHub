@@ -1,5 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Application.Payments;
 
 namespace BooklyHub.Api.Middlewares;
@@ -14,7 +16,7 @@ public class IdempotencyMiddleware
         _next = next;
     }
 
-    public async Task InvokeAsync(HttpContext context, IIdempotencyService idempotencyService)
+    public async Task InvokeAsync(HttpContext context, IIdempotencyService idempotencyService, ITenantContext tenantContext)
     {
         // Only apply idempotency to state-mutating requests (POST, PUT, PATCH, DELETE)
         if (HttpMethods.IsGet(context.Request.Method) || HttpMethods.IsHead(context.Request.Method))
@@ -30,12 +32,38 @@ public class IdempotencyMiddleware
             return;
         }
 
-        var key = idempotencyKey.ToString().Trim();
+        // A key only means something inside the tenant that issued it: scoping the stored record by tenant
+        // keeps one tenant's key from replaying another tenant's cached response, and requests without a
+        // tenant share one bucket where the payload check below is the only thing standing between a caller
+        // and someone else's response.
+        var tenantScope = tenantContext.TenantId?.ToString("N") ?? "global";
+        var scopedKey = $"{tenantScope}:{idempotencyKey.ToString().Trim()}";
 
-        // Check if existing entry exists
-        var existingEntry = await idempotencyService.GetEntryAsync(key, context.RequestAborted);
+        context.Request.EnableBuffering();
+        var requestBody = await new StreamReader(context.Request.Body, leaveOpen: true).ReadToEndAsync(context.RequestAborted);
+        context.Request.Body.Position = 0;
+
+        // The hash is what a key promises to repeat. Without comparing it, the same key reused with a
+        // different payload would silently return the old response and the new request would never run.
+        var requestHash = ComputeHash($"{context.Request.Method}\n{context.Request.Path}\n{requestBody}");
+
+        var existingEntry = await idempotencyService.GetEntryAsync(scopedKey, context.RequestAborted);
         if (existingEntry != null)
         {
+            if (existingEntry.RequestHash != requestHash)
+            {
+                context.Response.ContentType = "application/problem+json";
+                context.Response.StatusCode = StatusCodes.Status409Conflict;
+                await context.Response.WriteAsync(JsonSerializer.Serialize(new
+                {
+                    title = "Idempotency Key Conflict",
+                    status = StatusCodes.Status409Conflict,
+                    detail = "This Idempotency-Key was already used for a different request.",
+                    instance = context.Request.Path.Value
+                }));
+                return;
+            }
+
             context.Response.ContentType = "application/json";
             context.Response.StatusCode = existingEntry.StatusCode;
             context.Response.Headers["X-Idempotent-Replay"] = "true";
@@ -58,10 +86,9 @@ public class IdempotencyMiddleware
             // Persist successful or client error responses (don't cache 500 server errors)
             if (context.Response.StatusCode < 500)
             {
-                var requestHash = ComputeHash($"{context.Request.Method}:{context.Request.Path}");
                 await idempotencyService.SaveEntryAsync(
-                    key,
-                    null,
+                    scopedKey,
+                    tenantContext.TenantId is { } tenantId && tenantId != Guid.Empty ? tenantId : null,
                     requestHash,
                     context.Response.StatusCode,
                     responseBody,
