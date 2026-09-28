@@ -53,20 +53,26 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
     private readonly IApplicationDbContext _db;
     private readonly IAvailabilityService _availabilityService;
     private readonly ICurrentUser _currentUser;
+    private readonly IClock _clock;
 
     public CreateRecurringAppointmentCommandHandler(
         IApplicationDbContext db,
         IAvailabilityService availabilityService,
-        ICurrentUser currentUser)
+        ICurrentUser currentUser,
+        IClock clock)
     {
         _db = db;
         _availabilityService = availabilityService;
         _currentUser = currentUser;
+        _clock = clock;
     }
 
     public async Task<RecurringAppointmentResultDto> Handle(CreateRecurringAppointmentCommand request, CancellationToken cancellationToken)
     {
-        var tenant = await _db.Tenants.AsNoTracking().FirstOrDefaultAsync(t => t.Id == request.TenantId, cancellationToken)
+        var tenant = await _db.Tenants
+            .AsNoTracking()
+            .Include(t => t.Settings)
+            .FirstOrDefaultAsync(t => t.Id == request.TenantId, cancellationToken)
             ?? throw new NotFoundException($"Tenant with ID {request.TenantId} was not found.");
 
         var location = await _db.Locations.AsNoTracking().FirstOrDefaultAsync(l => l.Id == request.LocationId && l.TenantId == request.TenantId, cancellationToken)
@@ -104,12 +110,38 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
             throw new BusinessRuleValidationException("CustomerBlocked", "This customer account has been blocked from booking appointments.");
         }
 
+        // The range is resolved against the tenant's booking horizon, not against a constant invented
+        // here: a series that reaches past the horizon can never be booked, and silently shortening it
+        // would report a smaller request than the one that was made.
+        var maxAdvanceDays = tenant.Settings?.MaxAdvanceBookingDays ?? 60;
+        var lastBookableDate = DateOnly.FromDateTime(_clock.UtcNow.AddDays(maxAdvanceDays));
+
+        if (request.StartDate > lastBookableDate || request.EndDate > lastBookableDate)
+        {
+            var requestedThrough = request.EndDate is { } requestedEnd && requestedEnd > request.StartDate
+                ? $" from {request.StartDate:yyyy-MM-dd} to {requestedEnd:yyyy-MM-dd}"
+                : $" on {request.StartDate:yyyy-MM-dd}";
+
+            throw new BusinessRuleValidationException(
+                "RecurrenceBeyondBookingWindow",
+                $"Appointments can only be booked up to {lastBookableDate:yyyy-MM-dd} ({maxAdvanceDays} days ahead), " +
+                $"but this series is requested{requestedThrough}.");
+        }
+
         // Generate target dates
         var targetDates = GenerateDates(request.Pattern, request.Interval, request.StartDate, request.EndDate, request.MaxOccurrences);
 
         if (targetDates.Count == 0)
         {
             throw new BusinessRuleValidationException("NoDatesGenerated", "Recurrence rules produced no valid appointment dates.");
+        }
+
+        if (targetDates[^1] > lastBookableDate)
+        {
+            throw new BusinessRuleValidationException(
+                "RecurrenceBeyondBookingWindow",
+                $"Appointments can only be booked up to {lastBookableDate:yyyy-MM-dd} ({maxAdvanceDays} days ahead), " +
+                $"but this series runs to {targetDates[^1]:yyyy-MM-dd}. Lower MaxOccurrences or move EndDate earlier.");
         }
 
         var staffService = staff.StaffServices.FirstOrDefault(ss => ss.ServiceId == request.ServiceId)
@@ -291,6 +323,24 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
         }
     }
 
+    /// <summary>
+    /// The most appointments one request may create. It is a workload bound rather than a booking rule:
+    /// the series is written inside one transaction that holds the staff lock, so an oversized request is
+    /// refused instead of being truncated behind the caller's back.
+    /// </summary>
+    public const int MaxOccurrencesCeiling = 520;
+
+    /// <summary>
+    /// The widest gap allowed between two occurrences, in the pattern's own unit (days or months). It
+    /// keeps every computed occurrence inside the calendar.
+    /// </summary>
+    public const int MaxInterval = 120;
+
+    /// <summary>
+    /// Resolves the requested range into concrete dates. Every bound is honoured exactly: the count is
+    /// never defaulted and never clamped, because a series shorter than the one that was asked for is
+    /// indistinguishable in the response from the series that was requested.
+    /// </summary>
     public static List<DateOnly> GenerateDates(
         RecurrencePattern pattern,
         int interval,
@@ -298,16 +348,55 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
         DateOnly? endDate,
         int? maxOccurrences)
     {
+        if (!Enum.IsDefined(pattern))
+        {
+            throw new BusinessRuleValidationException(
+                "RecurrencePatternUnsupported",
+                $"'{pattern}' is not a recurrence pattern. The supported patterns are {string.Join(", ", Enum.GetNames<RecurrencePattern>())}.");
+        }
+
+        if (interval is < 1 or > MaxInterval)
+        {
+            throw new BusinessRuleValidationException(
+                "RecurrenceRangeInvalid",
+                $"The recurrence interval must be between 1 and {MaxInterval}.");
+        }
+
+        if (maxOccurrences is null && endDate is null)
+        {
+            throw new BusinessRuleValidationException(
+                "RecurrenceRangeRequired",
+                "Set MaxOccurrences, EndDate, or both. Without one of them the number of appointments this series asks for is undefined.");
+        }
+
+        if (maxOccurrences is { } requestedCount && requestedCount < 1)
+        {
+            throw new BusinessRuleValidationException("RecurrenceRangeInvalid", "MaxOccurrences must be at least 1.");
+        }
+
+        if (endDate is { } rangeEnd && rangeEnd < startDate)
+        {
+            throw new BusinessRuleValidationException("RecurrenceRangeInvalid", "EndDate must be on or after StartDate.");
+        }
+
+        if (maxOccurrences > MaxOccurrencesCeiling)
+        {
+            throw new BusinessRuleValidationException(
+                "RecurrenceRangeTooLarge",
+                $"MaxOccurrences of {maxOccurrences} is above the ceiling of {MaxOccurrencesCeiling} appointments per request.");
+        }
+
         var dates = new List<DateOnly>();
         var current = startDate;
-        var limit = maxOccurrences ?? 12; // safety cap default 12 if no end date
-        if (limit > 52) limit = 52; // max cap 1 year
 
-        while (dates.Count < limit)
+        while ((!maxOccurrences.HasValue || dates.Count < maxOccurrences.Value) &&
+               (!endDate.HasValue || current <= endDate.Value))
         {
-            if (endDate.HasValue && current > endDate.Value)
+            if (dates.Count >= MaxOccurrencesCeiling)
             {
-                break;
+                throw new BusinessRuleValidationException(
+                    "RecurrenceRangeTooLarge",
+                    $"This recurrence would create more than {MaxOccurrencesCeiling} appointments. Lower MaxOccurrences or move EndDate earlier.");
             }
 
             dates.Add(current);
@@ -318,7 +407,9 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
                 RecurrencePattern.Weekly => current.AddDays(7 * interval),
                 RecurrencePattern.Biweekly => current.AddDays(14 * interval),
                 RecurrencePattern.Monthly => current.AddMonths(interval),
-                _ => current.AddDays(7)
+                _ => throw new BusinessRuleValidationException(
+                    "RecurrencePatternUnsupported",
+                    $"'{pattern}' has no defined cadence, so its occurrences cannot be scheduled.")
             };
         }
 
