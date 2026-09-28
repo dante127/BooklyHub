@@ -1,5 +1,6 @@
 using BooklyHub.Application.Appointments.Dtos;
 using BooklyHub.Application.Common.Interfaces;
+using BooklyHub.Application.Payments.Commands;
 using BooklyHub.Domain.Enums;
 using BooklyHub.Domain.Exceptions;
 using FluentValidation;
@@ -44,28 +45,36 @@ public class CancelAppointmentCommandHandler : IRequestHandler<CancelAppointment
             .FirstOrDefaultAsync(t => t.Id == request.TenantId, cancellationToken)
             ?? throw new NotFoundException($"Tenant with ID {request.TenantId} was not found.");
 
-        var appointment = await _db.Appointments
-            .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == request.TenantId, cancellationToken)
-            ?? throw new NotFoundException($"Appointment with ID {request.AppointmentId} was not found.");
-
-        // Check cancellation cutoff for customers/non-admin staff
-        var isStaffOrAdmin = _currentUser.IsInRole("PlatformAdmin") || _currentUser.IsInRole("TenantOwner") || _currentUser.IsInRole("TenantAdmin") || _currentUser.IsInRole("Manager");
-        if (!isStaffOrAdmin)
+        // The status change and the counter move commit or roll back together: an appointment whose
+        // cancel saved without the decrement would inflate TotalBookings forever.
+        return await _db.ExecuteInTransactionAsync(async () =>
         {
-            var cutoffHours = tenant.Settings?.CancellationCutoffHours ?? 24;
-            if (appointment.StartAtUtc - _clock.UtcNow < TimeSpan.FromHours(cutoffHours))
+            var appointment = await _db.Appointments
+                .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == request.TenantId, cancellationToken)
+                ?? throw new NotFoundException($"Appointment with ID {request.AppointmentId} was not found.");
+
+            // Check cancellation cutoff for customers/non-admin staff
+            var isStaffOrAdmin = _currentUser.IsInRole("PlatformAdmin") || _currentUser.IsInRole("TenantOwner") || _currentUser.IsInRole("TenantAdmin") || _currentUser.IsInRole("Manager");
+            if (!isStaffOrAdmin)
             {
-                throw new BusinessRuleValidationException("CancellationCutoffExceeded", $"Appointments cannot be cancelled within {cutoffHours} hours of the start time.");
+                var cutoffHours = tenant.Settings?.CancellationCutoffHours ?? 24;
+                if (appointment.StartAtUtc - _clock.UtcNow < TimeSpan.FromHours(cutoffHours))
+                {
+                    throw new BusinessRuleValidationException("CancellationCutoffExceeded", $"Appointments cannot be cancelled within {cutoffHours} hours of the start time.");
+                }
             }
-        }
 
-        // TransitionTo returns the history row it appended; it must be registered as new, not discovered
-        // through the navigation (see the domain method).
-        _db.AppointmentStatusHistories.Add(
-            appointment.TransitionTo(AppointmentStatus.Cancelled, request.Reason, _currentUser.UserId?.ToString()));
+            // TransitionTo returns the history row it appended; it must be registered as new, not discovered
+            // through the navigation (see the domain method).
+            _db.AppointmentStatusHistories.Add(
+                appointment.TransitionTo(AppointmentStatus.Cancelled, request.Reason, _currentUser.UserId?.ToString()));
 
-        await _db.SaveChangesAsync(cancellationToken);
-        return true;
+            // The booking was counted when it was created; cancelling gives the count back.
+            await _db.AdjustTotalBookingsAsync(request.TenantId, appointment.CustomerId, -1, cancellationToken);
+
+            await _db.SaveChangesAsync(cancellationToken);
+            return true;
+        }, cancellationToken);
     }
 }
 
@@ -99,21 +108,32 @@ public class TransitionAppointmentStatusCommandHandler : IRequestHandler<Transit
 
     public async Task<AppointmentDto> Handle(TransitionAppointmentStatusCommand request, CancellationToken cancellationToken)
     {
-        var appointment = await _db.Appointments
-            .Include(a => a.Location)
-            .Include(a => a.Service)
-            .Include(a => a.Staff)
-            .Include(a => a.Customer)
-            .Include(a => a.AppointmentResources)
-            .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == request.TenantId, cancellationToken)
-            ?? throw new NotFoundException($"Appointment with ID {request.AppointmentId} was not found.");
+        // A transition to Cancelled is a cancel on this path too, so the counter moves in the same
+        // transaction as the status change here as well.
+        var appointment = await _db.ExecuteInTransactionAsync(async () =>
+        {
+            var loaded = await _db.Appointments
+                .Include(a => a.Location)
+                .Include(a => a.Service)
+                .Include(a => a.Staff)
+                .Include(a => a.Customer)
+                .Include(a => a.AppointmentResources)
+                .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == request.TenantId, cancellationToken)
+                ?? throw new NotFoundException($"Appointment with ID {request.AppointmentId} was not found.");
 
-        // TransitionTo returns the history row it appended; it must be registered as new, not discovered
-        // through the navigation (see the domain method).
-        _db.AppointmentStatusHistories.Add(
-            appointment.TransitionTo(request.NewStatus, request.Reason, _currentUser.UserId?.ToString()));
+            // TransitionTo returns the history row it appended; it must be registered as new, not discovered
+            // through the navigation (see the domain method).
+            _db.AppointmentStatusHistories.Add(
+                loaded.TransitionTo(request.NewStatus, request.Reason, _currentUser.UserId?.ToString()));
 
-        await _db.SaveChangesAsync(cancellationToken);
+            if (request.NewStatus == AppointmentStatus.Cancelled)
+            {
+                await _db.AdjustTotalBookingsAsync(request.TenantId, loaded.CustomerId, -1, cancellationToken);
+            }
+
+            await _db.SaveChangesAsync(cancellationToken);
+            return loaded;
+        }, cancellationToken);
 
         return new AppointmentDto(
             appointment.Id,

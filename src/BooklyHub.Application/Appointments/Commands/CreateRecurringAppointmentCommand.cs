@@ -1,5 +1,6 @@
 using BooklyHub.Application.Appointments.Dtos;
 using BooklyHub.Application.Common.Interfaces;
+using BooklyHub.Application.Payments.Commands;
 using BooklyHub.Application.Scheduling;
 using BooklyHub.Domain.Entities.Appointments;
 using BooklyHub.Domain.Entities.Resources;
@@ -213,6 +214,15 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
             }
 
             recurringAppt.CreatedAppointmentsCount = created.Count;
+
+            // Every created occurrence is a booking, so the counter moves by the created count in the
+            // same transaction, in SQL — a second booking flow touching this customer concurrently must
+            // not lose either delta.
+            if (created.Count > 0)
+            {
+                await _db.AdjustTotalBookingsAsync(request.TenantId, request.CustomerId, created.Count, cancellationToken);
+            }
+
             await _db.SaveChangesAsync(cancellationToken);
 
             return (created, skipped);

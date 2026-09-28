@@ -1,5 +1,6 @@
 using BooklyHub.Application.Appointments.Dtos;
 using BooklyHub.Application.Common.Interfaces;
+using BooklyHub.Application.Payments.Commands;
 using BooklyHub.Application.Scheduling;
 using BooklyHub.Domain.Entities.Appointments;
 using BooklyHub.Domain.Entities.Resources;
@@ -245,12 +246,9 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
 
             _db.Appointments.Add(appointment);
 
-            // Update customer total bookings
-            var customerToUpdate = await _db.Customers.FirstOrDefaultAsync(c => c.Id == request.CustomerId, cancellationToken);
-            if (customerToUpdate != null)
-            {
-                customerToUpdate.TotalBookings += 1;
-            }
+            // Two bookings for one customer at two locations hold no common lock, so the counter moves
+            // in SQL rather than on a loaded entity.
+            await _db.AdjustTotalBookingsAsync(request.TenantId, request.CustomerId, 1, cancellationToken);
 
             await _db.SaveChangesAsync(cancellationToken);
 

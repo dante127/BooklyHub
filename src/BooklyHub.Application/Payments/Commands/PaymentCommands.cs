@@ -292,4 +292,18 @@ internal static class CustomerCounterExtensions
         db.Customers
             .Where(c => c.Id == customerId && c.TenantId == tenantId)
             .ExecuteUpdateAsync(s => s.SetProperty(c => c.TotalSpent, c => c.TotalSpent + delta), cancellationToken);
+
+    /// <summary>
+    /// Same rule as <see cref="AdjustTotalSpentAsync"/>: two bookings for one customer at two locations
+    /// hold no common lock, so the count has to change inside the database, not on a loaded entity.
+    /// </summary>
+    public static Task AdjustTotalBookingsAsync(
+        this IApplicationDbContext db,
+        Guid tenantId,
+        Guid customerId,
+        int delta,
+        CancellationToken cancellationToken) =>
+        db.Customers
+            .Where(c => c.Id == customerId && c.TenantId == tenantId)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.TotalBookings, c => c.TotalBookings + delta), cancellationToken);
 }
