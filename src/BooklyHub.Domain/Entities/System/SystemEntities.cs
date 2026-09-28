@@ -56,15 +56,21 @@ public class IdempotencyRecord : Entity<string>
 
     public IdempotencyRecord() { }
 
-    public IdempotencyRecord(string key, Guid? tenantId, string requestHash, int responseStatusCode, string responseBody, TimeSpan ttl)
+    /// <summary>
+    /// The window is opened from the clock the caller was given, not from the wall clock, so a replay can be
+    /// tested against a deadline instead of against whatever time the machine happens to think it is. One
+    /// reading anchors both ends, so <paramref name="ttl"/> is measured from the same instant
+    /// <see cref="CreatedAtUtc"/> claims.
+    /// </summary>
+    public IdempotencyRecord(string key, Guid? tenantId, string requestHash, int responseStatusCode, string responseBody, TimeSpan ttl, DateTime nowUtc)
     {
         Id = key;
         TenantId = tenantId;
         RequestHash = requestHash;
         ResponseStatusCode = responseStatusCode;
         ResponseBody = responseBody;
-        CreatedAtUtc = DateTime.UtcNow;
-        ExpiresAtUtc = DateTime.UtcNow.Add(ttl);
+        CreatedAtUtc = nowUtc;
+        ExpiresAtUtc = nowUtc.Add(ttl);
     }
 }
 

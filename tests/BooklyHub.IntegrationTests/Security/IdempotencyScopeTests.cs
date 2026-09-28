@@ -8,6 +8,7 @@ using BooklyHub.Domain.Entities.Organizations;
 using BooklyHub.Domain.Entities.Scheduling;
 using BooklyHub.Domain.Entities.Services;
 using BooklyHub.Domain.Entities.StaffMembers;
+using BooklyHub.Domain.Entities.System;
 using BooklyHub.Domain.Entities.Tenancy;
 using BooklyHub.Infrastructure.Data;
 using BooklyHub.IntegrationTests.Infrastructure;
@@ -124,17 +125,26 @@ public class IdempotencyScopeTests : IClassFixture<BooklyHubWebApplicationFactor
         return await client.SendAsync(request);
     }
 
-    private static async Task<Guid> ReadAppointmentIdAsync(HttpResponseMessage response)
-    {
-        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        return doc.RootElement.GetProperty("id").GetGuid();
-    }
+    private static Guid ReadAppointmentId(string body) =>
+        JsonDocument.Parse(body).RootElement.GetProperty("id").GetGuid();
+
+    private static async Task<Guid> ReadAppointmentIdAsync(HttpResponseMessage response) =>
+        ReadAppointmentId(await response.Content.ReadAsStringAsync());
 
     private async Task<int> CountAppointmentsAsync(Guid tenantId)
     {
         using var scope = _factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
         return await db.Appointments.IgnoreQueryFilters().CountAsync(a => a.TenantId == tenantId);
+    }
+
+    private async Task<IdempotencyRecord?> ReadRecordAsync(Graph graph, string key)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        return await db.IdempotencyRecords
+            .AsNoTracking()
+            .FirstOrDefaultAsync(r => r.Id == $"{graph.TenantId:N}:{key}");
     }
 
     [Fact]
@@ -220,5 +230,57 @@ public class IdempotencyScopeTests : IClassFixture<BooklyHubWebApplicationFactor
         var secondId = await ReadAppointmentIdAsync(responses[1]);
         secondId.Should().Be(firstId, "one key buys one booking, so both responses name the same appointment");
         (await CountAppointmentsAsync(graph.TenantId)).Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Replay_AfterTheWindowClosed_MustNotBeServedFromTheCachedCopy()
+    {
+        var graph = await SeedGraphAsync("window-tenant");
+        var key = Guid.NewGuid().ToString("N");
+
+        try
+        {
+            var first = await BookAsync(graph, Slot(10), key);
+            Assert.True(first.StatusCode == HttpStatusCode.Created,
+                $"expected 201, got {(int)first.StatusCode}: {await first.Content.ReadAsStringAsync()}");
+            var bookedId = await ReadAppointmentIdAsync(first);
+
+            var replay = await BookAsync(graph, Slot(10), key);
+            Assert.True(replay.StatusCode == HttpStatusCode.Created,
+                $"inside the window a retry must replay, got {(int)replay.StatusCode}");
+            replay.Headers.Contains("X-Idempotent-Replay").Should().BeTrue();
+            (await ReadAppointmentIdAsync(replay)).Should().Be(bookedId);
+
+            var stored = await ReadRecordAsync(graph, key);
+            stored.Should().NotBeNull("the middleware stores the response with the window it promised");
+            (stored!.ExpiresAtUtc - stored.CreatedAtUtc).Should().Be(TimeSpan.FromHours(24),
+                "the window the record holds is the window the caller asked for, measured from one clock reading");
+
+            // The distributed cache and the JWT stack keep their own real-time timers, so nothing here can age
+            // the cached copy out except the deadline travelling inside it. Passing the window on the
+            // application's clock therefore asks the only question that matters: does the copy know it died?
+            // The slot is two days out and the working hours were seeded for its weekday, so after 25 hours it
+            // is still a bookable time and the only thing left to refuse on is the existing booking.
+            _factory.Clock.AdvanceBy(TimeSpan.FromHours(25));
+
+            var afterWindow = await BookAsync(graph, Slot(10), key);
+            var body = await afterWindow.Content.ReadAsStringAsync();
+
+            // The replay marker is what separates the two ways this can answer. Serving the stored copy stamps
+            // the header; executing the request again lets the booking's own key recovery hand back the
+            // appointment it already made — same booking, no replay, because the window really did close.
+            Assert.True(afterWindow.StatusCode == HttpStatusCode.Created,
+                $"the expired key must be re-executed and answered by the booking's own key recovery, got {(int)afterWindow.StatusCode}: {body}");
+            afterWindow.Headers.Contains("X-Idempotent-Replay").Should().BeFalse(
+                "an expired key may not be answered from the stored copy, which is the promise the window exists to keep");
+            ReadAppointmentId(body).Should().Be(bookedId,
+                "the re-run finds the appointment the key already made rather than booking a second one");
+            (await CountAppointmentsAsync(graph.TenantId)).Should().Be(1,
+                "one key buys one booking on either layer, so the re-run must not add a row");
+        }
+        finally
+        {
+            _factory.Clock.Release();
+        }
     }
 }

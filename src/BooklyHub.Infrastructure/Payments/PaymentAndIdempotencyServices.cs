@@ -52,40 +52,41 @@ public class IdempotencyService : IIdempotencyService
 {
     private readonly IApplicationDbContext _db;
     private readonly ICacheService _cache;
+    private readonly IClock _clock;
     private readonly ILogger<IdempotencyService> _logger;
 
     public IdempotencyService(
         IApplicationDbContext db,
         ICacheService cache,
+        IClock clock,
         ILogger<IdempotencyService> logger)
     {
         _db = db;
         _cache = cache;
+        _clock = clock;
         _logger = logger;
-    }
-
-    public async Task<bool> HasKeyAsync(string key, CancellationToken cancellationToken = default)
-    {
-        if (string.IsNullOrWhiteSpace(key)) return false;
-
-        var cached = await _cache.GetAsync<IdempotencyEntry>($"idemp:{key}", cancellationToken);
-        if (cached != null) return true;
-
-        return await _db.IdempotencyRecords
-            .AsNoTracking()
-            .AnyAsync(r => r.Id == key && r.ExpiresAtUtc > DateTime.UtcNow, cancellationToken);
     }
 
     public async Task<IdempotencyEntry?> GetEntryAsync(string key, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(key)) return null;
 
-        var cached = await _cache.GetAsync<IdempotencyEntry>($"idemp:{key}", cancellationToken);
-        if (cached != null) return cached;
+        var cacheKey = CacheKey(key);
+        var cached = await _cache.GetAsync<IdempotencyEntry>(cacheKey, cancellationToken);
 
+        // The cache holds a copy of the record, so a copy must die when the record does. Checking the window
+        // only in SQL left the cache as the one path that replayed a key whose window had closed — and it
+        // could do so for hours, because the cached copy carried no deadline to check itself against.
+        if (cached is not null)
+        {
+            if (cached.ExpiresAtUtc > _clock.UtcNow) return cached;
+            await _cache.RemoveAsync(cacheKey, cancellationToken);
+        }
+
+        var nowUtc = _clock.UtcNow;
         var record = await _db.IdempotencyRecords
             .AsNoTracking()
-            .FirstOrDefaultAsync(r => r.Id == key && r.ExpiresAtUtc > DateTime.UtcNow, cancellationToken);
+            .FirstOrDefaultAsync(r => r.Id == key && r.ExpiresAtUtc > nowUtc, cancellationToken);
 
         if (record == null) return null;
 
@@ -94,9 +95,12 @@ public class IdempotencyService : IIdempotencyService
             record.RequestHash,
             record.ResponseStatusCode,
             record.ResponseBody,
-            record.CreatedAtUtc);
+            record.CreatedAtUtc,
+            record.ExpiresAtUtc);
 
-        await _cache.SetAsync($"idemp:{key}", entry, TimeSpan.FromHours(24), cancellationToken);
+        // The copy lives for whatever the record has left, never for a duration of its own choosing: a fixed
+        // TTL would outlive the window for any key read close to the end of it.
+        await _cache.SetAsync(cacheKey, entry, record.ExpiresAtUtc - nowUtc, cancellationToken);
         return entry;
     }
 
@@ -111,19 +115,25 @@ public class IdempotencyService : IIdempotencyService
     {
         if (string.IsNullOrWhiteSpace(key)) return;
 
-        var record = new IdempotencyRecord(key, tenantId, requestHash, statusCode, responseBody, ttl);
+        var nowUtc = _clock.UtcNow;
+        var record = new IdempotencyRecord(key, tenantId, requestHash, statusCode, responseBody, ttl, nowUtc);
         _db.IdempotencyRecords.Add(record);
 
         try
         {
             await _db.SaveChangesAsync(cancellationToken);
 
-            var entry = new IdempotencyEntry(key, requestHash, statusCode, responseBody, DateTime.UtcNow);
-            await _cache.SetAsync($"idemp:{key}", entry, ttl, cancellationToken);
+            await _cache.SetAsync(
+                CacheKey(key),
+                new IdempotencyEntry(key, requestHash, statusCode, responseBody, nowUtc, record.ExpiresAtUtc),
+                ttl,
+                cancellationToken);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to persist idempotency key {Key}", key);
         }
     }
+
+    private static string CacheKey(string key) => $"idemp:{key}";
 }

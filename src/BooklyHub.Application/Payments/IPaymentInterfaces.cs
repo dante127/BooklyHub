@@ -38,14 +38,20 @@ public interface IPaymentProvider
 
 public interface IIdempotencyService
 {
-    Task<bool> HasKeyAsync(string key, CancellationToken cancellationToken = default);
     Task<IdempotencyEntry?> GetEntryAsync(string key, CancellationToken cancellationToken = default);
     Task SaveEntryAsync(string key, Guid? tenantId, string requestHash, int statusCode, string responseBody, TimeSpan ttl, CancellationToken cancellationToken = default);
 }
 
+/// <summary>
+/// A stored response plus the end of the window in which replaying it is still the honest answer.
+/// <see cref="ExpiresAtUtc"/> has to travel with the entry: the cache is a copy of the record, and a copy
+/// that carries no deadline turns the record's own window into a rule the database enforces and the cache
+/// ignores.
+/// </summary>
 public record IdempotencyEntry(
     string Key,
     string RequestHash,
     int StatusCode,
     string ResponseBody,
-    DateTime CreatedAtUtc);
+    DateTime CreatedAtUtc,
+    DateTime ExpiresAtUtc);

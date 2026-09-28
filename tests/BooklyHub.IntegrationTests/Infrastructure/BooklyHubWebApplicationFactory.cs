@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Xunit;
 
@@ -25,6 +26,14 @@ public class BooklyHubWebApplicationFactory : WebApplicationFactory<Program>, IA
     public string ConnectionString { get; }
 
     public QueryCountInterceptor QueryInterceptor { get; } = new();
+
+    /// <summary>
+    /// Swapped in for the host's <see cref="BooklyHub.Application.Common.Interfaces.IClock"/> so a test can pass
+    /// time rather than wait for it. It is the application's clock only: the distributed cache and the JWT
+    /// stack keep their own real-time timers, which is precisely the disagreement an expiring key has to
+    /// survive.
+    /// </summary>
+    public TestClock Clock { get; } = new();
 
     /// <summary>
     /// Last-mile service overrides (recording email senders and the like), applied after the test host has
@@ -100,6 +109,8 @@ public class BooklyHubWebApplicationFactory : WebApplicationFactory<Program>, IA
                 });
                 options.AddInterceptors(QueryInterceptor);
             });
+
+            services.Replace(ServiceDescriptor.Singleton<BooklyHub.Application.Common.Interfaces.IClock>(Clock));
 
             ConfigureTestServices(services);
         });
