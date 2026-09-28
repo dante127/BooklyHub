@@ -140,11 +140,17 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
         };
     }
 
-    public void TransitionTo(AppointmentStatus newStatus, string? reason = null, string? changedBy = null)
+    /// <summary>
+    /// Returns the appended history row, or null when the status is unchanged. A caller changing an
+    /// appointment that is already stored has to register that row with the context as new: a row that
+    /// reaches the change tracker only through the StatusHistories navigation of a tracked appointment is
+    /// treated as an existing row, and the update it generates matches nothing.
+    /// </summary>
+    public AppointmentStatusHistory? TransitionTo(AppointmentStatus newStatus, string? reason = null, string? changedBy = null)
     {
         if (Status == newStatus)
         {
-            return;
+            return null;
         }
 
         if (!CanTransitionTo(newStatus))
@@ -163,7 +169,7 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
             CancellationReason = reason;
         }
 
-        StatusHistories.Add(new AppointmentStatusHistory
+        var history = new AppointmentStatusHistory
         {
             AppointmentId = Id,
             FromStatus = previousStatus,
@@ -171,7 +177,8 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
             ChangedAtUtc = DateTime.UtcNow,
             ChangedBy = changedBy,
             Reason = reason
-        });
+        };
+        StatusHistories.Add(history);
 
         // Trigger domain events
         switch (newStatus)
@@ -186,9 +193,12 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
                 AddDomainEvent(new AppointmentCompletedEvent(TenantId, Id, CustomerId, StaffId, ServiceId));
                 break;
         }
+
+        return history;
     }
 
-    public void Reschedule(DateTime newStartAtUtc, DateTime newEndAtUtc, string? reason = null, string? changedBy = null)
+    /// <summary>Moves the appointment in place and keeps it active. Returns the appended history row, which carries the same persistence rule as <see cref="TransitionTo"/>.</summary>
+    public AppointmentStatusHistory Reschedule(DateTime newStartAtUtc, DateTime newEndAtUtc, string? reason = null, string? changedBy = null)
     {
         if (newEndAtUtc <= newStartAtUtc)
         {
@@ -208,7 +218,7 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
         EndAtUtc = newEndAtUtc;
         DurationMinutes = (int)(newEndAtUtc - newStartAtUtc).TotalMinutes;
 
-        StatusHistories.Add(new AppointmentStatusHistory
+        var history = new AppointmentStatusHistory
         {
             AppointmentId = Id,
             FromStatus = Status,
@@ -216,9 +226,12 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
             ChangedAtUtc = DateTime.UtcNow,
             ChangedBy = changedBy,
             Reason = $"Rescheduled from {oldStart:O} to {newStartAtUtc:O}. Reason: {reason}"
-        });
+        };
+        StatusHistories.Add(history);
 
         AddDomainEvent(new AppointmentRescheduledEvent(TenantId, Id, CustomerId, oldStart, newStartAtUtc, newEndAtUtc, reason));
+
+        return history;
     }
 }
 

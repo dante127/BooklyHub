@@ -264,6 +264,14 @@ public class ApplicationDbContext : DbContext, IApplicationDbContext
     public Task AcquireStaffLockAsync(Guid staffId, Guid tenantId, CancellationToken cancellationToken = default)
         => ExecuteAppLockAsync($"Booking_Staff_{tenantId:N}_{staffId:N}", cancellationToken);
 
+    /// <summary>
+    /// Serializes every money write for one appointment. Charging is contested per appointment rather than
+    /// per calendar, and a lost race is a financial loss instead of a reschedulable conflict, so payments
+    /// get their own key instead of widening the booking locks.
+    /// </summary>
+    public Task AcquireAppointmentPaymentLockAsync(Guid tenantId, Guid appointmentId, CancellationToken cancellationToken = default)
+        => ExecuteAppLockAsync($"Booking_Payment_{tenantId:N}_{appointmentId:N}", cancellationToken);
+
     private async Task ExecuteAppLockAsync(string lockKey, CancellationToken cancellationToken)
     {
         if (!Database.IsSqlServer()) return;

@@ -67,4 +67,11 @@ public interface IApplicationDbContext
     Task AcquireLocationBookingLockAsync(Guid tenantId, Guid locationId, CancellationToken cancellationToken = default);
 
     Task AcquireStaffLockAsync(Guid staffId, Guid tenantId, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Serializes every money write for one appointment. The booking locks protect a calendar; charging is
+    /// contested per appointment and a lost race is a financial loss rather than a reschedulable conflict,
+    /// so it gets its own key instead of widening the booking locks.
+    /// </summary>
+    Task AcquireAppointmentPaymentLockAsync(Guid tenantId, Guid appointmentId, CancellationToken cancellationToken = default);
 }

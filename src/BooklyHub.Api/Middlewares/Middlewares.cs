@@ -133,6 +133,13 @@ public class ExceptionHandlingMiddleware
             problemDetails.Extensions["errors"] = errors;
         }
 
+        if (exception is BusinessRuleValidationException ruleViolation)
+        {
+            // Without the rule name a client can only string-match the prose to tell "already paid" from
+            // "you asked for more than is owed", which are different things to do about it.
+            problemDetails.Extensions["rule"] = ruleViolation.RuleName;
+        }
+
         var json = JsonSerializer.Serialize(problemDetails, new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,

@@ -55,98 +55,127 @@ public class ProcessPaymentCommandHandler : IRequestHandler<ProcessPaymentComman
 
     public async Task<PaymentDto> Handle(ProcessPaymentCommand request, CancellationToken cancellationToken)
     {
-        var appointment = await _db.Appointments
-            .Include(a => a.Customer)
-            .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == request.TenantId, cancellationToken)
-            ?? throw new NotFoundException($"Appointment with ID {request.AppointmentId} was not found.");
-
-        // Check if already paid with idempotency key
-        if (!string.IsNullOrEmpty(request.IdempotencyKey))
+        return await _db.ExecuteInTransactionAsync(async () =>
         {
-            var existingPayment = await _db.Payments
-                .AsNoTracking()
-                .FirstOrDefaultAsync(p => p.TenantId == request.TenantId && p.IdempotencyKey == request.IdempotencyKey, cancellationToken);
+            await _db.AcquireAppointmentPaymentLockAsync(request.TenantId, request.AppointmentId, cancellationToken);
 
-            if (existingPayment != null)
+            var appointment = await _db.Appointments
+                .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == request.TenantId, cancellationToken)
+                ?? throw new NotFoundException($"Appointment with ID {request.AppointmentId} was not found.");
+
+            // Read after the lock: another charge can only commit while this transaction holds it, so the
+            // totals below are the ones the money rules are actually decided on.
+            var payments = await _db.Payments
+                .Include(p => p.Refunds)
+                .Where(p => p.TenantId == request.TenantId && p.AppointmentId == request.AppointmentId)
+                .ToListAsync(cancellationToken);
+
+            if (request.IdempotencyKey is { Length: > 0 })
             {
-                return new PaymentDto(
-                    existingPayment.Id,
-                    existingPayment.TenantId,
-                    existingPayment.AppointmentId,
-                    existingPayment.Amount,
-                    existingPayment.Currency,
-                    existingPayment.Status,
-                    existingPayment.ProviderPaymentId,
-                    existingPayment.CreatedAtUtc);
+                // One key buys one charge. Reusing it for this appointment replays it; reusing it for a
+                // different appointment is refused instead of silently capturing a second payment, which
+                // is what the caller's retry means either way.
+                var keyed = await _db.Payments
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(
+                        p => p.TenantId == request.TenantId && p.IdempotencyKey == request.IdempotencyKey,
+                        cancellationToken);
+
+                if (keyed != null)
+                {
+                    if (keyed.AppointmentId != request.AppointmentId)
+                    {
+                        throw new BusinessRuleValidationException(
+                            "IdempotencyKeyReused",
+                            "This idempotency key already paid for a different appointment.");
+                    }
+
+                    return ToDto(keyed);
+                }
             }
-        }
 
-        var providerRequest = new ProcessPaymentRequest(
-            request.TenantId,
-            request.AppointmentId,
-            request.Amount,
-            request.Currency,
-            request.PaymentMethodToken,
-            request.IdempotencyKey);
+            var ledger = PaymentLedger.From(payments);
+            PaymentLedger.ValidateCharge(
+                ledger,
+                amountDue: appointment.Price,
+                dueCurrency: appointment.Currency,
+                requestedCurrency: request.Currency,
+                status: appointment.Status,
+                amount: request.Amount);
 
-        var result = await _paymentProvider.ProcessPaymentAsync(providerRequest, cancellationToken);
+            var providerRequest = new ProcessPaymentRequest(
+                request.TenantId,
+                request.AppointmentId,
+                request.Amount,
+                request.Currency,
+                request.PaymentMethodToken,
+                request.IdempotencyKey);
 
-        if (!result.IsSuccess)
-        {
-            throw new BusinessRuleValidationException("PaymentFailed", result.ErrorMessage ?? "Payment processing failed.");
-        }
+            var result = await _paymentProvider.ProcessPaymentAsync(providerRequest, cancellationToken);
 
-        var payment = new Payment
-        {
-            Id = Guid.NewGuid(),
-            TenantId = request.TenantId,
-            AppointmentId = request.AppointmentId,
-            Amount = request.Amount,
-            Currency = request.Currency,
-            Status = result.Status,
-            Provider = _paymentProvider.ProviderType,
-            ProviderPaymentId = result.TransactionId,
-            IdempotencyKey = request.IdempotencyKey,
-            CreatedBy = _currentUser.UserId?.ToString() ?? "System"
-        };
+            if (!result.IsSuccess)
+            {
+                throw new BusinessRuleValidationException("PaymentFailed", result.ErrorMessage ?? "Payment processing failed.");
+            }
 
-        payment.Transactions.Add(new PaymentTransaction
-        {
-            PaymentId = payment.Id,
-            Amount = request.Amount,
-            Type = PaymentTransactionType.Charge,
-            Status = result.Status,
-            ProviderTransactionId = result.TransactionId,
-            TimestampUtc = DateTime.UtcNow
+            var payment = new Payment
+            {
+                Id = Guid.NewGuid(),
+                TenantId = request.TenantId,
+                AppointmentId = request.AppointmentId,
+                Amount = request.Amount,
+                Currency = request.Currency,
+                Status = result.Status,
+                Provider = _paymentProvider.ProviderType,
+                ProviderPaymentId = result.TransactionId,
+                IdempotencyKey = request.IdempotencyKey,
+                CreatedBy = _currentUser.UserId?.ToString() ?? "System"
+            };
+
+            // Children join the graph through the set, not through a parent's collection navigation: a
+            // child with a key that reaches the change tracker only through a navigation is treated as an
+            // existing row, and the update it generates matches nothing.
+            _db.PaymentTransactions.Add(new PaymentTransaction
+            {
+                PaymentId = payment.Id,
+                Amount = request.Amount,
+                Type = PaymentTransactionType.Charge,
+                Status = result.Status,
+                ProviderTransactionId = result.TransactionId,
+                TimestampUtc = DateTime.UtcNow
+            });
+
+            _db.Payments.Add(payment);
+
+            if (result.Status == PaymentStatus.Paid)
+            {
+                if (appointment.Status == AppointmentStatus.Pending)
+                {
+                    var history = appointment.TransitionTo(AppointmentStatus.Confirmed, "Payment received", _currentUser.UserId?.ToString());
+                    if (history is not null)
+                    {
+                        _db.AppointmentStatusHistories.Add(history);
+                    }
+                }
+
+                await _db.AdjustTotalSpentAsync(request.TenantId, appointment.CustomerId, request.Amount, cancellationToken);
+            }
+
+            await _db.SaveChangesAsync(cancellationToken);
+
+            return ToDto(payment);
         });
-
-        _db.Payments.Add(payment);
-
-        if (result.Status == PaymentStatus.Paid)
-        {
-            if (appointment.Status == AppointmentStatus.Pending)
-            {
-                appointment.TransitionTo(AppointmentStatus.Confirmed, "Payment received", _currentUser.UserId?.ToString());
-            }
-
-            if (appointment.Customer != null)
-            {
-                appointment.Customer.TotalSpent += request.Amount;
-            }
-        }
-
-        await _db.SaveChangesAsync(cancellationToken);
-
-        return new PaymentDto(
-            payment.Id,
-            payment.TenantId,
-            payment.AppointmentId,
-            payment.Amount,
-            payment.Currency,
-            payment.Status,
-            payment.ProviderPaymentId,
-            payment.CreatedAtUtc);
     }
+
+    private static PaymentDto ToDto(Payment payment) => new(
+        payment.Id,
+        payment.TenantId,
+        payment.AppointmentId,
+        payment.Amount,
+        payment.Currency,
+        payment.Status,
+        payment.ProviderPaymentId,
+        payment.CreatedAtUtc);
 }
 
 public record RefundPaymentCommand(
@@ -169,75 +198,101 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
 
     public async Task<bool> Handle(RefundPaymentCommand request, CancellationToken cancellationToken)
     {
-        var payment = await _db.Payments
-            .Include(p => p.Refunds)
-            .Include(p => p.Appointment)
-                .ThenInclude(a => a!.Customer)
-            .FirstOrDefaultAsync(p => p.Id == request.PaymentId && p.TenantId == request.TenantId, cancellationToken)
-            ?? throw new NotFoundException($"Payment with ID {request.PaymentId} was not found.");
+        // Only the appointment this payment belongs to is read here, and only to learn which lock to take.
+        // The refundable balance is computed again after the lock, from committed data.
+        var appointmentId = await _db.Payments
+            .Where(p => p.Id == request.PaymentId && p.TenantId == request.TenantId)
+            .Select(p => p.AppointmentId)
+            .FirstOrDefaultAsync(cancellationToken);
 
-        if (payment.Status != PaymentStatus.Paid && payment.Status != PaymentStatus.PartiallyRefunded)
+        if (appointmentId == Guid.Empty)
         {
-            throw new BusinessRuleValidationException("InvalidPaymentStatusForRefund", $"Cannot refund payment in {payment.Status} status.");
+            throw new NotFoundException($"Payment with ID {request.PaymentId} was not found.");
         }
 
-        var totalAlreadyRefunded = payment.Refunds.Where(r => r.Status == PaymentStatus.Refunded).Sum(r => r.Amount);
-        var remainingBalance = payment.Amount - totalAlreadyRefunded;
-
-        if (request.Amount > remainingBalance)
+        return await _db.ExecuteInTransactionAsync(async () =>
         {
-            throw new BusinessRuleValidationException("RefundAmountExceeded", $"Refund amount ({request.Amount}) exceeds remaining balance ({remainingBalance}).");
-        }
+            await _db.AcquireAppointmentPaymentLockAsync(request.TenantId, appointmentId, cancellationToken);
 
-        var providerRequest = new ProcessRefundRequest(
-            request.TenantId,
-            request.PaymentId,
-            request.Amount,
-            request.Reason,
-            request.IdempotencyKey);
+            var payments = await _db.Payments
+                .Include(p => p.Refunds)
+                .Include(p => p.Appointment)
+                .Where(p => p.TenantId == request.TenantId && p.AppointmentId == appointmentId)
+                .ToListAsync(cancellationToken);
 
-        var result = await _paymentProvider.ProcessRefundAsync(providerRequest, cancellationToken);
-        if (!result.IsSuccess)
-        {
-            throw new BusinessRuleValidationException("RefundFailed", result.ErrorMessage ?? "Refund processing failed.");
-        }
+            var payment = payments.FirstOrDefault(p => p.Id == request.PaymentId)
+                ?? throw new NotFoundException($"Payment with ID {request.PaymentId} was not found.");
 
-        var refund = new Refund
-        {
-            Id = Guid.NewGuid(),
-            PaymentId = payment.Id,
-            Amount = request.Amount,
-            Reason = request.Reason,
-            Status = PaymentStatus.Refunded,
-            ProviderRefundId = result.RefundId,
-            CreatedAtUtc = DateTime.UtcNow
-        };
+            if (payment.Status != PaymentStatus.Paid && payment.Status != PaymentStatus.PartiallyRefunded)
+            {
+                throw new BusinessRuleValidationException("InvalidPaymentStatusForRefund", $"Cannot refund payment in {payment.Status} status.");
+            }
 
-        payment.Refunds.Add(refund);
+            var remaining = PaymentLedger.RemainingOnPayment(payment);
+            PaymentLedger.ValidateRefund(remaining, payment.Amount, request.Amount);
 
-        payment.Transactions.Add(new PaymentTransaction
-        {
-            PaymentId = payment.Id,
-            Amount = request.Amount,
-            Type = PaymentTransactionType.Refund,
-            Status = PaymentStatus.Refunded,
-            ProviderTransactionId = result.RefundId,
-            TimestampUtc = DateTime.UtcNow
+            var providerRequest = new ProcessRefundRequest(
+                request.TenantId,
+                request.PaymentId,
+                request.Amount,
+                request.Reason,
+                request.IdempotencyKey);
+
+            var result = await _paymentProvider.ProcessRefundAsync(providerRequest, cancellationToken);
+            if (!result.IsSuccess)
+            {
+                throw new BusinessRuleValidationException("RefundFailed", result.ErrorMessage ?? "Refund processing failed.");
+            }
+
+            var refund = new Refund
+            {
+                Id = Guid.NewGuid(),
+                PaymentId = payment.Id,
+                Amount = request.Amount,
+                Reason = request.Reason,
+                Status = PaymentStatus.Refunded,
+                ProviderRefundId = result.RefundId,
+                CreatedAtUtc = DateTime.UtcNow
+            };
+
+            // Same registration rule as the charge path: children are added through the set.
+            _db.Refunds.Add(refund);
+
+            _db.PaymentTransactions.Add(new PaymentTransaction
+            {
+                PaymentId = payment.Id,
+                Amount = request.Amount,
+                Type = PaymentTransactionType.Refund,
+                Status = PaymentStatus.Refunded,
+                ProviderTransactionId = result.RefundId,
+                TimestampUtc = DateTime.UtcNow
+            });
+
+            payment.Status = remaining - request.Amount <= 0m
+                ? PaymentStatus.Refunded
+                : PaymentStatus.PartiallyRefunded;
+
+            await _db.AdjustTotalSpentAsync(request.TenantId, payment.Appointment!.CustomerId, -request.Amount, cancellationToken);
+
+            await _db.SaveChangesAsync(cancellationToken);
+            return true;
         });
-
-        // Update status
-        var newTotalRefunded = totalAlreadyRefunded + request.Amount;
-        payment.Status = newTotalRefunded >= payment.Amount
-            ? PaymentStatus.Refunded
-            : PaymentStatus.PartiallyRefunded;
-
-        // Adjust customer total spent
-        if (payment.Appointment?.Customer != null)
-        {
-            payment.Appointment.Customer.TotalSpent -= request.Amount;
-        }
-
-        await _db.SaveChangesAsync(cancellationToken);
-        return true;
     }
+}
+
+/// <summary>
+/// The counter moves in SQL, not in this process: two charges on two different appointments of the same
+/// customer hold two different payment locks, so a read-modify-write would drop one of them.
+/// </summary>
+internal static class CustomerCounterExtensions
+{
+    public static Task AdjustTotalSpentAsync(
+        this IApplicationDbContext db,
+        Guid tenantId,
+        Guid customerId,
+        decimal delta,
+        CancellationToken cancellationToken) =>
+        db.Customers
+            .Where(c => c.Id == customerId && c.TenantId == tenantId)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.TotalSpent, c => c.TotalSpent + delta), cancellationToken);
 }
