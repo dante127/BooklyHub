@@ -59,6 +59,10 @@ public static class DependencyInjection
             services.AddDistributedMemoryCache();
         }
 
+        // Refuses the stand-in bindings below wherever their result would be believed as real: Production
+        // may not run the payment simulator or the log-only senders.
+        OutboundProviderPolicy.Validate(configuration, environment);
+
         services.AddSingleton<ICacheService, CacheService>();
         services.AddScoped<BooklyHub.Application.Scheduling.IAvailabilityService, AvailabilityService>();
         services.AddScoped<BooklyHub.Application.Payments.IPaymentProvider, BooklyHub.Infrastructure.Payments.SimulatedPaymentProvider>();
@@ -99,7 +103,8 @@ public static class DependencyInjection
 
         services.AddAuthorization();
 
-        // Notification senders (Default simulated implementations)
+        // Notification senders. The simulated implementations above and here log instead of delivering;
+        // OutboundProviderPolicy has already refused them for Production.
         services.AddScoped<IEmailSender, SimulatedEmailSender>();
         services.AddScoped<ISmsSender, SimulatedSmsSender>();
         services.AddScoped<IPushNotificationSender, SimulatedPushNotificationSender>();
