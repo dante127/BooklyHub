@@ -94,15 +94,34 @@ public class RescheduleAppointmentCommandHandler : IRequestHandler<RescheduleApp
                 throw new BookingConflictException($"The selected new slot is not available: {slotCheck.Message}");
             }
 
-            // Apply domain rescheduling (keeps original slot intact until committed)
-            appointment.Reschedule(request.NewStartAtUtc, newEndAtUtc, request.Reason, _currentUser.UserId?.ToString());
+            // Apply domain rescheduling (keeps original slot intact until committed). The returned history
+            // row must be registered as new, not discovered through the navigation (see the domain method).
+            var history = appointment.Reschedule(request.NewStartAtUtc, newEndAtUtc, request.Reason, _currentUser.UserId?.ToString());
+            _db.AppointmentStatusHistories.Add(history);
 
             // The guard allocated rooms for the new time while holding the location lock. Keeping the old
             // rows instead would leave the appointment on a resource someone else took in the meantime.
-            appointment.AppointmentResources.Clear();
-            foreach (var resourceId in slotCheck.ResourceIds)
+            // Rows still allocated stay; the rest leave and join through the set, because children that
+            // reach the tracker only through the collection are treated as rows that already exist.
+            var selectedResourceIds = slotCheck.ResourceIds.ToHashSet();
+            var staleResources = appointment.AppointmentResources
+                .Where(ar => !selectedResourceIds.Contains(ar.ResourceId))
+                .ToList();
+            foreach (var stale in staleResources)
             {
-                appointment.AppointmentResources.Add(new AppointmentResource
+                appointment.AppointmentResources.Remove(stale);
+                _db.AppointmentResources.Remove(stale);
+            }
+
+            var keptResourceIds = appointment.AppointmentResources.Select(ar => ar.ResourceId).ToHashSet();
+            foreach (var resourceId in selectedResourceIds)
+            {
+                if (keptResourceIds.Contains(resourceId))
+                {
+                    continue;
+                }
+
+                _db.AppointmentResources.Add(new AppointmentResource
                 {
                     TenantId = request.TenantId,
                     AppointmentId = appointment.Id,

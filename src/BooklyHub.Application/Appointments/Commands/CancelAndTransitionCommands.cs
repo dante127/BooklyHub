@@ -59,7 +59,13 @@ public class CancelAppointmentCommandHandler : IRequestHandler<CancelAppointment
             }
         }
 
-        appointment.TransitionTo(AppointmentStatus.Cancelled, request.Reason, _currentUser.UserId?.ToString());
+        // TransitionTo returns the history row it appended; it must be registered as new, not discovered
+        // through the navigation (see the domain method).
+        var history = appointment.TransitionTo(AppointmentStatus.Cancelled, request.Reason, _currentUser.UserId?.ToString());
+        if (history is not null)
+        {
+            _db.AppointmentStatusHistories.Add(history);
+        }
 
         await _db.SaveChangesAsync(cancellationToken);
         return true;
@@ -94,7 +100,13 @@ public class TransitionAppointmentStatusCommandHandler : IRequestHandler<Transit
             .FirstOrDefaultAsync(a => a.Id == request.AppointmentId && a.TenantId == request.TenantId, cancellationToken)
             ?? throw new NotFoundException($"Appointment with ID {request.AppointmentId} was not found.");
 
-        appointment.TransitionTo(request.NewStatus, request.Reason, _currentUser.UserId?.ToString());
+        // TransitionTo returns the history row it appended; it must be registered as new, not discovered
+        // through the navigation (see the domain method).
+        var history = appointment.TransitionTo(request.NewStatus, request.Reason, _currentUser.UserId?.ToString());
+        if (history is not null)
+        {
+            _db.AppointmentStatusHistories.Add(history);
+        }
 
         await _db.SaveChangesAsync(cancellationToken);
 

@@ -195,7 +195,11 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
                     recurringAppointmentId: recurringApptId,
                     createdBy: _currentUser.UserId?.ToString() ?? "System");
 
-                appt.TransitionTo(AppointmentStatus.Confirmed, "Confirmed recurring appointment", _currentUser.UserId?.ToString());
+                var history = appt.TransitionTo(AppointmentStatus.Confirmed, "Confirmed recurring appointment", _currentUser.UserId?.ToString());
+                if (history is not null)
+                {
+                    _db.AppointmentStatusHistories.Add(history);
+                }
 
                 foreach (var resourceId in slotCheck.ResourceIds)
                 {

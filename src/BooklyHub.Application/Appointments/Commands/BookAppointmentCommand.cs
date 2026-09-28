@@ -170,7 +170,11 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
             // Automatically confirm if upfront payment is not required
             if (tenant.Settings?.RequireUpfrontPayment != true)
             {
-                appointment.TransitionTo(AppointmentStatus.Confirmed, "Auto-confirmed on booking", _currentUser.UserId?.ToString());
+                var history = appointment.TransitionTo(AppointmentStatus.Confirmed, "Auto-confirmed on booking", _currentUser.UserId?.ToString());
+                if (history is not null)
+                {
+                    _db.AppointmentStatusHistories.Add(history);
+                }
             }
 
             foreach (var resourceId in allocatedResourceIds)
