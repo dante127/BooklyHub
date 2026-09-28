@@ -39,7 +39,7 @@ public class RecurringSeriesTests : IClassFixture<BooklyHubWebApplicationFactory
 
     private sealed record Graph(Guid TenantId, Guid LocationId, Guid ServiceId, Guid StaffId, Guid CustomerId);
 
-    private async Task<Graph> SeedGraphAsync(DateOnly seriesStart, int maxAdvanceBookingDays)
+    private async Task<Graph> SeedGraphAsync(DateOnly seriesStart, int maxAdvanceBookingDays, bool requireUpfrontPayment = false)
     {
         var graph = new Graph(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid());
 
@@ -51,7 +51,8 @@ public class RecurringSeriesTests : IClassFixture<BooklyHubWebApplicationFactory
         {
             MinBookingNoticeMinutes = 10,
             MaxAdvanceBookingDays = maxAdvanceBookingDays,
-            SlotIntervalMinutes = 30
+            SlotIntervalMinutes = 30,
+            RequireUpfrontPayment = requireUpfrontPayment
         };
         db.Tenants.Add(tenant);
 
@@ -154,6 +155,37 @@ public class RecurringSeriesTests : IClassFixture<BooklyHubWebApplicationFactory
 
     private static string ReadRule(string body) =>
         JsonDocument.Parse(body).RootElement.GetProperty("rule").GetString()!;
+
+    private sealed record StoredAppointment(DateTime StartAtUtc, AppointmentStatus Status, int HistoryRows);
+
+    private async Task<List<StoredAppointment>> ReadSeriesAppointmentsAsync(Graph graph)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+        var rows = await db.Appointments
+            .IgnoreQueryFilters()
+            .Where(a => a.TenantId == graph.TenantId)
+            .OrderBy(a => a.StartAtUtc)
+            .Select(a => new { a.StartAtUtc, a.Status, Histories = a.StatusHistories.Count })
+            .ToListAsync();
+
+        return rows.Select(r => new StoredAppointment(r.StartAtUtc, r.Status, r.Histories)).ToList();
+    }
+
+    private async Task SeedHolidayAsync(Graph graph, DateOnly date)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        db.Holidays.Add(new Holiday
+        {
+            TenantId = graph.TenantId,
+            LocationId = graph.LocationId,
+            Name = "Clinic closed",
+            Date = date
+        });
+        await db.SaveChangesAsync();
+    }
 
     [Fact]
     public async Task TwoYearWeeklySeries_MustBeRefusedWithTheBookingHorizon()
@@ -294,6 +326,87 @@ public class RecurringSeriesTests : IClassFixture<BooklyHubWebApplicationFactory
             $"expected 422, got {(int)response.StatusCode}: {body}");
         ReadRule(body).Should().Be("RecurrencePatternUnsupported");
         (await ReadCountsAsync(graph)).Should().Be((0, 0), body);
+    }
+
+    [Fact]
+    public async Task RecurringWithRequireUpfrontPayment_MustLeaveOccurrencesPendingUntilPaid()
+    {
+        var start = DateOnly.FromDateTime(DateTime.UtcNow.Date.AddDays(2));
+        var graph = await SeedGraphAsync(start, maxAdvanceBookingDays: 500, requireUpfrontPayment: true);
+
+        var response = await PostSeriesAsync(graph, start, endDate: null, maxOccurrences: 3, conflictPolicy: RecurrenceConflictPolicy.AbortSeries);
+        var body = await ReadBodyAsync(response);
+
+        Assert.True(response.StatusCode == HttpStatusCode.OK, $"expected 200, got {(int)response.StatusCode}: {body}");
+
+        // A tenant that is paid before it honours an appointment must not be able to buy confirmation by
+        // booking in bulk: the single-booking path already refuses to auto-confirm, so the series has to
+        // hold every occurrence at Pending too.
+        var stored = await ReadSeriesAppointmentsAsync(graph);
+        stored.Should().HaveCount(3);
+        stored.Should().OnlyContain(a => a.Status == AppointmentStatus.Pending, body);
+        stored.Should().OnlyContain(a => a.HistoryRows == 1, "only the creation row may exist; a confirm row would mean the series was confirmed");
+
+        var first = stored[0];
+        var paid = await _factory.CreateClientForTenant(graph.TenantId, Roles.Accountant).PostAsJsonAsync("/api/v1/payments/charge",
+            new PaymentsController.ProcessPaymentApiRequest(await ReadAppointmentIdAsync(graph, first.StartAtUtc), 100.00m));
+        var paidBody = await ReadBodyAsync(paid);
+
+        Assert.True(paid.StatusCode == HttpStatusCode.OK, $"expected 200, got {(int)paid.StatusCode}: {paidBody}");
+
+        var afterPayment = await ReadSeriesAppointmentsAsync(graph);
+        afterPayment[0].Status.Should().Be(AppointmentStatus.Confirmed, "payment is what confirms a Pending occurrence, on this path as on any other");
+        afterPayment[1].Status.Should().Be(AppointmentStatus.Pending, "paying for one occurrence must not confirm the rest of the series");
+    }
+
+    [Fact]
+    public async Task RecurringSkippedOccurrences_MustReportWhyEachOneWasRefused()
+    {
+        var start = DateOnly.FromDateTime(DateTime.UtcNow.Date.AddDays(2));
+        var graph = await SeedGraphAsync(start, maxAdvanceBookingDays: 500);
+
+        var secondOccurrence = start.AddDays(7);
+        var thirdOccurrence = start.AddDays(14);
+        await SeedHolidayAsync(graph, secondOccurrence);
+
+        var otherCustomer = await SeedSecondCustomerAsync(graph);
+        var occupied = await StaffClient(graph).PostAsJsonAsync("/api/v1/appointments",
+            new AppointmentsController.BookAppointmentRequest(
+                graph.LocationId, graph.ServiceId, graph.StaffId, otherCustomer,
+                thirdOccurrence.ToDateTime(new TimeOnly(9, 0)),
+                "takes the third occurrence"));
+        var occupiedBody = await ReadBodyAsync(occupied);
+        Assert.True(occupied.StatusCode is HttpStatusCode.Created or HttpStatusCode.OK,
+            $"expected 201, got {(int)occupied.StatusCode}: {occupiedBody}");
+
+        var response = await PostSeriesAsync(graph, start, endDate: null, maxOccurrences: 4);
+        var seriesBody = await ReadBodyAsync(response);
+
+        Assert.True(response.StatusCode == HttpStatusCode.OK, $"expected 200, got {(int)response.StatusCode}: {seriesBody}");
+
+        using var doc = JsonDocument.Parse(seriesBody);
+        doc.RootElement.GetProperty("bookedCount").GetInt32().Should().Be(2, seriesBody);
+        doc.RootElement.GetProperty("skippedCount").GetInt32().Should().Be(2, seriesBody);
+
+        // The count says two of four are missing; only the reasons say that one is a closed day the caller
+        // should move and one is somebody else's appointment they should not touch.
+        var skipped = doc.RootElement.GetProperty("skippedOccurrences").EnumerateArray().ToList();
+        skipped.Should().HaveCount(2);
+        DateOnly.Parse(skipped[0].GetProperty("date").GetString()!).Should().Be(secondOccurrence);
+        skipped[0].GetProperty("reason").GetString().Should().Be("Closed");
+        DateOnly.Parse(skipped[1].GetProperty("date").GetString()!).Should().Be(thirdOccurrence);
+        skipped[1].GetProperty("reason").GetString().Should().Be("StaffBusy");
+    }
+
+    private async Task<Guid> ReadAppointmentIdAsync(Graph graph, DateTime startAtUtc)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+        return await db.Appointments
+            .IgnoreQueryFilters()
+            .Where(a => a.TenantId == graph.TenantId && a.StartAtUtc == startAtUtc)
+            .Select(a => a.Id)
+            .SingleAsync();
     }
 
     private async Task<Guid> SeedSecondCustomerAsync(Graph graph)

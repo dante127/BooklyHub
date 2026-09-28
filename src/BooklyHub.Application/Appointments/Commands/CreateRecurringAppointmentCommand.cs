@@ -32,7 +32,15 @@ public record RecurringAppointmentResultDto(
     int TotalOccurrencesRequested,
     int BookedCount,
     int SkippedCount,
+    IReadOnlyList<SkippedOccurrenceDto> SkippedOccurrences,
     IReadOnlyList<AppointmentDto> CreatedAppointments);
+
+/// <summary>
+/// One occurrence that was asked for and not booked, with the guard's own reason for refusing it. A count
+/// alone cannot be acted on: a closed day, a booked-over slot and a slot outside the booking window all
+/// looked the same in the skipped total.
+/// </summary>
+public record SkippedOccurrenceDto(DateOnly Date, SlotUnavailableReason Reason);
 
 public class CreateRecurringAppointmentCommandValidator : AbstractValidator<CreateRecurringAppointmentCommand>
 {
@@ -163,7 +171,7 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
 
         var recurringApptId = Guid.NewGuid();
 
-        var (createdAppointments, skippedCount) = await _db.ExecuteInTransactionAsync(async () =>
+        var (createdAppointments, skippedOccurrences) = await _db.ExecuteInTransactionAsync(async () =>
         {
             // Lock order is location then staff, everywhere a booking is written.
             await _db.AcquireLocationBookingLockAsync(request.TenantId, request.LocationId, cancellationToken);
@@ -194,7 +202,7 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
                 cancellationToken);
 
             var created = new List<Appointment>();
-            var skipped = 0;
+            var skipped = new List<SkippedOccurrenceDto>();
 
             for (var i = 0; i < candidates.Count; i++)
             {
@@ -209,7 +217,7 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
                         throw new BookingConflictException($"Conflict detected on {date:yyyy-MM-dd}: {slotCheck.Message} Recurring series was aborted.");
                     }
 
-                    skipped++;
+                    skipped.Add(new SkippedOccurrenceDto(date, slotCheck.Reason!.Value));
                     continue;
                 }
 
@@ -228,8 +236,14 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
                     recurringAppointmentId: recurringApptId,
                     createdBy: _currentUser.UserId?.ToString() ?? "System");
 
-                _db.AppointmentStatusHistories.Add(
-                    appt.TransitionTo(AppointmentStatus.Confirmed, "Confirmed recurring appointment", _currentUser.UserId?.ToString()));
+                // A tenant that takes payment before honouring an appointment is not confirmation-free
+                // just because the booking arrived as a series: the occurrence stays Pending and the
+                // payment path confirms it, exactly as for a single booking.
+                if (tenant.Settings?.RequireUpfrontPayment != true)
+                {
+                    _db.AppointmentStatusHistories.Add(
+                        appt.TransitionTo(AppointmentStatus.Confirmed, "Confirmed recurring appointment", _currentUser.UserId?.ToString()));
+                }
 
                 foreach (var resourceId in slotCheck.ResourceIds)
                 {
@@ -286,7 +300,8 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
             recurringApptId,
             targetDates.Count,
             createdAppointments.Count,
-            skippedCount,
+            skippedOccurrences.Count,
+            skippedOccurrences,
             dtos);
     }
 
