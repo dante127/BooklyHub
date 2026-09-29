@@ -213,6 +213,16 @@ Executes high-performance set-based SQL aggregations for executive reporting.
   late arrival is still an arrival) and no more than 14 days past it, so a first run cannot restate a
   period somebody already reported. The closure writes one `AppointmentStatusHistory` row attributed to
   `system:no-show-sweep` and sends no notification.
+- If a staff member edits one of the appointments being closed after the sweep has read it, the row's
+  `RowVersion` token makes the sweep's write fail rather than overwrite: the tenant's whole batch rolls back
+  and is re-judged from a fresh read, up to three times. A booking the front desk closed as `Completed` is
+  therefore never restated as `NoShow`, and a re-judgement never costs the neighbouring closures either —
+  only the row that moved is re-evaluated. A tenant whose rows keep moving under the sweep is not judged in
+  that tick; it is reported in `SkippedContendedTenant` and picked up by the next one, while every other
+  tenant is still swept normally.
+  **Residual (SWP-02, open):** the token guards the appointment row, not the money judgement. A payment that
+  commits between the sweep's ledger read and its write touches no `Appointments` row, so no conflict is
+  detected and a paid visit is still closed to a status `PaymentLedger.ValidateCharge` refuses to charge.
 - A booking that still owes money is **not** closed. `PaymentLedger.ValidateCharge` refuses to charge a
   `NoShow`, so closing an unpaid row would write the balance off silently; the sweep leaves it `Confirmed`
   and counts it in its `SkippedWithBalance` result. Those rows are the population of

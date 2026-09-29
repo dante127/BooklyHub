@@ -10,7 +10,11 @@ using Microsoft.Extensions.Logging;
 
 namespace BooklyHub.Infrastructure.BackgroundJobs;
 
-public sealed record NoShowSweepResult(int Closed, int SkippedWithBalance, int SkippedLockedTenant);
+public sealed record NoShowSweepResult(
+    int Closed,
+    int SkippedWithBalance,
+    int SkippedLockedTenant,
+    int SkippedContendedTenant);
 
 /// <summary>
 /// Closes bookings that were confirmed, never attended and are now past their visit window. Without this
@@ -22,6 +26,14 @@ public class AppointmentNoShowBackgroundService : BackgroundService
     private const string SweepActor = "system:no-show-sweep";
     private const string ClosureReason = "Not attended; closed automatically after the visit window.";
     private const int BatchSize = 200;
+
+    /// <summary>
+    /// How many times one tenant's closure batch is re-judged after the store says a row moved under it.
+    /// Every conflict takes that row out of the next read, so three in a row is a busy front desk rather
+    /// than a livelock; past that the tenant defers to the next tick instead of the sweep spinning while
+    /// every tenant behind it waits.
+    /// </summary>
+    private const int MaxConflictAttempts = 3;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<AppointmentNoShowBackgroundService> _logger;
@@ -60,41 +72,96 @@ public class AppointmentNoShowBackgroundService : BackgroundService
         CancellationToken cancellationToken,
         Guid? tenantFilter = null)
     {
-        using var scope = _scopeFactory.CreateSystemScope();
-        var db = scope.ServiceProvider.GetRequiredService<IApplicationDbContext>();
-        var clock = scope.ServiceProvider.GetRequiredService<IClock>();
+        List<Guid> tenantIds;
+        DateTime nowUtc;
 
-        var nowUtc = clock.UtcNow;
+        using (var read = _scopeFactory.CreateSystemScope())
+        {
+            var db = read.ServiceProvider.GetRequiredService<IApplicationDbContext>();
+            var clock = read.ServiceProvider.GetRequiredService<IClock>();
 
-        var tenantIds = await db.Tenants
-            .AsNoTracking()
-            .Where(t => t.IsActive && (tenantFilter == null || t.Id == tenantFilter))
-            .Select(t => t.Id)
-            .ToListAsync(cancellationToken);
+            // One clock read for the whole tick: the deadline, the lookback and every tenant's window have
+            // to be the same instant, or a booking could be closed by two different "now"s.
+            nowUtc = clock.UtcNow;
+
+            tenantIds = await db.Tenants
+                .AsNoTracking()
+                .Where(t => t.IsActive && (tenantFilter == null || t.Id == tenantFilter))
+                .Select(t => t.Id)
+                .ToListAsync(cancellationToken);
+        }
 
         var closed = 0;
         var skippedWithBalance = 0;
         var skippedLocked = 0;
+        var skippedContended = 0;
 
         foreach (var tenantId in tenantIds)
         {
-            var (tenantClosed, tenantSkipped, lockHeld) = await SweepTenantAsync(db, tenantId, nowUtc, cancellationToken);
+            var (tenantClosed, tenantSkipped, lockHeld, contention) =
+                await SweepTenantAsync(tenantId, nowUtc, cancellationToken);
+
             closed += tenantClosed;
             skippedWithBalance += tenantSkipped;
             if (!lockHeld) skippedLocked++;
+            if (contention) skippedContended++;
         }
 
-        if (closed > 0 || skippedWithBalance > 0)
+        if (closed > 0 || skippedWithBalance > 0 || skippedContended > 0)
         {
             _logger.LogInformation(
-                "No-show closure sweep: {Closed} closed, {Skipped} left with a balance, {Locked} tenants busy.",
-                closed, skippedWithBalance, skippedLocked);
+                "No-show closure sweep: {Closed} closed, {Skipped} left with a balance, {Locked} tenants busy, " +
+                "{Contended} tenants deferred by concurrent edits.",
+                closed, skippedWithBalance, skippedLocked, skippedContended);
         }
 
-        return new NoShowSweepResult(closed, skippedWithBalance, skippedLocked);
+        return new NoShowSweepResult(closed, skippedWithBalance, skippedLocked, skippedContended);
     }
 
-    private async Task<(int Closed, int SkippedWithBalance, bool LockHeld)> SweepTenantAsync(
+    private async Task<(int Closed, int SkippedWithBalance, bool LockHeld, bool DeferredByContention)> SweepTenantAsync(
+        Guid tenantId,
+        DateTime nowUtc,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                // A fresh context per attempt. A rejected SaveChanges leaves the whole batch dirty in the
+                // change tracker, so re-running on the same context would re-send the writes the store just
+                // refused instead of re-reading the state the conflicting writer left.
+                using var scope = _scopeFactory.CreateSystemScope();
+                var db = scope.ServiceProvider.GetRequiredService<IApplicationDbContext>();
+
+                return await SweepBatchAsync(db, tenantId, nowUtc, cancellationToken);
+            }
+            catch (DbUpdateConcurrencyException ex)
+            {
+                var moved = ex.Entries
+                    .Select(entry => entry.Entity)
+                    .OfType<Appointment>()
+                    .Select(a => a.Id)
+                    .ToList();
+
+                if (attempt >= MaxConflictAttempts)
+                {
+                    _logger.LogWarning(
+                        "No-show closures for tenant {TenantId} were re-judged {Attempts} times and appointments " +
+                        "{AppointmentIds} were still moving under the sweep; deferring the tenant to the next tick.",
+                        tenantId, attempt, string.Join(", ", moved));
+
+                    return (0, 0, true, true);
+                }
+
+                _logger.LogInformation(
+                    "No-show sweep for tenant {TenantId} lost a row to a concurrent edit ({AppointmentIds}); " +
+                    "the tenant's batch was rolled back and is being re-judged.",
+                    tenantId, string.Join(", ", moved));
+            }
+        }
+    }
+
+    private async Task<(int Closed, int SkippedWithBalance, bool LockHeld, bool DeferredByContention)> SweepBatchAsync(
         IApplicationDbContext db,
         Guid tenantId,
         DateTime nowUtc,
@@ -169,10 +236,14 @@ public class AppointmentNoShowBackgroundService : BackgroundService
 
             if (closed > 0)
             {
+                // The appointments carry a rowversion, so this throws rather than overwriting a status a
+                // staff member wrote after the candidate read. The batch is one transaction, so the whole
+                // tenant rolls back with it and SweepTenantAsync re-judges it; an attended visit is never
+                // restated as an absence, and never silently costs the rest of the tick either.
                 await db.SaveChangesAsync(cancellationToken);
             }
         }, cancellationToken);
 
-        return (closed, skippedWithBalance, lockHeld);
+        return (closed, skippedWithBalance, lockHeld, false);
     }
 }
