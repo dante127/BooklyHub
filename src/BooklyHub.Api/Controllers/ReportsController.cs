@@ -15,11 +15,13 @@ public class ReportsController : ControllerBase
 {
     private readonly ISender _sender;
     private readonly ITenantContext _tenantContext;
+    private readonly IClock _clock;
 
-    public ReportsController(ISender sender, ITenantContext tenantContext)
+    public ReportsController(ISender sender, ITenantContext tenantContext, IClock clock)
     {
         _sender = sender;
         _tenantContext = tenantContext;
+        _clock = clock;
     }
 
     [HttpGet("dashboard")]
@@ -34,8 +36,10 @@ public class ReportsController : ControllerBase
             return BadRequest(new { message = "Active tenant context is required." });
         }
 
-        var start = fromUtc ?? DateTime.UtcNow.AddDays(-30);
-        var end = toUtc ?? DateTime.UtcNow;
+        // One instant for both bounds, so the period is 30 days wide rather than 30 days plus the gap between two reads.
+        var nowUtc = _clock.UtcNow;
+        var start = fromUtc ?? nowUtc.AddDays(-30);
+        var end = toUtc ?? nowUtc;
 
         var query = new GetDashboardReportQuery(_tenantContext.TenantId.Value, start, end);
         var report = await _sender.Send(query, cancellationToken);
