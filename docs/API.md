@@ -172,6 +172,10 @@ Executes high-performance set-based SQL aggregations for executive reporting.
   "grossRevenue": 17850.00,
   "cancellationRatePercent": 4.2,
   "noShowRatePercent": 2.1,
+  "upcomingCount": 9,
+  "upcomingPendingCount": 2,
+  "upcomingConfirmedCount": 6,
+  "nextAppointmentAtUtc": "2026-09-23T11:30:00Z",
   "topServices": [
     {
       "serviceId": "50c2688b-1e7a-42fc-873b-5517173b060d",
@@ -190,3 +194,13 @@ Executes high-performance set-based SQL aggregations for executive reporting.
   ]
 }
 ```
+
+**Counter semantics:**
+- Every field above except the four `upcoming*` fields is counted inside `[fromUtc, toUtc]`.
+- `upcomingCount`, `upcomingPendingCount`, `upcomingConfirmedCount` and `nextAppointmentAtUtc` are
+  anchored on the server clock, not on `toUtc`: they count appointments that start after now and whose
+  visit has not been closed yet (`Completed`, `Cancelled` and `NoShow` are excluded; a legacy `Rescheduled`
+  row still owes a visit). Asking about a period that closed in 2020 therefore still reports what is owed
+  next, and `nextAppointmentAtUtc` is null when nothing is.
+- `confirmedCount` is a status count inside the period, so an appointment that has already started and was
+  never marked `Completed` or `NoShow` still appears there. Nothing closes those rows automatically today.

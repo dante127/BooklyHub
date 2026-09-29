@@ -1,4 +1,5 @@
 using BooklyHub.Application.Common.Interfaces;
+using BooklyHub.Domain.Entities.Appointments;
 using BooklyHub.Domain.Enums;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
@@ -16,6 +17,10 @@ public record DashboardReportDto(
     decimal GrossRevenue,
     double CancellationRatePercent,
     double NoShowRatePercent,
+    int UpcomingCount,
+    int UpcomingPendingCount,
+    int UpcomingConfirmedCount,
+    DateTime? NextAppointmentAtUtc,
     IReadOnlyList<ServicePerformanceDto> TopServices,
     IReadOnlyList<StaffPerformanceDto> TopStaff);
 
@@ -34,7 +39,8 @@ public record StaffPerformanceDto(
 public record GetDashboardReportQuery(
     Guid TenantId,
     DateTime FromUtc,
-    DateTime ToUtc) : IRequest<DashboardReportDto>;
+    DateTime ToUtc,
+    DateTime NowUtc) : IRequest<DashboardReportDto>;
 
 public class GetDashboardReportQueryHandler : IRequestHandler<GetDashboardReportQuery, DashboardReportDto>
 {
@@ -71,6 +77,24 @@ public class GetDashboardReportQueryHandler : IRequestHandler<GetDashboardReport
 
         var cancellationRate = total > 0 ? Math.Round((double)cancelled / total * 100, 1) : 0.0;
         var noShowRate = total > 0 ? Math.Round((double)noShow / total * 100, 1) : 0.0;
+
+        // Anchored on the clock instant rather than ToUtc: a caller asking about a closed period still needs
+        // to know what is owed next, and both halves of the report must agree on what "now" is.
+        var upcomingByStatus = await _db.Appointments
+            .AsNoTracking()
+            .Where(a => a.TenantId == request.TenantId &&
+                        a.StartAtUtc > request.NowUtc &&
+                        !AppointmentStatusSet.Closed.Contains(a.Status))
+            .GroupBy(a => a.Status)
+            .Select(g => new { Status = g.Key, Count = g.Count(), EarliestStart = g.Min(a => a.StartAtUtc) })
+            .ToListAsync(cancellationToken);
+
+        var upcomingCount = upcomingByStatus.Sum(x => x.Count);
+        var upcomingPendingCount = upcomingByStatus.Where(x => x.Status == AppointmentStatus.Pending).Sum(x => x.Count);
+        var upcomingConfirmedCount = upcomingByStatus.Where(x => x.Status == AppointmentStatus.Confirmed).Sum(x => x.Count);
+        DateTime? nextAppointmentAtUtc = upcomingByStatus.Count == 0
+            ? null
+            : upcomingByStatus.Min(x => x.EarliestStart);
 
         // Top services aggregated in SQL by scalar ServiceId
         var topServicesRaw = await apptQuery
@@ -149,6 +173,10 @@ public class GetDashboardReportQueryHandler : IRequestHandler<GetDashboardReport
             grossRevenue,
             cancellationRate,
             noShowRate,
+            upcomingCount,
+            upcomingPendingCount,
+            upcomingConfirmedCount,
+            nextAppointmentAtUtc,
             topServices,
             topStaff);
     }

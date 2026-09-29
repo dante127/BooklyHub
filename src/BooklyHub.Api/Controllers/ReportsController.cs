@@ -41,7 +41,7 @@ public class ReportsController : ControllerBase
         var start = fromUtc ?? nowUtc.AddDays(-30);
         var end = toUtc ?? nowUtc;
 
-        var query = new GetDashboardReportQuery(_tenantContext.TenantId.Value, start, end);
+        var query = new GetDashboardReportQuery(_tenantContext.TenantId.Value, start, end, nowUtc);
         var report = await _sender.Send(query, cancellationToken);
         return Ok(report);
     }

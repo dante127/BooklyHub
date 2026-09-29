@@ -170,5 +170,13 @@ public class NPlusOneQueryTests : IClassFixture<BooklyHubWebApplicationFactory>
         var totalQueries = _factory.QueryInterceptor.QueryCount;
         totalQueries.Should().BeLessThanOrEqualTo(4,
             because: $"dashboard reports must use pure SQL aggregations rather than loading entity rows. Observed: {totalQueries}");
+
+        // A single SELECT that pulls every row into memory also counts as one query, so the ceiling alone
+        // cannot tell an SQL aggregate from a loaded table. Every dashboard command must carry its own
+        // aggregation and the tenant it was asked about, not the ambient one.
+        var commands = _factory.QueryInterceptor.ExecutedCommands;
+        commands.Should().OnlyContain(command =>
+                command.Contains("COUNT(") && command.Contains("@request_TenantId"),
+            because: $"every dashboard query must be a tenant-scoped SQL aggregate. Observed:\n{string.Join("\n---\n", commands)}");
     }
 }
