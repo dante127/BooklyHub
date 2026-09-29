@@ -1,5 +1,6 @@
 using BooklyHub.Application.Appointments.Dtos;
 using BooklyHub.Application.Common.Interfaces;
+using BooklyHub.Application.Payments;
 using BooklyHub.Application.Payments.Commands;
 using BooklyHub.Domain.Enums;
 using BooklyHub.Domain.Exceptions;
@@ -85,6 +86,13 @@ public class TransitionAppointmentStatusCommandValidator : AbstractValidator<Tra
         RuleFor(x => x.AppointmentId).NotEmpty();
         RuleFor(x => x.NewStatus).IsInEnum();
         RuleFor(x => x.Reason).MaximumLength(500);
+
+        // /cancel has always required a reason and this endpoint did not, so the reason was a rule a caller
+        // could step around by choosing a different URL — the same shape as the cutoff hole closed by putting
+        // EnsureCancellable behind both doors.
+        RuleFor(x => x.Reason).NotEmpty()
+            .WithMessage("A reason is required when cancelling, whichever endpoint the cancel arrives on.")
+            .When(x => x.NewStatus == AppointmentStatus.Cancelled);
     }
 }
 
@@ -128,6 +136,26 @@ public class TransitionAppointmentStatusCommandHandler : IRequestHandler<Transit
                     .FirstOrDefaultAsync(cancellationToken);
 
                 AppointmentCutoffPolicy.EnsureCancellable(settings, loaded.StartAtUtc, _clock.UtcNow, _currentUser);
+            }
+
+            // A status that ends collection also ends the queue's sight of the debt, so writing one off is a
+            // decision that has to name itself. The money read is taken inside this transaction and only for
+            // those statuses, leaving the routine check-in and completion writes as cheap as they were: a
+            // payment landing after the read can only lower the balance, so the gate cannot be talked out of
+            // existence by money that has not arrived yet.
+            if (PaymentLedger.EndsCollection(request.NewStatus))
+            {
+                var payments = await _db.Payments
+                    .AsNoTracking()
+                    .Include(p => p.Refunds)
+                    .Where(p => p.TenantId == request.TenantId && p.AppointmentId == loaded.Id)
+                    .ToListAsync(cancellationToken);
+
+                PaymentLedger.ValidateWriteOff(
+                    request.NewStatus,
+                    loaded.Price,
+                    PaymentLedger.From(payments),
+                    request.Reason);
             }
 
             // TransitionTo returns the history row it appended; it must be registered as new, not discovered

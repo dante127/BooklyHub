@@ -145,6 +145,18 @@ Transitions an appointment status according to the domain state machine.
 }
 ```
 
+**When `reason` stops being optional** (`/transition`, and `/cancel` as it always did):
+- `newStatus: Cancelled` — the validator requires it, `BadRequest` 400, the same as `POST /{id}/cancel`. Before
+  this the reason was a rule a caller could step around by choosing this URL (WRI-01).
+- `newStatus: NoShow` (or any status `PaymentLedger.EndsCollection` names) while the appointment still owes
+  money — `UnprocessableEntity` 422, rule `DebtWriteOffReasonRequired`, and the message carries the amount
+  being stranded (`"60.00 of 100.00"`). The amount is read from the payment rows inside the same transaction,
+  so it is the remainder after deposits, not the booked price.
+- A settled booking closes with no reason at all: nothing is stranded, so nothing has to be explained.
+- The refusal is the point: a `NoShow` cannot be charged and the outstanding queue lists only `Confirmed` and
+  `Completed`, so writing an unexplained balance off takes the debt off every surface at once. Refused, the
+  row stays `Confirmed` and stays on the queue.
+
 ### `POST /api/v1/appointments/recurring`
 Creates a series of recurring appointments with configurable conflict policies (`SkipConflicts` or `AbortSeries`).
 
@@ -234,7 +246,8 @@ Executes high-performance set-based SQL aggregations for executive reporting.
   `NoShow`, so closing an unpaid row would write the balance off silently; the sweep leaves it `Confirmed`
   and counts it in its `SkippedWithBalance` result. Those rows are the population of
   `GET /api/v1/payments/outstanding-visits` (section 6), which is where a human decides whether to collect
-  or to waive.
+  or to waive — and waiving on that human's behalf, through `POST /api/v1/appointments/{id}/transition`,
+  now has to state the reason (section 4).
   **Residual (RPT-01, open):** `grossRevenue` sums `Appointment.Price` over the `Completed` and `Confirmed`
   rows in the period, so it is booked value, not money the ledger holds — an unpaid visit and a half-paid
   one inflate it the same way. The queue makes that gap visible and gives the amount actually outstanding;
@@ -321,8 +334,9 @@ neither repeat a booking nor drop one between two page reads).
   already decided. A client reading `lastModifiedAtUtc`/`lastModifiedBy` on an appointment will therefore see
   money writes in it, not only status edits.
 - `POST /api/v1/appointments/{id}/transition` with `newStatus: NoShow` (`appointments.update`) — waiving the
-  balance. Two things about this path are worth knowing before anyone relies on the queue for control:
-  `AppointmentCutoffPolicy.EnsureCancellable` runs only when the target is `Cancelled`, so a write-off is
-  never gated by the tenant's cutoff, and the transition validator puts no requirement on `reason`, so an
-  unexplained write-off of a real debt is accepted today. Both are open findings, recorded rather than
-  changed here.
+  balance. The queue only lists `Confirmed` and `Completed`, and a `NoShow` cannot be charged, so this verb
+  removes a real debt from every collectable surface in one call. It now says so: with a balance still open
+  the transition is refused `422 DebtWriteOffReasonRequired` until a `reason` is supplied, which is the
+  written-down justification the money question needs. One property of this path is still open and recorded
+  rather than changed here: `AppointmentCutoffPolicy.EnsureCancellable` runs only when the target is
+  `Cancelled`, so a write-off is never gated by the tenant's cancellation cutoff.

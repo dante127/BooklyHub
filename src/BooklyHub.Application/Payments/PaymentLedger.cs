@@ -41,6 +41,38 @@ public readonly record struct PaymentLedger
     public decimal Outstanding(decimal amountDue) => Math.Max(0m, amountDue - Net);
 
     /// <summary>
+    /// The statuses after which nothing more can be collected, which is the list <see cref="ValidateCharge"/>
+    /// refuses to charge. Moving a booking into one of them while it still owes money writes the balance off,
+    /// and the outstanding queue loses the row at the same moment because its own membership is the mirror
+    /// image of this list. Rescheduled is named because the charge rule names it; BL-06 leaves it unreachable,
+    /// so no path is widened by including it.
+    /// </summary>
+    public static bool EndsCollection(AppointmentStatus status) =>
+        status is AppointmentStatus.Cancelled or AppointmentStatus.NoShow or AppointmentStatus.Rescheduled;
+
+    /// <summary>
+    /// A balance written off by a status change is a decision somebody has to own. The ledger cannot tell a
+    /// waiver from a slip, and once the status lands the debt is off every queue, so a blank reason leaves the
+    /// money with no author and nothing left to ask about it.
+    /// </summary>
+    public static void ValidateWriteOff(
+        AppointmentStatus status,
+        decimal amountDue,
+        PaymentLedger ledger,
+        string? reason)
+    {
+        if (!EndsCollection(status)) return;
+
+        var outstanding = ledger.Outstanding(amountDue);
+        if (outstanding == 0m || !string.IsNullOrWhiteSpace(reason)) return;
+
+        throw new BusinessRuleValidationException(
+            "DebtWriteOffReasonRequired",
+            $"This appointment still owes {outstanding:0.00} of {amountDue:0.00} and a {status} appointment cannot " +
+            "be charged, so this transition writes the balance off. Say why.");
+    }
+
+    /// <summary>
     /// A refund draws on its own payment, never on the appointment's whole balance, so refunding part of
     /// one visit cannot silently eat the money taken for another.
     /// </summary>
@@ -60,7 +92,7 @@ public readonly record struct PaymentLedger
         AppointmentStatus status,
         decimal amount)
     {
-        if (status is AppointmentStatus.Cancelled or AppointmentStatus.NoShow or AppointmentStatus.Rescheduled)
+        if (EndsCollection(status))
         {
             throw new BusinessRuleValidationException(
                 "AppointmentNotChargeable",
