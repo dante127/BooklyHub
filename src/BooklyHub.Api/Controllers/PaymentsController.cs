@@ -1,5 +1,7 @@
 using BooklyHub.Application.Common.Interfaces;
+using BooklyHub.Application.Common.Models;
 using BooklyHub.Application.Payments.Commands;
+using BooklyHub.Application.Payments.Queries;
 using BooklyHub.Application.Security;
 using BooklyHub.Infrastructure.Security;
 using MediatR;
@@ -15,11 +17,13 @@ public class PaymentsController : ControllerBase
 {
     private readonly ISender _sender;
     private readonly ITenantContext _tenantContext;
+    private readonly IClock _clock;
 
-    public PaymentsController(ISender sender, ITenantContext tenantContext)
+    public PaymentsController(ISender sender, ITenantContext tenantContext, IClock clock)
     {
         _sender = sender;
         _tenantContext = tenantContext;
+        _clock = clock;
     }
 
     public record ProcessPaymentApiRequest(
@@ -40,6 +44,22 @@ public class PaymentsController : ControllerBase
             throw new BadHttpRequestException("Active tenant context is required.");
         }
         return _tenantContext.TenantId.Value;
+    }
+
+    [HttpGet("outstanding-visits")]
+    [HasPermission(Permissions.Payments.Read)]
+    public async Task<ActionResult<PaginatedList<OutstandingVisitDto>>> GetOutstandingVisits(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        CancellationToken cancellationToken = default)
+    {
+        var tenantId = GetRequiredTenantId();
+
+        // The window is derived from the application clock, not from the query string: a caller that could
+        // pass its own "now" could pull a not-yet-overdue booking into the collection queue.
+        var query = new GetOutstandingVisitsQuery(tenantId, _clock.UtcNow, page, pageSize);
+        var result = await _sender.Send(query, cancellationToken);
+        return Ok(result);
     }
 
     [HttpPost("charge")]

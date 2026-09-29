@@ -30,4 +30,17 @@ public static class AppointmentStatusSet
         AppointmentStatus.CheckedIn,
         AppointmentStatus.InProgress
     ];
+
+    /// <summary>
+    /// Statuses a debt can still be chased for: the clinic accepted the visit, or performed it. Pending is
+    /// excluded because nothing was ever agreed to render, and AwaitingOutcome is excluded because that row
+    /// has to be closed before its money question can be answered at all. Closed is not reused here: a
+    /// Completed row ends the visit and still owes money, while a Cancelled or NoShow row ends the visit
+    /// with nothing owed, so the same status answers both questions differently.
+    /// </summary>
+    public static readonly AppointmentStatus[] Collectable =
+    [
+        AppointmentStatus.Confirmed,
+        AppointmentStatus.Completed
+    ];
 }

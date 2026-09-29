@@ -215,8 +215,93 @@ Executes high-performance set-based SQL aggregations for executive reporting.
   `system:no-show-sweep` and sends no notification.
 - A booking that still owes money is **not** closed. `PaymentLedger.ValidateCharge` refuses to charge a
   `NoShow`, so closing an unpaid row would write the balance off silently; the sweep leaves it `Confirmed`
-  and counts it in its `SkippedWithBalance` result.
-  **Residual (RPT-01, open):** those rows keep holding `confirmedCount` and keep inflating `grossRevenue`,
-  because revenue is priced off `Completed` and `Confirmed`. Collecting or cancelling them is still a human
-  decision the API exposes no surface for; `staleExecutionCount` does not cover them either, since they are
-  not `CheckedIn`/`InProgress`.
+  and counts it in its `SkippedWithBalance` result. Those rows are the population of
+  `GET /api/v1/payments/outstanding-visits` (section 6), which is where a human decides whether to collect
+  or to waive.
+  **Residual (RPT-01, open):** `grossRevenue` sums `Appointment.Price` over the `Completed` and `Confirmed`
+  rows in the period, so it is booked value, not money the ledger holds — an unpaid visit and a half-paid
+  one inflate it the same way. The queue makes that gap visible and gives the amount actually outstanding;
+  it does not change what the dashboard reports.
+
+---
+
+## 6. Payments
+
+### `GET /api/v1/payments/outstanding-visits`
+The collection queue: visits the clinic is past its window on and still owes money for.
+
+**Permission:** `payments.read` (`TenantOwner`, `TenantAdmin`, `Manager`, `Receptionist`, `Accountant`;
+`Staff` has none). Deliberately not `reports.read`, which `Receptionist` does not hold — the desk that
+chases payment is the desk that needs this list. This is the first endpoint in the codebase gated on
+`payments.read`; the permission existed in the role map with no surface behind it.
+
+**Query parameters:** `page` (default 1) and `pageSize` (default 20, clamped to 1..100 exactly as the
+appointment search clamps it). There is no `nowUtc` parameter: the window comes from the server clock, so a
+caller cannot pull a not-yet-overdue booking into the queue by lying about the time.
+
+**What is in the queue** — a row has to satisfy all four:
+1. Its `Status` is in `AppointmentStatusSet.Collectable`: `Confirmed` or `Completed`. `Pending` is excluded
+   because nothing was ever agreed to render; `CheckedIn`/`InProgress` because that row has to be closed
+   before its money question can be answered at all (that is `staleExecutionCount`); `Cancelled` and
+   `NoShow` because they end the visit with nothing owed. `Completed` is in both this set and `Closed`, and
+   that is the point: the same status answers "is the visit over" and "is it paid" differently.
+2. `EndAtUtc` is more than 6 hours in the past — `NoShowClosurePolicy.DeadlineUtc`, the same bound the sweep
+   uses, so the two surfaces cannot disagree about when a visit became overdue. There is **no** lookback
+   bound: the sweep needs one because it writes, a queue does not, because a debt from three months ago is
+   still owed and dropping it from the list does not collect it.
+3. The ledger balance is still open: captured payments (`Paid`, `PartiallyRefunded`, `Refunded`) minus
+   settled refunds, against the price the booking was made at. A free booking owes nothing and is not
+   listed; a visit refunded back to zero is listed again.
+4. It belongs to the calling tenant. A platform admin passing `X-Tenant-Id` has the global filter open, so
+   this predicate is the only scoping left on the way.
+
+`amountDue` comes from `PaymentLedger.Outstanding`, the same object the charge path enforces its limits
+with, so the queue never invites an amount the ledger would refuse. Membership, however, is decided in SQL
+(`PaymentLedgerQuery.WhereOwing`), because a queue that filtered in memory would have to load every
+overdue booking to show a dozen. That is one rule written twice, and
+`OutstandingVisitQueueTests.EveryPaymentShape_SqlMembershipAndAmountsMustMatchTheLedger` runs both forms
+over thirteen payment shapes in one book: no rows, wholly paid, partly paid, refunded to zero, partly
+refunded, two payments that settle, two that do not, a capture that never happened, an attempt still
+`Pending`, three statuses refused on status, one row refused on the window.
+
+**Response:** `PaginatedList<OutstandingVisitDto>`, oldest debt first (`EndAtUtc`, then `Id`, so a page can
+neither repeat a booking nor drop one between two page reads).
+
+```json
+{
+  "items": [
+    {
+      "appointmentId": "0b6a2b3c-2f77-4b1c-9d0e-1a2b3c4d5e6f",
+      "customerId": "6a71c2d0-9e3b-4f11-8a55-2b3c4d5e6f70",
+      "customerName": "Ziad Patient",
+      "serviceName": "Comprehensive Dental Exam & Cleaning",
+      "staffName": "Dr. Sarah Smith",
+      "endAtUtc": "2026-09-28T11:30:00Z",
+      "price": 120.00,
+      "netPaid": 40.00,
+      "amountDue": 80.00,
+      "currency": "USD",
+      "status": "Confirmed"
+    }
+  ],
+  "pageNumber": 1,
+  "pageSize": 20,
+  "totalCount": 7,
+  "totalPages": 1,
+  "hasNextPage": false,
+  "hasPreviousPage": false
+}
+```
+
+**Closing a row.** The queue only reads; the write verbs already existed and are what a caller uses next:
+- `POST /api/v1/payments/charge` (`payments.manage`, honours `Idempotency-Key`) — collecting the `amountDue`
+  shown clears the row. Charging past the price is refused on the ledger, with
+  `AppointmentAlreadyPaid` or `PaymentExceedsAmountDue`.
+- `POST /api/v1/payments/refund` (`payments.refund`) — draws against one payment's remaining balance, so a
+  refund back to zero puts the visit into the queue again.
+- `POST /api/v1/appointments/{id}/transition` with `newStatus: NoShow` (`appointments.update`) — waiving the
+  balance. Two things about this path are worth knowing before anyone relies on the queue for control:
+  `AppointmentCutoffPolicy.EnsureCancellable` runs only when the target is `Cancelled`, so a write-off is
+  never gated by the tenant's cutoff, and the transition validator puts no requirement on `reason`, so an
+  unexplained write-off of a real debt is accepted today. Both are open findings, recorded rather than
+  changed here.

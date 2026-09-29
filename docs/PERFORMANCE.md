@@ -20,6 +20,7 @@ graph TD
 1. **No Lazy Loading**: EF Core Lazy Loading is strictly disabled across all aggregates. Entities do not make surprise database roundtrips when accessing navigational properties.
 2. **Explicit SQL Projections (`Select`)**: Read queries project directly into DTOs. SQL Server generates an optimized single `SELECT` statement joining only the requested columns.
 3. **Automated Interceptor Testing**: `NPlusOneQueryTests.cs` uses a custom EF Core `DbCommandInterceptor` (`QueryCountInterceptor`) to assert that fetching 25 appointments takes **at most 2 queries**, completely preventing regressions during future development.
+4. **A Page Of Debt Is Three Statements**: `GET /api/v1/payments/outstanding-visits` decides who owes money in SQL (`PaymentLedgerQuery.WhereOwing`, so the queue never loads the whole overdue book to show a dozen rows), reads the page, then reads the payments for **that page in one statement** and recomputes each balance through `PaymentLedger`. `OutstandingVisitQueueTests.TheQueue_MustStayThreeStatementsAndScopeEveryOneOfThem` pins the ceiling at 3 and requires every statement to carry a tenant condition — the fourth statement would mean the ledger is being rebuilt booking by booking.
 
 ---
 

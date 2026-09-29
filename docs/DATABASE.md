@@ -75,6 +75,13 @@ stays small; that population is exactly what the sweep drains every 15 minutes. 
 because bookings go unpaid and the ledger keeps them open — the sweep needs its own
 `(TenantId, Status, EndAtUtc)` index, and so does the reporting gap it exposes.
 
+That gap is now a surface: `GET /api/v1/payments/outstanding-visits` asks for
+`TenantId = @t AND Status IN (Confirmed, Completed) AND EndAtUtc <= @deadline`, owing money, ordered by
+`EndAtUtc`. It is the wider of the two reads — two statuses, no upper bound on age, and one correlated
+payment aggregate per candidate row — and it runs while a human pages through it rather than once every
+15 minutes. Still the intended shape for a small tenant's open book; the same
+`(TenantId, Status, EndAtUtc)` index is what both the sweep and the queue are waiting on.
+
 ### 3.2 Staff & Availability Indexing
 | Index Name | Columns | Purpose |
 | :--- | :--- | :--- |

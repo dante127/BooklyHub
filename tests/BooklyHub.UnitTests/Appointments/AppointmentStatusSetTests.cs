@@ -1,3 +1,4 @@
+using BooklyHub.Application.Payments;
 using BooklyHub.Domain.Entities.Appointments;
 using BooklyHub.Domain.Enums;
 using FluentAssertions;
@@ -106,5 +107,38 @@ public class AppointmentStatusSetTests
             AppointmentStatusSet.IsClosed(status)
                 .Should().Be(AppointmentStatusSet.Closed.Contains(status), $"for {status}");
         }
+    }
+
+    // The collection queue lists a booking by its status, so the set it reads has to be a set of statuses the
+    // money door still opens for. Otherwise the queue invites a charge the ledger is going to refuse.
+    [Fact]
+    public void EveryCollectableStatus_MustBeOneTheChargeDoorStillOpensFor()
+    {
+        foreach (var status in AppointmentStatusSet.Collectable)
+        {
+            var action = () => PaymentLedger.ValidateCharge(
+                PaymentLedger.From([]), 100.00m, "USD", "USD", status, 100.00m);
+
+            action.Should().NotThrow($"{status} is listed as still owing money, so charging it must be permitted");
+        }
+    }
+
+    [Fact]
+    public void Collectable_MustExcludeEveryStatusWhoseDebtIsNotTheCustomers()
+    {
+        // Pending: the clinic never accepted the booking, so nothing is owed to it. CheckedIn and InProgress:
+        // the customer appeared and the open row is the clinic's own reporting gap. Cancelled and NoShow: the
+        // visit is over with nothing owed, and a NoShow cannot be charged at all.
+        AppointmentStatusSet.Collectable.Should().BeEquivalentTo(
+            [AppointmentStatus.Confirmed, AppointmentStatus.Completed]);
+    }
+
+    // Completed is the only status that both ends the visit and still owes for it, which is exactly why the
+    // queue cannot reuse Closed: the same status answers "is it over" and "is it paid" differently.
+    [Fact]
+    public void ClosedAndCollectable_MustOverlapOnCompletedAlone()
+    {
+        AppointmentStatusSet.Closed.Intersect(AppointmentStatusSet.Collectable)
+            .Should().Equal(AppointmentStatus.Completed);
     }
 }

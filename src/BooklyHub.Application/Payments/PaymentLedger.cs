@@ -1,3 +1,4 @@
+using BooklyHub.Domain.Entities.Appointments;
 using BooklyHub.Domain.Entities.Payments;
 using BooklyHub.Domain.Enums;
 using BooklyHub.Domain.Exceptions;
@@ -100,4 +101,31 @@ public readonly record struct PaymentLedger
                 $"payment of {paymentAmount:0.00}.");
         }
     }
+}
+
+/// <summary>
+/// The ledger's money question written for the database, kept in this file so the two forms of one rule are
+/// read side by side.
+///
+/// <see cref="PaymentLedger.Outstanding"/> can only answer for payments already in memory, which makes it
+/// useless for paging: a queue that filtered in C# would have to load every overdue appointment to know
+/// which dozen to show. So the same test is stated here as a translatable predicate. Nothing but a test
+/// keeps the two agreeable, and <c>OutstandingVisitQueueTests</c> runs both forms over every payment shape -
+/// because a queue that listed a settled booking would accuse a customer who paid, and one that dropped a
+/// debt would reopen exactly the hole the queue exists to close.
+/// </summary>
+public static class PaymentLedgerQuery
+{
+    public static IQueryable<Appointment> WhereOwing(
+        this IQueryable<Appointment> appointments,
+        IQueryable<Payment> payments) =>
+        appointments.Where(a => a.Price >
+            (payments.Where(p => p.AppointmentId == a.Id &&
+                                 (p.Status == PaymentStatus.Paid ||
+                                  p.Status == PaymentStatus.PartiallyRefunded ||
+                                  p.Status == PaymentStatus.Refunded))
+                .Sum(p => (decimal?)p.Amount) ?? 0m) -
+            (payments.Where(p => p.AppointmentId == a.Id)
+                .SelectMany(p => p.Refunds.Where(r => r.Status == PaymentStatus.Refunded))
+                .Sum(r => (decimal?)r.Amount) ?? 0m));
 }
