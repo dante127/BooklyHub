@@ -272,6 +272,31 @@ public class ApplicationDbContext : DbContext, IApplicationDbContext
     public Task AcquireAppointmentPaymentLockAsync(Guid tenantId, Guid appointmentId, CancellationToken cancellationToken = default)
         => ExecuteAppLockAsync($"Booking_Payment_{tenantId:N}_{appointmentId:N}", cancellationToken);
 
+    /// <summary>
+    /// Restamps the appointment's audit columns, which moves its rowversion. Money is stored on the payment
+    /// rows, so without this a charge or a refund changes what the no-show sweep decides and leaves nothing
+    /// behind for its compare-and-swap to notice, and a closure decided against the old ledger commits a debt
+    /// onto a status that refuses to be charged and a queue that refuses to list it.
+    ///
+    /// Deliberately unconditional by id: the appointment may have been edited by the front desk in the same
+    /// window, and a touch that checked the token would fail money that was genuinely taken. The tenant is
+    /// stated in the predicate rather than left to the ambient filter, the same way the customer counters
+    /// state it, because this is a write.
+    /// </summary>
+    public Task TouchAppointmentRowAsync(Guid tenantId, Guid appointmentId, CancellationToken cancellationToken = default)
+    {
+        var now = _clock.UtcNow;
+        var currentUserId = _currentUser.UserId?.ToString() ?? "System";
+
+        return Appointments
+            .Where(a => a.Id == appointmentId && a.TenantId == tenantId)
+            .ExecuteUpdateAsync(
+                s => s
+                    .SetProperty(a => a.LastModifiedAtUtc, now)
+                    .SetProperty(a => a.LastModifiedBy, currentUserId),
+                cancellationToken);
+    }
+
     public async Task<bool> TryAcquireOutboxProcessorLockAsync(CancellationToken cancellationToken = default)
     {
         if (!Database.IsSqlServer()) return true;

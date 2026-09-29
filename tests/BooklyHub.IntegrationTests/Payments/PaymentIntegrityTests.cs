@@ -295,6 +295,34 @@ public class PaymentIntegrityTests : IClassFixture<BooklyHubWebApplicationFactor
         ledger.TotalSpent.Should().Be(Price, "two deposits must add up to exactly what was collected");
     }
 
+    /// <summary>
+    /// A first charge on a Pending booking writes that appointment twice in one transaction: its status
+    /// through the tracker, its audit stamp through the money touch. The touch has to follow the tracked save,
+    /// because restamping the rowversion first leaves the tracker's own UPDATE matching nothing, and money the
+    /// provider already captured would come back to the desk as a failure.
+    /// </summary>
+    [Fact]
+    public async Task Charge_PendingBooking_MustConfirmItWithTheAuditTouchFollowingTheTrackedSave()
+    {
+        var graph = await SeedGraphAsync();
+        var appointmentId = await SeedAppointmentAsync(graph, status: AppointmentStatus.Pending);
+
+        (await ChargeAsync(graph, appointmentId, Price)).StatusCode.Should().Be(HttpStatusCode.OK);
+
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+        var row = await db.Appointments
+            .IgnoreQueryFilters()
+            .Where(a => a.Id == appointmentId)
+            .Select(a => new { a.Status, a.LastModifiedAtUtc, Histories = a.StatusHistories.Count })
+            .SingleAsync();
+
+        row.Status.Should().Be(AppointmentStatus.Confirmed, "money received is what confirms a Pending booking");
+        row.LastModifiedAtUtc.Should().NotBeNull("the charge restamped the row it settled");
+        row.Histories.Should().Be(2, "the booking itself and the confirmation this charge caused");
+    }
+
     [Fact]
     public async Task Charge_CancelledAppointment_MustBeRefused()
     {

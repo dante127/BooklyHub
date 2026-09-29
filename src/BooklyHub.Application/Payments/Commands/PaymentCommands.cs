@@ -163,6 +163,11 @@ public class ProcessPaymentCommandHandler : IRequestHandler<ProcessPaymentComman
 
             await _db.SaveChangesAsync(cancellationToken);
 
+            // After the save, because a Pending appointment was just transitioned through the tracker and a
+            // second writer of its token would fail the charge. The sweep reads this ledger in a transaction
+            // it cannot hold open, so the rowversion is the only way it learns money moved.
+            await _db.TouchAppointmentRowAsync(request.TenantId, request.AppointmentId, cancellationToken);
+
             return ToDto(payment);
         });
     }
@@ -275,6 +280,11 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
             await _db.AdjustTotalSpentAsync(request.TenantId, payment.Appointment!.CustomerId, -request.Amount, cancellationToken);
 
             await _db.SaveChangesAsync(cancellationToken);
+
+            // Same reason as the charge path: a refund is the write that turns a settled booking back into a
+            // debt, and a closure that had already read the old ledger has to be refused rather than committed.
+            await _db.TouchAppointmentRowAsync(request.TenantId, appointmentId, cancellationToken);
+
             return true;
         });
     }

@@ -220,9 +220,16 @@ Executes high-performance set-based SQL aggregations for executive reporting.
   only the row that moved is re-evaluated. A tenant whose rows keep moving under the sweep is not judged in
   that tick; it is reported in `SkippedContendedTenant` and picked up by the next one, while every other
   tenant is still swept normally.
-  **Residual (SWP-02, open):** the token guards the appointment row, not the money judgement. A payment that
-  commits between the sweep's ledger read and its write touches no `Appointments` row, so no conflict is
-  detected and a paid visit is still closed to a status `PaymentLedger.ValidateCharge` refuses to charge.
+  Money moves the row it settles: `POST /api/v1/payments/charge` and `POST /api/v1/payments/refund` both end
+  by restamping the appointment's audit columns, which bumps the same `RowVersion`, so a payment or refund that
+  lands after the sweep has read the ledger is caught the same way and the re-judged batch asks the money
+  question again instead of committing the closure. A refund racing an edit of the appointment still succeeds:
+  that restamp is unconditional by id, because money a provider already captured must not come back as a
+  failure.
+  **Residual (SWP-03, open — a policy question, not a race):** a fully paid booking nobody ever closed is
+  recorded as an absence by the sweep, one tick after the balance skip if the payment arrives late. `NoShow`
+  has no outgoing transition, so the attendance record cannot be restated afterwards through any endpoint; the
+  amount stays refundable because the refund gate reads the payment's status, not the appointment's.
 - A booking that still owes money is **not** closed. `PaymentLedger.ValidateCharge` refuses to charge a
   `NoShow`, so closing an unpaid row would write the balance off silently; the sweep leaves it `Confirmed`
   and counts it in its `SkippedWithBalance` result. Those rows are the population of
@@ -309,6 +316,10 @@ neither repeat a booking nor drop one between two page reads).
   `AppointmentAlreadyPaid` or `PaymentExceedsAmountDue`.
 - `POST /api/v1/payments/refund` (`payments.refund`) — draws against one payment's remaining balance, so a
   refund back to zero puts the visit into the queue again.
+  Both of those write the appointment row as well as the money rows: they restamp its audit columns, which
+  moves its `RowVersion` and is what lets the no-show sweep notice a ledger that changed under a closure it had
+  already decided. A client reading `lastModifiedAtUtc`/`lastModifiedBy` on an appointment will therefore see
+  money writes in it, not only status edits.
 - `POST /api/v1/appointments/{id}/transition` with `newStatus: NoShow` (`appointments.update`) — waiving the
   balance. Two things about this path are worth knowing before anyone relies on the queue for control:
   `AppointmentCutoffPolicy.EnsureCancellable` runs only when the target is `Cancelled`, so a write-off is

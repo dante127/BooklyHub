@@ -76,6 +76,16 @@ public interface IApplicationDbContext
     Task AcquireAppointmentPaymentLockAsync(Guid tenantId, Guid appointmentId, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Restamps the appointment's audit columns, which moves its rowversion. Money lives on the payment rows,
+    /// so a charge or a refund that does not touch the appointment changes what the no-show sweep decides
+    /// without leaving anything for its compare-and-swap to notice. Call it after the tracked save: the charge
+    /// path may itself update that row, and moving the token under a tracked copy would turn money that was
+    /// taken into a concurrency failure. The touch restamps by id without comparing the token, so a racing edit
+    /// of the appointment cannot fail money that was genuinely taken.
+    /// </summary>
+    Task TouchAppointmentRowAsync(Guid tenantId, Guid appointmentId, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Try semantics for background sweeps: returns false instead of waiting when another instance already
     /// owns the outbox batch, because a skipped tick is harmless and a duplicated delivery is not.
     /// </summary>
