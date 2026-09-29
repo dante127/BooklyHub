@@ -152,6 +152,9 @@ Transitions an appointment status according to the domain state machine.
   money — `UnprocessableEntity` 422, rule `DebtWriteOffReasonRequired`, and the message carries the amount
   being stranded (`"60.00 of 100.00"`). The amount is read from the payment rows inside the same transaction,
   so it is the remainder after deposits, not the booked price.
+- Leaving a `NoShow` for `Completed` — rule `NoShowRestatementRequiresReason`, also 422. The reason is the only
+  place a correction of an absence is written down, since the status column cannot say both that the patient
+  was absent and that she was in the chair (SWP-03).
 - A settled booking closes with no reason at all: nothing is stranded, so nothing has to be explained.
 - The refusal is the point: a `NoShow` cannot be charged and the outstanding queue lists only `Confirmed` and
   `Completed`, so writing an unexplained balance off takes the debt off every surface at once. Refused, the
@@ -238,10 +241,15 @@ Executes high-performance set-based SQL aggregations for executive reporting.
   question again instead of committing the closure. A refund racing an edit of the appointment still succeeds:
   that restamp is unconditional by id, because money a provider already captured must not come back as a
   failure.
-  **Residual (SWP-03, open — a policy question, not a race):** a fully paid booking nobody ever closed is
-  recorded as an absence by the sweep, one tick after the balance skip if the payment arrives late. `NoShow`
-  has no outgoing transition, so the attendance record cannot be restated afterwards through any endpoint; the
-  amount stays refundable because the refund gate reads the payment's status, not the appointment's.
+  **A wrong absence is correctable (SWP-03, closed).** The sweep decides attendance from a timer, so it can
+  close a visit that did happen — the patient was in the chair and nobody checked her in — and the row is then
+  out of the completed counts and the revenue with nothing in the book saying so. `NoShow` therefore has
+  exactly one outgoing transition, to `Completed`, and it requires a reason: the history row is the only place
+  both the wrong closure and its correction survive. It reaches `Completed` and nothing else, so a correction
+  cannot put a booking back on the schedule or re-arm a reminder, and the money question the closure ended
+  simply restarts — a restated row is chargeable and listed as owed again, including one whose balance was
+  waived as an absence. The refund path was never the problem: it reads the payment's status, not the
+  appointment's, so the amount was always recoverable while the fact was not.
 - A booking that still owes money is **not** closed. `PaymentLedger.ValidateCharge` refuses to charge a
   `NoShow`, so closing an unpaid row would write the balance off silently; the sweep leaves it `Confirmed`
   and counts it in its `SkippedWithBalance` result. Those rows are the population of

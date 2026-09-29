@@ -213,6 +213,61 @@ public class AppointmentStateMachineTests
             .Where(e => e.RuleName == "TransitionTooEarly");
     }
 
+    [Fact]
+    public void Transition_NoShowToCompleted_WithAReason_ShouldSucceedAndLeaveTheAbsenceInHistory()
+    {
+        var appt = CreateSampleAppointment();
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
+        appt.TransitionTo(AppointmentStatus.NoShow, DateTime.UtcNow, "Closed by the sweep");
+
+        var history = appt.TransitionTo(
+            AppointmentStatus.Completed, DateTime.UtcNow, "Patient was in the chair; desk never checked her in");
+
+        appt.Status.Should().Be(AppointmentStatus.Completed);
+        appt.CancellationReason.Should().BeNull("a corrected absence is not a cancellation");
+
+        history.FromStatus.Should().Be(AppointmentStatus.NoShow);
+        history.Reason.Should().Be("Patient was in the chair; desk never checked her in",
+            "the history row is the only place the wrong absence is still recorded");
+
+        appt.DomainEvents.Should().Contain(e => e is AppointmentCompletedEvent,
+            "a restated completion has to move the reporting and the outbox the way a normal one does");
+    }
+
+    [Fact]
+    public void Transition_NoShowToCompleted_WithoutAReason_ShouldThrowAndStayAnAbsence()
+    {
+        var appt = CreateSampleAppointment();
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
+        appt.TransitionTo(AppointmentStatus.NoShow, DateTime.UtcNow);
+
+        var act = () => appt.TransitionTo(AppointmentStatus.Completed, DateTime.UtcNow, "   ");
+
+        act.Should().Throw<BusinessRuleValidationException>()
+            .Where(e => e.RuleName == "NoShowRestatementRequiresReason");
+        appt.Status.Should().Be(AppointmentStatus.NoShow);
+    }
+
+    [Theory]
+    [InlineData(AppointmentStatus.Pending)]
+    [InlineData(AppointmentStatus.Confirmed)]
+    [InlineData(AppointmentStatus.CheckedIn)]
+    [InlineData(AppointmentStatus.InProgress)]
+    [InlineData(AppointmentStatus.Cancelled)]
+    [InlineData(AppointmentStatus.NoShow)]
+    [InlineData(AppointmentStatus.Rescheduled)]
+    public void Transition_OutOfAnAbsence_ShouldReachCompletedAndNothingElse(AppointmentStatus newStatus)
+    {
+        var appt = CreateSampleAppointment();
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
+        appt.TransitionTo(AppointmentStatus.NoShow, DateTime.UtcNow);
+
+        var act = () => appt.TransitionTo(newStatus, DateTime.UtcNow, "correction");
+
+        act.Should().Throw<InvalidStateTransitionException>()
+            .WithMessage("*not permitted*");
+    }
+
     private static Appointment CreateFutureAppointment()
     {
         var start = DateTime.UtcNow.AddDays(2);

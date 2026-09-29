@@ -140,6 +140,13 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
             (AppointmentStatus.InProgress, AppointmentStatus.Completed) => true,
             (AppointmentStatus.InProgress, AppointmentStatus.Cancelled) => true,
 
+            // One edge out of an absence, and it leads only back to the visit having happened. The sweep
+            // judges attendance from a timer, so it can be wrong about a patient who was in the chair, and a
+            // wrong absence needs a door back that a cancelled booking does not: nothing about the corrected
+            // row reopens a slot or re-arms a reminder. Everything else stays unreachable, so a closure can
+            // never become a live booking again by way of a correction.
+            (AppointmentStatus.NoShow, AppointmentStatus.Completed) => true,
+
             _ => false
         };
     }
@@ -177,6 +184,17 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
             throw new BusinessRuleValidationException(
                 "TransitionTooEarly",
                 $"Cannot mark an appointment as {newStatus} before its start time ({StartAtUtc:O}).");
+        }
+
+        // A reason is the only place a correction out of an absence gets written down: the status column says
+        // either absence or attendance and cannot say both, so without one the book simply disagrees with
+        // itself about a visit nobody can explain. Enforced here rather than in a validator because a
+        // validator never sees the status the request is leaving.
+        if (Status == AppointmentStatus.NoShow && string.IsNullOrWhiteSpace(reason))
+        {
+            throw new BusinessRuleValidationException(
+                "NoShowRestatementRequiresReason",
+                "A recorded absence can only be corrected by stating why it was wrong.");
         }
 
         var previousStatus = Status;

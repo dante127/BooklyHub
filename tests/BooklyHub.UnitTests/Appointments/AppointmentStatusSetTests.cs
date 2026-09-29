@@ -9,8 +9,8 @@ namespace BooklyHub.UnitTests.Appointments;
 /// <summary>
 /// "What is still owed a visit" is one definition, and the booking engine, the reminder sweep and the
 /// reporting counters all have to answer to it. These tests bind the set to the state machine itself: a
-/// status is closed exactly when nothing can follow it, so adding a status to the enum cannot let it join
-/// either bucket without a test saying so.
+/// closed status may only be followed by another closed one, so adding a status to the enum cannot let it
+/// join either bucket without a test saying so.
 /// </summary>
 public class AppointmentStatusSetTests
 {
@@ -53,6 +53,13 @@ public class AppointmentStatusSetTests
             return appointment;
         }
 
+        if (status == AppointmentStatus.Rescheduled)
+        {
+            // Walking on to NoShow would hand back an absence wearing the name of a live legacy booking, so
+            // a test asking for one would be bound to the wrong row.
+            throw new InvalidOperationException("Rescheduled is unreachable through the state machine.");
+        }
+
         appointment.TransitionTo(AppointmentStatus.NoShow, DateTime.UtcNow);
         return appointment;
     }
@@ -61,12 +68,21 @@ public class AppointmentStatusSetTests
         AllStatuses.Any(to => AppointmentIn(from).CanTransitionTo(to));
 
     [Fact]
-    public void EveryClosedStatus_MustHaveNoTransitionOut()
+    public void EveryClosedStatus_MayOnlyBeFollowedByAClosedStatus()
     {
+        // Closed means the visit is over and the slot is free, so a correction inside the closed set (an
+        // absence restated as an attendance) is allowed while anything that could make the booking live
+        // again is not.
         foreach (var status in AppointmentStatusSet.Closed)
         {
-            HasOutgoingTransition(status).Should().BeFalse(
-                $"{status} is reported as closed, so nothing may follow it");
+            var appointment = AppointmentIn(status);
+
+            var successors = AllStatuses
+                .Where(to => appointment.CanTransitionTo(to))
+                .Where(to => !AppointmentStatusSet.IsClosed(to))
+                .ToList();
+
+            successors.Should().BeEmpty($"{status} is reported as closed, so nothing live may follow it");
         }
     }
 
@@ -74,7 +90,11 @@ public class AppointmentStatusSetTests
     public void EveryOpenStatus_MustStillHaveSomewhereToGo()
     {
         // Rescheduled is the documented exception: unreachable for new rows, but a legacy row in it is a
-        // live booking, so it belongs to neither bucket by transition.
+        // live booking, so it belongs to neither bucket by transition. It is excluded rather than built here
+        // because the machine refuses to put a row in it (BL-06) and Status has a private setter, so an
+        // appointment handed to this loop would be some other status wearing its name. A new enum value
+        // arriving without an edge, or a closed status gaining a live successor, fails one of this test or
+        // EveryClosedStatus_MayOnlyBeFollowedByAClosedStatus.
         var open = AllStatuses
             .Where(s => !AppointmentStatusSet.IsClosed(s) && s != AppointmentStatus.Rescheduled)
             .ToList();
@@ -86,17 +106,6 @@ public class AppointmentStatusSetTests
             HasOutgoingTransition(status).Should().BeTrue(
                 $"{status} is not closed, so the state machine must still be able to move it");
         }
-    }
-
-    [Fact]
-    public void TheOnlyStatusThatIsNeitherClosedNorAbleToTransition_MustBeRescheduled()
-    {
-        var unclassified = AllStatuses
-            .Where(s => !AppointmentStatusSet.IsClosed(s) && !HasOutgoingTransition(s))
-            .ToList();
-
-        unclassified.Should().Equal(new[] { AppointmentStatus.Rescheduled },
-            because: "a new status has to be declared closed or given an outgoing edge, or the upcoming counters silently stop covering it");
     }
 
     [Fact]
