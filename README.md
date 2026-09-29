@@ -25,6 +25,7 @@ It is designed to power scheduling for diverse appointment-based businesses:
 - **Zero N+1 Query Guarantee**: All critical read paths (paginated appointment lists, dashboards, staff schedules) utilize projection queries and set-based SQL aggregations verified by automated query interceptors.
 - **Idempotency & Webhook Replay Protection**: RFC-compliant `Idempotency-Key` middleware with distributed Redis/database caching to ensure state-modifying actions are safe against network retries.
 - **Transactional Outbox & Reliable Reminders**: Domain events are persisted to `OutboxMessages` atomically with business data. Background workers process events with exponential backoff and dispatch automated appointment reminders.
+- **Automatic Absence Closure**: A third worker closes `Confirmed` bookings that were never attended — more than 6 hours past the end of the visit and no more than 14 days back — into `NoShow` with one attributable history row and no notification, per tenant under its own `sp_getapplock`. Bookings that still owe money are left open rather than written off, and rows the customer actually appeared for (`CheckedIn` / `InProgress`) are reported separately as `staleExecutionCount` instead of being blamed on the customer.
 
 ---
 
@@ -55,6 +56,7 @@ graph TD
         EFCore[EF Core DbContext + Global Filters]
         OutboxWorker[Outbox Background Worker]
         ReminderWorker[Reminder Background Worker]
+        NoShowWorker[No-Show Closure Sweep]
         PaymentGateway[Simulated Provider — no gateway implemented]
     end
 
@@ -71,6 +73,7 @@ graph TD
     EFCore --> SqlServer
     OutboxWorker --> SqlServer
     ReminderWorker --> SqlServer
+    NoShowWorker --> SqlServer
     Middleware --> RedisCache
 ```
 

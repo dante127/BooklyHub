@@ -166,9 +166,11 @@ public class NPlusOneQueryTests : IClassFixture<BooklyHubWebApplicationFactory>
         var report = await response.Content.ReadFromJsonAsync<DashboardReportDto>(jsonOptions);
         report.Should().NotBeNull();
 
-        // Dashboard aggregates should execute in at most 4 set-based SQL queries
+        // Five set-based SQL queries: status/revenue, upcoming, stale executions, top services, top staff —
+        // the name lookups only run when those groups returned rows. The ceiling has no headroom left, which
+        // is the point: a sixth dashboard aggregate has to arrive with a reason to merge one.
         var totalQueries = _factory.QueryInterceptor.QueryCount;
-        totalQueries.Should().BeLessThanOrEqualTo(4,
+        totalQueries.Should().BeLessThanOrEqualTo(5,
             because: $"dashboard reports must use pure SQL aggregations rather than loading entity rows. Observed: {totalQueries}");
 
         // A single SELECT that pulls every row into memory also counts as one query, so the ceiling alone

@@ -283,6 +283,17 @@ public class ApplicationDbContext : DbContext, IApplicationDbContext
         return results.Count > 0 && results[0] >= 0;
     }
 
+    public async Task<bool> TryAcquireNoShowSweepLockAsync(Guid tenantId, CancellationToken cancellationToken = default)
+    {
+        if (!Database.IsSqlServer()) return true;
+
+        var results = await Database
+            .SqlQuery<int>($"DECLARE @res INT; EXEC @res = sp_getapplock @Resource = {($"NoShow_Sweep_{tenantId:N}")}, @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 0; SELECT @res AS [Value];")
+            .ToListAsync(cancellationToken);
+
+        return results.Count > 0 && results[0] >= 0;
+    }
+
     private async Task ExecuteAppLockAsync(string lockKey, CancellationToken cancellationToken)
     {
         if (!Database.IsSqlServer()) return;

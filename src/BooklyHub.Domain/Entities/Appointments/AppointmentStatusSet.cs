@@ -20,4 +20,14 @@ public static class AppointmentStatusSet
     ];
 
     public static bool IsClosed(AppointmentStatus status) => Closed.Contains(status);
+
+    /// <summary>
+    /// The customer appeared and staff never recorded how the visit ended. Reporting these separately from a
+    /// no-show matters: closing one of them as NoShow would blame the customer for the clinic's own gap.
+    /// </summary>
+    public static readonly AppointmentStatus[] AwaitingOutcome =
+    [
+        AppointmentStatus.CheckedIn,
+        AppointmentStatus.InProgress
+    ];
 }

@@ -1,6 +1,8 @@
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Application.Payments;
 using BooklyHub.Infrastructure;
+using BooklyHub.Infrastructure.BackgroundJobs;
+using BooklyHub.Infrastructure.Outbox;
 using BooklyHub.Infrastructure.Payments;
 using BooklyHub.Infrastructure.Services;
 using FluentAssertions;
@@ -157,6 +159,28 @@ public class OutboundProviderPolicyTests
         ImplementedType<IEmailSender>(services).Should().Be<SimulatedEmailSender>();
         ImplementedType<ISmsSender>(services).Should().Be<SimulatedSmsSender>();
         ImplementedType<IPushNotificationSender>(services).Should().Be<SimulatedPushNotificationSender>();
+    }
+
+    [Fact]
+    public void RegisteringInfrastructure_MustBindEveryPollingWorker()
+    {
+        var services = new ServiceCollection();
+
+        services.AddInfrastructure(Build(PaymentsAndNotifications("Simulated", "Simulated")), HostEnvironment("Development"));
+
+        // The test host removes these workers so its queries stay deterministic, which means no integration
+        // test would notice a sweep that never gets registered at all. This does.
+        var workers = services
+            .Where(d => d.ServiceType == typeof(IHostedService))
+            .Select(d => d.ImplementationType)
+            .ToList();
+
+        workers.Should().Contain(new[]
+        {
+            typeof(OutboxProcessorBackgroundService),
+            typeof(AppointmentReminderBackgroundService),
+            typeof(AppointmentNoShowBackgroundService)
+        });
     }
 
     private static void Validate(Dictionary<string, string?> values, string environmentName) =>

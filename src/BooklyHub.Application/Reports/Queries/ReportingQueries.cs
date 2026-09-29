@@ -21,6 +21,7 @@ public record DashboardReportDto(
     int UpcomingPendingCount,
     int UpcomingConfirmedCount,
     DateTime? NextAppointmentAtUtc,
+    int StaleExecutionCount,
     IReadOnlyList<ServicePerformanceDto> TopServices,
     IReadOnlyList<StaffPerformanceDto> TopStaff);
 
@@ -95,6 +96,15 @@ public class GetDashboardReportQueryHandler : IRequestHandler<GetDashboardReport
         DateTime? nextAppointmentAtUtc = upcomingByStatus.Count == 0
             ? null
             : upcomingByStatus.Min(x => x.EarliestStart);
+
+        // Opened and never closed: the customer appeared, so this is the clinic's own reporting gap and must
+        // not be counted as, or closed into, a no-show.
+        var staleExecutionCount = await _db.Appointments
+            .AsNoTracking()
+            .Where(a => a.TenantId == request.TenantId &&
+                        a.EndAtUtc <= request.NowUtc &&
+                        AppointmentStatusSet.AwaitingOutcome.Contains(a.Status))
+            .CountAsync(cancellationToken);
 
         // Top services aggregated in SQL by scalar ServiceId
         var topServicesRaw = await apptQuery
@@ -177,6 +187,7 @@ public class GetDashboardReportQueryHandler : IRequestHandler<GetDashboardReport
             upcomingPendingCount,
             upcomingConfirmedCount,
             nextAppointmentAtUtc,
+            staleExecutionCount,
             topServices,
             topStaff);
     }

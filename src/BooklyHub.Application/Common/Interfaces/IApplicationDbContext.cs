@@ -80,4 +80,10 @@ public interface IApplicationDbContext
     /// owns the outbox batch, because a skipped tick is harmless and a duplicated delivery is not.
     /// </summary>
     Task<bool> TryAcquireOutboxProcessorLockAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Try semantics per tenant for the overdue-closure sweep. Two instances closing the same booking would
+    /// write the same status twice as two different facts, so only one of them gets the tenant this tick.
+    /// </summary>
+    Task<bool> TryAcquireNoShowSweepLockAsync(Guid tenantId, CancellationToken cancellationToken = default);
 }

@@ -82,8 +82,13 @@ seeding and host work still operate across tenants.
 **System scope for background workers (`SystemTenantScope.CreateSystemScope`).**
 Workers resolve `IServiceScopeFactory.CreateScope()`, which carries an **unbound** `ITenantContext`:
 `TenantId == null` and `IsPlatformAdmin == false`, so the filter matches nothing and a sweep would silently
-process zero rows. Both `OutboxProcessorBackgroundService` and `AppointmentReminderBackgroundService`
-therefore open a system scope, which binds `SetTenant(Guid.Empty, isPlatformAdmin: true)` for that scope only.
+process zero rows. All three host workers — `OutboxProcessorBackgroundService`,
+`AppointmentReminderBackgroundService` and `AppointmentNoShowBackgroundService` — therefore open a system
+scope, which binds `SetTenant(Guid.Empty, isPlatformAdmin: true)` for that scope only.
+
+Because that scope is platform-admin, the cross-tenant write invariant above is not what limits it: the
+no-show sweep is the one worker that writes, and it scopes itself with an explicit
+`a.TenantId == tenantId` predicate per tenant, under a per-tenant `sp_getapplock`.
 
 - `IgnoreQueryFilters()` was rejected as the fix: it also drops the `!IsDeleted` soft-delete filter and has to be remembered per query.
 - Binding the scope to one tenant was rejected too: `OutboxMessage` carries no `TenantId`, and the reminder sweep is cross-tenant by design.

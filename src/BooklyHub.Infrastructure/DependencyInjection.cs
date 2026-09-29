@@ -112,6 +112,7 @@ public static class DependencyInjection
         // Background workers
         services.AddHostedService<BooklyHub.Infrastructure.Outbox.OutboxProcessorBackgroundService>();
         services.AddHostedService<BooklyHub.Infrastructure.BackgroundJobs.AppointmentReminderBackgroundService>();
+        services.AddHostedService<BooklyHub.Infrastructure.BackgroundJobs.AppointmentNoShowBackgroundService>();
 
         return services;
     }

@@ -176,6 +176,7 @@ Executes high-performance set-based SQL aggregations for executive reporting.
   "upcomingPendingCount": 2,
   "upcomingConfirmedCount": 6,
   "nextAppointmentAtUtc": "2026-09-23T11:30:00Z",
+  "staleExecutionCount": 1,
   "topServices": [
     {
       "serviceId": "50c2688b-1e7a-42fc-873b-5517173b060d",
@@ -196,11 +197,26 @@ Executes high-performance set-based SQL aggregations for executive reporting.
 ```
 
 **Counter semantics:**
-- Every field above except the four `upcoming*` fields is counted inside `[fromUtc, toUtc]`.
+- Every field above except `upcomingCount`, `upcomingPendingCount`, `upcomingConfirmedCount`,
+  `nextAppointmentAtUtc` and `staleExecutionCount` is counted inside `[fromUtc, toUtc]`.
 - `upcomingCount`, `upcomingPendingCount`, `upcomingConfirmedCount` and `nextAppointmentAtUtc` are
   anchored on the server clock, not on `toUtc`: they count appointments that start after now and whose
   visit has not been closed yet (`Completed`, `Cancelled` and `NoShow` are excluded; a legacy `Rescheduled`
   row still owes a visit). Asking about a period that closed in 2020 therefore still reports what is owed
   next, and `nextAppointmentAtUtc` is null when nothing is.
-- `confirmedCount` is a status count inside the period, so an appointment that has already started and was
-  never marked `Completed` or `NoShow` still appears there. Nothing closes those rows automatically today.
+- `staleExecutionCount` is likewise anchored on the server clock: appointments that have already ended and
+  are still `CheckedIn` or `InProgress`. The customer appeared, so these are the clinic's own recording gap
+  and are deliberately not reported as no-shows.
+- A `Confirmed` appointment whose visit window has passed is closed to `NoShow` by a background sweep every
+  15 minutes, once per tenant, under an exclusive per-tenant application lock. The rule is
+  `NoShowClosurePolicy`: more than 6 hours past `EndAtUtc` (grace measured from the end of the visit, so a
+  late arrival is still an arrival) and no more than 14 days past it, so a first run cannot restate a
+  period somebody already reported. The closure writes one `AppointmentStatusHistory` row attributed to
+  `system:no-show-sweep` and sends no notification.
+- A booking that still owes money is **not** closed. `PaymentLedger.ValidateCharge` refuses to charge a
+  `NoShow`, so closing an unpaid row would write the balance off silently; the sweep leaves it `Confirmed`
+  and counts it in its `SkippedWithBalance` result.
+  **Residual (RPT-01, open):** those rows keep holding `confirmedCount` and keep inflating `grossRevenue`,
+  because revenue is priced off `Completed` and `Confirmed`. Collecting or cancelling them is still a human
+  decision the API exposes no surface for; `staleExecutionCount` does not cover them either, since they are
+  not `CheckedIn`/`InProgress`.

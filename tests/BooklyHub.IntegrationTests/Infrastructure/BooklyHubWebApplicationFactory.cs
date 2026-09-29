@@ -82,11 +82,13 @@ public class BooklyHubWebApplicationFactory : WebApplicationFactory<Program>, IA
         builder.ConfigureServices(services =>
         {
             // The polling workers issue their own SQL against the same database, which makes the
-            // query-count assertions in the performance tests non-deterministic.
+            // query-count assertions in the performance tests non-deterministic — and the no-show sweep
+            // would close rows a test is still about to read. The sweep tests call it themselves.
             var backgroundWorkers = services
                 .Where(d => d.ServiceType == typeof(IHostedService)
                             && (d.ImplementationType == typeof(OutboxProcessorBackgroundService)
-                                || d.ImplementationType == typeof(AppointmentReminderBackgroundService)))
+                                || d.ImplementationType == typeof(AppointmentReminderBackgroundService)
+                                || d.ImplementationType == typeof(AppointmentNoShowBackgroundService)))
                 .ToList();
 
             foreach (var worker in backgroundWorkers)
