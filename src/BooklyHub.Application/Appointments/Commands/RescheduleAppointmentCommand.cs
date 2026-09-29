@@ -17,13 +17,14 @@ public record RescheduleAppointmentCommand(
 
 public class RescheduleAppointmentCommandValidator : AbstractValidator<RescheduleAppointmentCommand>
 {
-    public RescheduleAppointmentCommandValidator()
+    // The clock is read inside the rule, not captured at construction, so a singleton validator cannot freeze the floor.
+    public RescheduleAppointmentCommandValidator(IClock clock)
     {
         RuleFor(x => x.TenantId).NotEmpty();
         RuleFor(x => x.AppointmentId).NotEmpty();
         RuleFor(x => x.NewStartAtUtc)
             .NotEmpty()
-            .Must(d => d > DateTime.UtcNow)
+            .Must(d => d > clock.UtcNow)
             .WithMessage("Rescheduled time must be in the future.");
     }
 }

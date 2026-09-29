@@ -24,7 +24,8 @@ public record BookAppointmentCommand(
 
 public class BookAppointmentCommandValidator : AbstractValidator<BookAppointmentCommand>
 {
-    public BookAppointmentCommandValidator()
+    // The clock is read inside the rule, not captured at construction, so a singleton validator cannot freeze the floor.
+    public BookAppointmentCommandValidator(IClock clock)
     {
         RuleFor(x => x.TenantId).NotEmpty();
         RuleFor(x => x.LocationId).NotEmpty();
@@ -33,7 +34,7 @@ public class BookAppointmentCommandValidator : AbstractValidator<BookAppointment
         RuleFor(x => x.CustomerId).NotEmpty();
         RuleFor(x => x.StartAtUtc)
             .NotEmpty()
-            .Must(d => d > DateTime.UtcNow.AddMinutes(5))
+            .Must(d => d > clock.UtcNow.AddMinutes(5))
             .WithMessage("Appointment start time must be in the future.");
     }
 }
