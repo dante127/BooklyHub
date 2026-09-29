@@ -42,15 +42,18 @@ public class ProcessPaymentCommandHandler : IRequestHandler<ProcessPaymentComman
     private readonly IApplicationDbContext _db;
     private readonly IPaymentProvider _paymentProvider;
     private readonly ICurrentUser _currentUser;
+    private readonly IClock _clock;
 
     public ProcessPaymentCommandHandler(
         IApplicationDbContext db,
         IPaymentProvider paymentProvider,
-        ICurrentUser currentUser)
+        ICurrentUser currentUser,
+        IClock clock)
     {
         _db = db;
         _paymentProvider = paymentProvider;
         _currentUser = currentUser;
+        _clock = clock;
     }
 
     public async Task<PaymentDto> Handle(ProcessPaymentCommand request, CancellationToken cancellationToken)
@@ -152,7 +155,7 @@ public class ProcessPaymentCommandHandler : IRequestHandler<ProcessPaymentComman
                 if (appointment.Status == AppointmentStatus.Pending)
                 {
                     _db.AppointmentStatusHistories.Add(
-                        appointment.TransitionTo(AppointmentStatus.Confirmed, "Payment received", _currentUser.UserId?.ToString()));
+                        appointment.TransitionTo(AppointmentStatus.Confirmed, _clock.UtcNow, "Payment received", _currentUser.UserId?.ToString()));
                 }
 
                 await _db.AdjustTotalSpentAsync(request.TenantId, appointment.CustomerId, request.Amount, cancellationToken);

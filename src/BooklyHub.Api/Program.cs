@@ -97,6 +97,7 @@ if (args.Contains("--migrate-only") || builder.Configuration.GetValue<bool>("Aut
     using var scope = app.Services.CreateScope();
     var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
     var hasher = scope.ServiceProvider.GetRequiredService<IPasswordHasher>();
+    var clock = scope.ServiceProvider.GetRequiredService<BooklyHub.Application.Common.Interfaces.IClock>();
     var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
 
     if (db.Database.IsRelational())
@@ -108,7 +109,7 @@ if (args.Contains("--migrate-only") || builder.Configuration.GetValue<bool>("Aut
         await db.Database.EnsureCreatedAsync();
     }
 
-    await DatabaseSeeder.SeedAsync(db, hasher, builder.Configuration, logger);
+    await DatabaseSeeder.SeedAsync(db, hasher, clock, builder.Configuration, logger);
 
     if (args.Contains("--migrate-only"))
     {

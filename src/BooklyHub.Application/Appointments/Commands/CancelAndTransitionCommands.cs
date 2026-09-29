@@ -60,7 +60,7 @@ public class CancelAppointmentCommandHandler : IRequestHandler<CancelAppointment
             // TransitionTo returns the history row it appended; it must be registered as new, not discovered
             // through the navigation (see the domain method).
             _db.AppointmentStatusHistories.Add(
-                appointment.TransitionTo(AppointmentStatus.Cancelled, request.Reason, _currentUser.UserId?.ToString()));
+                appointment.TransitionTo(AppointmentStatus.Cancelled, _clock.UtcNow, request.Reason, _currentUser.UserId?.ToString()));
 
             // The booking was counted when it was created; cancelling gives the count back.
             await _db.AdjustTotalBookingsAsync(request.TenantId, appointment.CustomerId, -1, cancellationToken);
@@ -133,7 +133,7 @@ public class TransitionAppointmentStatusCommandHandler : IRequestHandler<Transit
             // TransitionTo returns the history row it appended; it must be registered as new, not discovered
             // through the navigation (see the domain method).
             _db.AppointmentStatusHistories.Add(
-                loaded.TransitionTo(request.NewStatus, request.Reason, _currentUser.UserId?.ToString()));
+                loaded.TransitionTo(request.NewStatus, _clock.UtcNow, request.Reason, _currentUser.UserId?.ToString()));
 
             if (request.NewStatus == AppointmentStatus.Cancelled)
             {

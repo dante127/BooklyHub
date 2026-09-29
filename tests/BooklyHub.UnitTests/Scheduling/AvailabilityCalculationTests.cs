@@ -124,7 +124,7 @@ public class AvailabilityCalculationTests
                 new DateTime(2026, 10, 5, 10, 30, 0, DateTimeKind.Utc),
                 30,
                 120.00m);
-            existingAppt.TransitionTo(AppointmentStatus.Confirmed);
+            existingAppt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
             db.Appointments.Add(existingAppt);
 

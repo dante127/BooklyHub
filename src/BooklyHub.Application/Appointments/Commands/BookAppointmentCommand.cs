@@ -231,7 +231,7 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
             if (tenant.Settings?.RequireUpfrontPayment != true)
             {
                 _db.AppointmentStatusHistories.Add(
-                    appointment.TransitionTo(AppointmentStatus.Confirmed, "Auto-confirmed on booking", _currentUser.UserId?.ToString()));
+                    appointment.TransitionTo(AppointmentStatus.Confirmed, _clock.UtcNow, "Auto-confirmed on booking", _currentUser.UserId?.ToString()));
             }
 
             foreach (var resourceId in allocatedResourceIds)

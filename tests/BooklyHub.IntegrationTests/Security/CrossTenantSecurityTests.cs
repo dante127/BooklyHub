@@ -63,7 +63,7 @@ public class CrossTenantSecurityTests : IClassFixture<BooklyHubWebApplicationFac
                 DateTime.UtcNow.AddDays(1).AddMinutes(30),
                 30,
                 50.00m);
-            apptB.TransitionTo(AppointmentStatus.Confirmed);
+            apptB.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
             db.Appointments.Add(apptB);
             tenantBApptId = apptB.Id;
@@ -90,7 +90,7 @@ public class CrossTenantSecurityTests : IClassFixture<BooklyHubWebApplicationFac
                 DateTime.UtcNow.AddDays(1).AddMinutes(30),
                 30,
                 50.00m);
-            apptA.TransitionTo(AppointmentStatus.Confirmed);
+            apptA.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
             db.Appointments.Add(apptA);
             tenantAApptId = apptA.Id;

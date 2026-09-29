@@ -98,7 +98,7 @@ public class NPlusOneQueryTests : IClassFixture<BooklyHubWebApplicationFactory>
                     start.AddMinutes(30),
                     30,
                     100.00m);
-                appt.TransitionTo(AppointmentStatus.Confirmed);
+                appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
                 db.Appointments.Add(appt);
             }

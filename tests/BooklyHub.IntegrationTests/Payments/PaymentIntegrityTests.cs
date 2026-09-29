@@ -115,7 +115,7 @@ public class PaymentIntegrityTests : IClassFixture<BooklyHubWebApplicationFactor
 
         if (status != AppointmentStatus.Pending)
         {
-            appointment.TransitionTo(status, "seeded for payment tests");
+            appointment.TransitionTo(status, DateTime.UtcNow, "seeded for payment tests");
         }
 
         using var scope = _factory.Services.CreateScope();

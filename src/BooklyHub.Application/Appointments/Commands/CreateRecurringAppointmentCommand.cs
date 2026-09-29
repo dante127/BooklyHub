@@ -242,7 +242,7 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
                 if (tenant.Settings?.RequireUpfrontPayment != true)
                 {
                     _db.AppointmentStatusHistories.Add(
-                        appt.TransitionTo(AppointmentStatus.Confirmed, "Confirmed recurring appointment", _currentUser.UserId?.ToString()));
+                        appt.TransitionTo(AppointmentStatus.Confirmed, _clock.UtcNow, "Confirmed recurring appointment", _currentUser.UserId?.ToString()));
                 }
 
                 foreach (var resourceId in slotCheck.ResourceIds)

@@ -46,19 +46,19 @@ public class AppointmentStateMachineTests
         var appt = CreateSampleAppointment();
 
         // Pending -> Confirmed
-        appt.TransitionTo(AppointmentStatus.Confirmed, "Payment authorized", "StaffUser");
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow, "Payment authorized", "StaffUser");
         appt.Status.Should().Be(AppointmentStatus.Confirmed);
 
         // Confirmed -> CheckedIn
-        appt.TransitionTo(AppointmentStatus.CheckedIn, "Customer arrived at desk", "Receptionist");
+        appt.TransitionTo(AppointmentStatus.CheckedIn, DateTime.UtcNow, "Customer arrived at desk", "Receptionist");
         appt.Status.Should().Be(AppointmentStatus.CheckedIn);
 
         // CheckedIn -> InProgress
-        appt.TransitionTo(AppointmentStatus.InProgress, "Treatment started", "StaffUser");
+        appt.TransitionTo(AppointmentStatus.InProgress, DateTime.UtcNow, "Treatment started", "StaffUser");
         appt.Status.Should().Be(AppointmentStatus.InProgress);
 
         // InProgress -> Completed
-        appt.TransitionTo(AppointmentStatus.Completed, "Treatment finished successfully", "StaffUser");
+        appt.TransitionTo(AppointmentStatus.Completed, DateTime.UtcNow, "Treatment finished successfully", "StaffUser");
         appt.Status.Should().Be(AppointmentStatus.Completed);
 
         // Total histories: Initial + 4 transitions = 5
@@ -70,12 +70,12 @@ public class AppointmentStateMachineTests
     public void InvalidTransition_FromCompletedToCancelled_ShouldThrowException()
     {
         var appt = CreateSampleAppointment();
-        appt.TransitionTo(AppointmentStatus.Confirmed);
-        appt.TransitionTo(AppointmentStatus.CheckedIn);
-        appt.TransitionTo(AppointmentStatus.InProgress);
-        appt.TransitionTo(AppointmentStatus.Completed);
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
+        appt.TransitionTo(AppointmentStatus.CheckedIn, DateTime.UtcNow);
+        appt.TransitionTo(AppointmentStatus.InProgress, DateTime.UtcNow);
+        appt.TransitionTo(AppointmentStatus.Completed, DateTime.UtcNow);
 
-        var act = () => appt.TransitionTo(AppointmentStatus.Cancelled, "Customer wants refund");
+        var act = () => appt.TransitionTo(AppointmentStatus.Cancelled, DateTime.UtcNow, "Customer wants refund");
 
         act.Should().Throw<InvalidStateTransitionException>()
             .WithMessage("*not permitted*");
@@ -85,9 +85,9 @@ public class AppointmentStateMachineTests
     public void InvalidTransition_FromCancelledToConfirmed_ShouldThrowException()
     {
         var appt = CreateSampleAppointment();
-        appt.TransitionTo(AppointmentStatus.Cancelled, "Customer cancelled");
+        appt.TransitionTo(AppointmentStatus.Cancelled, DateTime.UtcNow, "Customer cancelled");
 
-        var act = () => appt.TransitionTo(AppointmentStatus.Confirmed);
+        var act = () => appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
         act.Should().Throw<InvalidStateTransitionException>()
             .WithMessage("*not permitted*");
@@ -97,7 +97,7 @@ public class AppointmentStateMachineTests
     public void Reschedule_ValidNewTimes_ShouldUpdateAndRecordHistory()
     {
         var appt = CreateSampleAppointment();
-        appt.TransitionTo(AppointmentStatus.Confirmed);
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
         var newStart = DateTime.UtcNow.AddDays(2).Date.AddHours(14);
         var newEnd = newStart.AddMinutes(45);
@@ -116,7 +116,7 @@ public class AppointmentStateMachineTests
     public void Reschedule_InvalidTimeRange_ShouldThrowException()
     {
         var appt = CreateSampleAppointment();
-        appt.TransitionTo(AppointmentStatus.Confirmed);
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
         var newStart = DateTime.UtcNow.AddDays(2).Date.AddHours(14);
         var newEnd = newStart.AddHours(-1); // Earlier than start!
@@ -130,9 +130,9 @@ public class AppointmentStateMachineTests
     public void Transition_ConfirmedToCompleted_AfterStart_ShouldSucceed()
     {
         var appt = CreateSampleAppointment();
-        appt.TransitionTo(AppointmentStatus.Confirmed);
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
-        appt.TransitionTo(AppointmentStatus.Completed, "Walk-in handled without check-in ceremony");
+        appt.TransitionTo(AppointmentStatus.Completed, DateTime.UtcNow, "Walk-in handled without check-in ceremony");
 
         appt.Status.Should().Be(AppointmentStatus.Completed);
         appt.DomainEvents.Should().Contain(e => e is AppointmentCompletedEvent);
@@ -142,10 +142,10 @@ public class AppointmentStateMachineTests
     public void Transition_CheckedInToCompleted_AfterStart_ShouldSucceed()
     {
         var appt = CreateSampleAppointment();
-        appt.TransitionTo(AppointmentStatus.Confirmed);
-        appt.TransitionTo(AppointmentStatus.CheckedIn);
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
+        appt.TransitionTo(AppointmentStatus.CheckedIn, DateTime.UtcNow);
 
-        appt.TransitionTo(AppointmentStatus.Completed);
+        appt.TransitionTo(AppointmentStatus.Completed, DateTime.UtcNow);
 
         appt.Status.Should().Be(AppointmentStatus.Completed);
     }
@@ -157,9 +157,9 @@ public class AppointmentStateMachineTests
         // Rescheduled status: a row moved there by hand became non-cancellable and invisible to
         // availability while still being displayed as a live booking.
         var appt = CreateSampleAppointment();
-        appt.TransitionTo(AppointmentStatus.Confirmed);
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
-        var act = () => appt.TransitionTo(AppointmentStatus.Rescheduled);
+        var act = () => appt.TransitionTo(AppointmentStatus.Rescheduled, DateTime.UtcNow);
 
         act.Should().Throw<InvalidStateTransitionException>()
             .WithMessage("*not permitted*");
@@ -169,9 +169,9 @@ public class AppointmentStateMachineTests
     public void Transition_ToSameStatus_ShouldThrow()
     {
         var appt = CreateSampleAppointment();
-        appt.TransitionTo(AppointmentStatus.Confirmed);
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
-        var act = () => appt.TransitionTo(AppointmentStatus.Confirmed);
+        var act = () => appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
         act.Should().Throw<InvalidStateTransitionException>()
             .WithMessage("*not permitted*");
@@ -181,9 +181,9 @@ public class AppointmentStateMachineTests
     public void Transition_CheckInLongBeforeStart_ShouldThrow()
     {
         var appt = CreateFutureAppointment();
-        appt.TransitionTo(AppointmentStatus.Confirmed);
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
-        var act = () => appt.TransitionTo(AppointmentStatus.CheckedIn);
+        var act = () => appt.TransitionTo(AppointmentStatus.CheckedIn, DateTime.UtcNow);
 
         act.Should().Throw<BusinessRuleValidationException>()
             .Where(e => e.RuleName == "TransitionTooEarly");
@@ -193,9 +193,9 @@ public class AppointmentStateMachineTests
     public void Transition_CompleteBeforeStart_ShouldThrow()
     {
         var appt = CreateFutureAppointment();
-        appt.TransitionTo(AppointmentStatus.Confirmed);
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
-        var act = () => appt.TransitionTo(AppointmentStatus.Completed);
+        var act = () => appt.TransitionTo(AppointmentStatus.Completed, DateTime.UtcNow);
 
         act.Should().Throw<BusinessRuleValidationException>()
             .Where(e => e.RuleName == "TransitionTooEarly");
@@ -205,9 +205,9 @@ public class AppointmentStateMachineTests
     public void Transition_NoShowBeforeStart_ShouldThrow()
     {
         var appt = CreateFutureAppointment();
-        appt.TransitionTo(AppointmentStatus.Confirmed);
+        appt.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
 
-        var act = () => appt.TransitionTo(AppointmentStatus.NoShow);
+        var act = () => appt.TransitionTo(AppointmentStatus.NoShow, DateTime.UtcNow);
 
         act.Should().Throw<BusinessRuleValidationException>()
             .Where(e => e.RuleName == "TransitionTooEarly");

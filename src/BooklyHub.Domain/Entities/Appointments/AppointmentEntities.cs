@@ -150,7 +150,7 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
     /// StatusHistories navigation of a tracked appointment is treated as an existing row, and the update
     /// it generates matches nothing.
     /// </summary>
-    public AppointmentStatusHistory TransitionTo(AppointmentStatus newStatus, string? reason = null, string? changedBy = null)
+    public AppointmentStatusHistory TransitionTo(AppointmentStatus newStatus, DateTime nowUtc, string? reason = null, string? changedBy = null)
     {
         if (!CanTransitionTo(newStatus))
         {
@@ -163,13 +163,12 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
         // Execution statuses describe something happening at the appointment, so they may not be set
         // before the appointment could conceivably be happening; anything earlier is a data entry error
         // that would corrupt reporting and the reminder sweep.
-        var now = DateTime.UtcNow;
         var tooEarly = newStatus switch
         {
-            AppointmentStatus.CheckedIn => now < StartAtUtc - TimeSpan.FromHours(1),
-            AppointmentStatus.InProgress => now < StartAtUtc - TimeSpan.FromMinutes(15),
-            AppointmentStatus.Completed => now < StartAtUtc,
-            AppointmentStatus.NoShow => now < StartAtUtc,
+            AppointmentStatus.CheckedIn => nowUtc < StartAtUtc - TimeSpan.FromHours(1),
+            AppointmentStatus.InProgress => nowUtc < StartAtUtc - TimeSpan.FromMinutes(15),
+            AppointmentStatus.Completed => nowUtc < StartAtUtc,
+            AppointmentStatus.NoShow => nowUtc < StartAtUtc,
             _ => false
         };
 

@@ -1,3 +1,4 @@
+using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Application.Security;
 using BooklyHub.Domain.Entities.Appointments;
 using BooklyHub.Domain.Entities.Customers;
@@ -18,7 +19,7 @@ namespace BooklyHub.Infrastructure.Data.Seeding;
 
 public static class DatabaseSeeder
 {
-    public static async Task SeedAsync(ApplicationDbContext db, IPasswordHasher hasher, IConfiguration configuration, ILogger logger)
+    public static async Task SeedAsync(ApplicationDbContext db, IPasswordHasher hasher, IClock clock, IConfiguration configuration, ILogger logger)
     {
         if (await db.Tenants.IgnoreQueryFilters().AnyAsync())
         {
@@ -134,11 +135,13 @@ public static class DatabaseSeeder
         db.Customers.AddRange(cust1, cust2);
 
         // Past Completed Appointment with Review
-        var appt1 = Appointment.Create(tenant1.Id, loc1.Id, srv1.Id, dentist1.Id, cust1.Id, DateTime.UtcNow.AddDays(-2).Date.AddHours(14), DateTime.UtcNow.AddDays(-2).Date.AddHours(14).AddMinutes(45), 45, 120.00m);
-        appt1.TransitionTo(AppointmentStatus.Confirmed);
-        appt1.TransitionTo(AppointmentStatus.CheckedIn);
-        appt1.TransitionTo(AppointmentStatus.InProgress);
-        appt1.TransitionTo(AppointmentStatus.Completed);
+        var demoStartUtc = clock.UtcNow.AddDays(-2).Date.AddHours(14);
+        var appt1 = Appointment.Create(tenant1.Id, loc1.Id, srv1.Id, dentist1.Id, cust1.Id, demoStartUtc, demoStartUtc.AddMinutes(45), 45, 120.00m);
+        var seededNowUtc = clock.UtcNow;
+        appt1.TransitionTo(AppointmentStatus.Confirmed, seededNowUtc);
+        appt1.TransitionTo(AppointmentStatus.CheckedIn, seededNowUtc);
+        appt1.TransitionTo(AppointmentStatus.InProgress, seededNowUtc);
+        appt1.TransitionTo(AppointmentStatus.Completed, seededNowUtc);
         appt1.AppointmentResources.Add(new AppointmentResource { TenantId = tenant1.Id, AppointmentId = appt1.Id, ResourceId = chair1.Id });
         db.Appointments.Add(appt1);
 

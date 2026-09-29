@@ -150,7 +150,7 @@ public class AppointmentLifecycleTests : IClassFixture<BooklyHubWebApplicationFa
             30,
             100.00m,
             "USD");
-        appointment.TransitionTo(AppointmentStatus.Confirmed, "seeded for lifecycle tests");
+        appointment.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow, "seeded for lifecycle tests");
 
         if (withRoom)
         {

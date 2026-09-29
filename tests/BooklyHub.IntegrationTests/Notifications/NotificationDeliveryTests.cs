@@ -128,7 +128,7 @@ public sealed class NotificationDeliveryTests : IAsyncLifetime
 
         if (status != AppointmentStatus.Pending)
         {
-            appointment.TransitionTo(status);
+            appointment.TransitionTo(status, DateTime.UtcNow);
         }
 
         db.Appointments.Add(appointment);

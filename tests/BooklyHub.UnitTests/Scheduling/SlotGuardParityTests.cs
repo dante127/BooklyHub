@@ -162,7 +162,7 @@ public class SlotGuardParityTests
             start.AddMinutes(minutes),
             minutes,
             90.00m);
-        appointment.TransitionTo(AppointmentStatus.Confirmed);
+        appointment.TransitionTo(AppointmentStatus.Confirmed, DateTime.UtcNow);
         return appointment;
     }
 
@@ -546,7 +546,7 @@ public class SlotGuardParityTests
             30,
             90.00m);
 
-        appointment.TransitionTo(status);
+        appointment.TransitionTo(status, DateTime.UtcNow);
         appointment.AppointmentResources.Add(new AppointmentResource
         {
             TenantId = scenario.TenantId,
