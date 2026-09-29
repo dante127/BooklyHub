@@ -106,9 +106,10 @@ public class RefreshToken : Entity<Guid>
     public DateTime? RevokedAtUtc { get; set; }
     public string? ReplacedByToken { get; set; }
 
-    public bool IsExpired => DateTime.UtcNow >= ExpiresAtUtc;
+    // nowUtc arrives from the caller: Domain cannot reference IClock, and a rule reading DateTime.UtcNow has no boundary a test can reach.
+    public bool IsExpired(DateTime nowUtc) => nowUtc >= ExpiresAtUtc;
     public bool IsRevoked => RevokedAtUtc != null;
-    public bool IsActive => !IsRevoked && !IsExpired;
+    public bool IsActive(DateTime nowUtc) => !IsRevoked && !IsExpired(nowUtc);
 
     public RefreshToken()
     {

@@ -95,7 +95,7 @@ public class AuthController : ControllerBase
                         .ThenInclude(r => r.RolePermissions)
             .FirstOrDefaultAsync(rt => rt.Token == request.RefreshToken, cancellationToken);
 
-        if (tokenRecord == null || !tokenRecord.IsActive || tokenRecord.User == null)
+        if (tokenRecord == null || !tokenRecord.IsActive(_clock.UtcNow) || tokenRecord.User == null)
         {
             return Unauthorized(new { message = "Invalid or expired refresh token." });
         }
