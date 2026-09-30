@@ -83,6 +83,43 @@ Computes all available booking slots for a given service and date range.
 
 ## 4. Appointments
 
+### `GET /api/v1/appointments`
+The schedule reader: one paged list, filtered by location, staff, customer and status.
+
+**Query parameters:** `locationId`, `staffId`, `customerId`, `status`, `fromUtc`, `toUtc`, `page` (default 1),
+`pageSize` (default 20, clamped to 1..100). There is no `nowUtc` parameter, for the same reason the collection
+queue has none: the window is decided by the server clock, so a caller cannot pull a not-yet-due booking into
+the page by lying about the time.
+
+**The default window.** Called with neither `fromUtc` nor `toUtc`, the list is `StartAtUtc >= now` — the
+upcoming book, ordered nearest first. Before this, no bound meant every row the tenant had ever booked, and
+the descending sort put the furthest future appointment on page 1, which is the one page a desk opens by
+default and the least useful thing to find on it.
+
+Supplying *either* bound opts out of the default completely; nothing is injected at the other end. A caller
+who asks for `toUtc=2026-01-01` to browse history gets history — a default start of today bolted onto that
+request would return an empty page, and an empty page from a schedule endpoint reads as an empty diary rather
+than a bad query.
+
+**`totalCount` counts the window, not the book.** Because the window is part of the query, the count on the
+default page is the number of upcoming appointments, not the number of rows in the tenant. A caller that
+wants the whole book has to ask for it with both bounds open.
+
+**Ordering is `StartAtUtc`, then `Id`.** The tie-break is what makes paging correct rather than merely
+deterministic-looking: two bookings in the same minute have no order between them, and SQL Server is free to
+return them differently on each read. Without a tie-break that shows up as one booking appearing on two pages
+and another never appearing at all — which is invisible at page 1 and only visible once the book is bigger
+than one page. Note this is the second *ascending* reader (the collection queue is oldest-debt-first); the
+dashboard's counters are aggregates and do not order at all.
+
+**Not indexed for the default path (open, PERF-09 family).** The window filters `TenantId` + `StartAtUtc`
+and sorts by `StartAtUtc, Id`; no index on the table leads with that pair. The three existing composite
+indexes — `IX_Appointments_Tenant_Customer_StartAt`, `IX_Appointments_Tenant_Status_StartAt`,
+`IX_Appointments_Tenant_Staff_TimeRange` — all lead with a column the default request does not supply, so
+they serve the *filtered* variants and the default page reads via the `TenantId` seek and sorts. Recorded
+here rather than migrated: an index is a schema change with a write cost, and the read that needs it has no
+measured volume behind it yet.
+
 ### `POST /api/v1/appointments`
 Atomically books an appointment with transactional concurrency locks.
 

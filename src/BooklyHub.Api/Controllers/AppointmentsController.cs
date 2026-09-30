@@ -19,11 +19,13 @@ public class AppointmentsController : ControllerBase
 {
     private readonly ISender _sender;
     private readonly ITenantContext _tenantContext;
+    private readonly IClock _clock;
 
-    public AppointmentsController(ISender sender, ITenantContext tenantContext)
+    public AppointmentsController(ISender sender, ITenantContext tenantContext, IClock clock)
     {
         _sender = sender;
         _tenantContext = tenantContext;
+        _clock = clock;
     }
 
     public record BookAppointmentRequest(
@@ -94,6 +96,7 @@ public class AppointmentsController : ControllerBase
 
         var query = new SearchAppointmentsQuery(
             tenantId,
+            _clock.UtcNow,
             locationId,
             staffId,
             customerId,

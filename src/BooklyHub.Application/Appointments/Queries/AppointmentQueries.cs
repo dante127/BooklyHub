@@ -52,8 +52,13 @@ public class GetAppointmentByIdQueryHandler : IRequestHandler<GetAppointmentById
     }
 }
 
+/// <summary>
+/// The schedule reader: one appointment list, filtered and paged. NowUtc comes from the application clock
+/// because the default window is defined by it, exactly as the collection queue's deadline is.
+/// </summary>
 public record SearchAppointmentsQuery(
     Guid TenantId,
+    DateTime NowUtc,
     Guid? LocationId = null,
     Guid? StaffId = null,
     Guid? CustomerId = null,
@@ -101,9 +106,17 @@ public class SearchAppointmentsQueryHandler : IRequestHandler<SearchAppointments
             query = query.Where(a => a.Status == request.Status.Value);
         }
 
-        if (request.FromUtc.HasValue)
+        // A list asked for with no bound at all is not a list of everything ever booked. Ordered from the
+        // nearest outward it is the clinic's work queue, which is the question this endpoint is opened to
+        // answer and the same reading the dashboard's upcoming counters already give. Supplying either bound
+        // opts out of the default completely: a caller who asks for "up to last March" and is then silently
+        // started at today would get an empty page and read it as an empty book, which is a worse answer than
+        // the far-future-first page this replaces.
+        var fromUtc = request.FromUtc ?? (request.ToUtc is null ? request.NowUtc : null);
+
+        if (fromUtc.HasValue)
         {
-            query = query.Where(a => a.StartAtUtc >= request.FromUtc.Value);
+            query = query.Where(a => a.StartAtUtc >= fromUtc.Value);
         }
 
         if (request.ToUtc.HasValue)
@@ -113,8 +126,11 @@ public class SearchAppointmentsQueryHandler : IRequestHandler<SearchAppointments
 
         var totalCount = await query.CountAsync(cancellationToken);
 
+        // Nearest first, then by id, so two bookings sharing a start minute cannot appear on two pages while
+        // another is skipped — the same paging rule the collection queue runs on.
         var items = await query
-            .OrderByDescending(a => a.StartAtUtc)
+            .OrderBy(a => a.StartAtUtc)
+            .ThenBy(a => a.Id)
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
             .Select(a => new AppointmentDto(
