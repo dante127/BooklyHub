@@ -94,6 +94,18 @@ no-show sweep is the one worker that writes, and it scopes itself with an explic
 - Binding the scope to one tenant was rejected too: `OutboxMessage` carries no `TenantId`, and the reminder sweep is cross-tenant by design.
 - Request-path code must never call `CreateSystemScope()`; the middleware owns tenant binding for HTTP calls.
 
+**A cross-tenant read is not a cross-tenant policy.** The reminder sweep runs one pass over every tenant, so
+it left-joins each appointment to *its own* `TenantSettings` row and compares the start time against that
+tenant's `ReminderNoticeHours`. Hardcoding the window was the original shape, and it was wrong in both
+directions at once: a two-hour clinic was reminded a day early — and, because a reminder sends at most once
+per appointment, was therefore never reminded at the hour it asked for — while a forty-eight-hour clinic was
+never reached before its visit. The join is a left join with `TenantSetting.DefaultReminderNoticeHours` as the
+fallback, because a tenant with no settings row is still a tenant with appointments; an inner join there reads
+as a healthy sweep for every tenant that does have a row and silently un-reminds the ones that do not.
+
+Verified by `tests/BooklyHub.IntegrationTests/Notifications/ReminderNoticeHoursTests.cs`, which fails in both
+window directions and fails a join that drops the per-tenant key.
+
 Verified by `tests/BooklyHub.IntegrationTests/Notifications/NotificationDeliveryTests.cs`, which fails when
 either worker is switched back to a plain scope (zero rows read, and the outbox message is marked processed
 without any email being sent).

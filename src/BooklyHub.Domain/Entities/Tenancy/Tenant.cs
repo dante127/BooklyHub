@@ -39,6 +39,13 @@ public class Tenant : AggregateRoot<Guid>, IAuditableEntity, ISoftDeletable
 
 public class TenantSetting : Entity<Guid>, ITenantEntity
 {
+    /// <summary>
+    /// The notice a reminder asks for when the tenant never configured one. Named here rather than at each
+    /// reader because the reminder sweep has to answer this for a tenant with no settings row at all, in
+    /// SQL, where this class's own constructor default is not running.
+    /// </summary>
+    public const int DefaultReminderNoticeHours = 24;
+
     public Guid TenantId { get; set; }
     public Tenant? Tenant { get; set; }
 
@@ -48,7 +55,7 @@ public class TenantSetting : Entity<Guid>, ITenantEntity
     public int ReschedulingCutoffHours { get; set; } = 12; // 12 hours
     public int SlotIntervalMinutes { get; set; } = 15; // default grid step
     public bool ConfirmationEmailEnabled { get; set; } = true;
-    public int ReminderNoticeHours { get; set; } = 24;
+    public int ReminderNoticeHours { get; set; } = DefaultReminderNoticeHours;
     public bool RequireUpfrontPayment { get; set; } = false;
 
     public TenantSetting()

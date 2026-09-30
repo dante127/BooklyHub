@@ -1,5 +1,6 @@
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Domain.Entities.System;
+using BooklyHub.Domain.Entities.Tenancy;
 using BooklyHub.Domain.Enums;
 using BooklyHub.Infrastructure.MultiTenancy;
 using Microsoft.EntityFrameworkCore;
@@ -52,26 +53,44 @@ public class AppointmentReminderBackgroundService : BackgroundService
         var clock = scope.ServiceProvider.GetRequiredService<IClock>();
 
         var now = clock.UtcNow;
-        var reminderWindowEnd = now.AddHours(24);
 
-        // Fetch upcoming confirmed appointments in next 24h
-        var upcomingAppointments = await db.Appointments
-            .AsNoTracking()
-            .Include(a => a.Customer)
-            .Include(a => a.Service)
-            .Where(a => a.Status == AppointmentStatus.Confirmed &&
-                        a.StartAtUtc >= now &&
-                        a.StartAtUtc <= reminderWindowEnd)
+        // How much notice a reminder is worth is a tenant's decision, recorded on its own settings row, and
+        // this sweep serves every tenant in one pass - so the window has to come from the row, not from the
+        // worker. A single hardcoded window is wrong in both directions at once, and wrong permanently:
+        // because a reminder sends at most once per appointment, a clinic configured for two hours is reminded
+        // a full day early and never reminded at the hour it asked for, while a clinic configured for
+        // forty-eight is never reached before its visit begins.
+        //
+        // The join is a left join and the fallback is TenantSetting's own default, because a tenant with no
+        // settings row is still a tenant with appointments. TenantSettings.TenantId is unique, so this join
+        // cannot duplicate a candidate.
+        var candidates = await (
+            from a in db.Appointments.AsNoTracking()
+            from s in db.TenantSettings.AsNoTracking()
+                .Where(s => s.TenantId == a.TenantId)
+                .DefaultIfEmpty()
+            where a.Status == AppointmentStatus.Confirmed &&
+                  a.Customer != null &&
+                  a.StartAtUtc >= now &&
+                  a.StartAtUtc <= now.AddHours(s == null
+                      ? TenantSetting.DefaultReminderNoticeHours
+                      : s.ReminderNoticeHours)
+            orderby a.StartAtUtc
+            select new ReminderCandidate(
+                a.Id,
+                a.TenantId,
+                a.StartAtUtc,
+                a.Customer!.Email,
+                a.Customer.FirstName,
+                a.Service != null ? a.Service.Name : null))
             .ToListAsync(cancellationToken);
 
-        if (upcomingAppointments.Count == 0) return 0;
+        if (candidates.Count == 0) return 0;
 
         var remindersSent = 0;
 
-        foreach (var appt in upcomingAppointments)
+        foreach (var appt in candidates)
         {
-            if (appt.Customer == null) continue;
-
             // Idempotency check: has reminder already been sent for this appointment?
             var alreadySent = await db.NotificationRecords
                 .AsNoTracking()
@@ -84,17 +103,17 @@ public class AppointmentReminderBackgroundService : BackgroundService
 
             try
             {
-                var subject = $"Appointment Reminder - {appt.Service?.Name ?? "Service"}";
-                var body = $"<p>Dear {appt.Customer.FirstName},</p><p>This is a reminder for your upcoming appointment on {appt.StartAtUtc:f} UTC.</p>";
+                var subject = $"Appointment Reminder - {appt.ServiceName ?? "Service"}";
+                var body = $"<p>Dear {appt.CustomerFirstName},</p><p>This is a reminder for your upcoming appointment on {appt.StartAtUtc:f} UTC.</p>";
 
-                await emailSender.SendEmailAsync(appt.Customer.Email, subject, body, cancellationToken);
+                await emailSender.SendEmailAsync(appt.CustomerEmail, subject, body, cancellationToken);
 
                 db.NotificationRecords.Add(new NotificationRecord
                 {
                     Id = Guid.NewGuid(),
                     TenantId = appt.TenantId,
                     AppointmentId = appt.Id,
-                    Recipient = appt.Customer.Email,
+                    Recipient = appt.CustomerEmail,
                     Channel = "Email",
                     Subject = subject,
                     Body = body,
@@ -115,4 +134,17 @@ public class AppointmentReminderBackgroundService : BackgroundService
 
         return remindersSent;
     }
+
+    /// <summary>
+    /// One appointment the sweep may remind about, with the few customer fields the message needs. Projected
+    /// rather than loaded because the sweep now reaches across to the tenant's settings row, and an
+    /// <c>Include</c> cannot ride on that join - which is the same reason it reads no navigation properties.
+    /// </summary>
+    private sealed record ReminderCandidate(
+        Guid Id,
+        Guid TenantId,
+        DateTime StartAtUtc,
+        string CustomerEmail,
+        string CustomerFirstName,
+        string? ServiceName);
 }
