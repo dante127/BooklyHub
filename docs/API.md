@@ -43,6 +43,12 @@ Two writers produce these documents and they are deliberately not merged:
 For a client that means: parse `status`, `title`, `instance` and `correlationId` unconditionally, and treat
 `detail`, `errors`, `rule`, `type` and `traceId` as present only where the table says so.
 
+A `429` additionally carries `Retry-After` in seconds. Nothing is queued any more — an over-budget request is
+refused the moment it arrives — so the deadline is the only thing that tells a well-behaved caller when to come
+back instead of retrying immediately into the same wall. `/health*` lives in a partition of its own and is never
+refused for somebody else's traffic; the partitions and what they deliberately do not protect are in
+`SECURITY.md` §3.1.
+
 A request the client abandons mid-flight is the one failure with no body: it is answered `499` and logged
 at Warning, because a closed tab is not a server fault and must not be counted in the `5xx` rate. A
 cancellation nobody at the client asked for (an internal deadline, a provider that hung) is still a `500`

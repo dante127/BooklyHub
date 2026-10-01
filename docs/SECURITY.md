@@ -67,9 +67,22 @@ The `PermissionAuthorizationHandler` checks the user's combined permissions load
 ## 3. Rate Limiting & Defense-in-Depth
 
 ### 3.1 Rate Limiting Middleware
-Configured in `Program.cs` via ASP.NET Core's built-in `RateLimiter`:
-- **General Endpoints**: Sliding window limiter (100 requests per minute per IP).
-- **Authentication Endpoints**: Strict fixed window limiter (10 login attempts per minute per IP) to prevent brute-force credential stuffing.
+Configured in `Program.cs` through ASP.NET Core's built-in `RateLimiter`. Three fixed-window partitions, every one with `QueueLimit = 0` so an over-budget request is refused at once rather than held in a queue until the window turns:
+
+- **General traffic**: 100 requests per minute per peer address.
+- **Authentication endpoints** (`POST /api/v1/auth/login`, `POST /api/v1/auth/refresh-token`): 10 requests per minute per peer address, applied with `[EnableRateLimiting("auth")]` on top of the general budget.
+- **Health probes** (`/health`, `/health/live`, `/health/ready`): 120 per minute instance-wide, in a partition of their own.
+
+Every refusal answers with the standard problem envelope and a `Retry-After` header.
+
+This section used to describe a limiter that did not exist. It claimed a *sliding* window for general traffic (the code has always been fixed-window) and a "strict fixed window limiter (10 login attempts per minute per IP)" for authentication (no such policy was ever registered — `grep` for `AddPolicy`/`EnableRateLimiting` returned nothing). Measured against the real pipeline before the fix: fifteen consecutive wrong-password logins were answered `401, 401, 401…`, ninety-five requests on any path left exactly five permits for the login box, and a sequential caller over budget was never refused at all — it sat in the 10-deep queue and was re-permitted seconds later, which also parked authenticated desk requests past five seconds with no status and answered `GET /health` with a `429`.
+
+What these tiers deliberately do **not** protect against, stated so nobody reads them as more than they are:
+
+- **The key is the address, not the account.** A limiter counts requests and cannot know whether one failed, so ten per minute is ten *attempts*, legitimate ones included. A clinic whose twenty staff sign in from one office address inside a minute will see the eleventh refused. The real defence against a targeted account is failure counting with backoff, which needs columns on `Users` and is tracked as `SEC-04`'s remaining half.
+- **Behind a reverse proxy, the address is the proxy's.** Nothing in `src` calls `UseForwardedHeaders`, so partitioning on `Connection.RemoteIpAddress` collapses every user into a single bucket the moment a proxy sits in front. `docker-compose.yml` publishes `127.0.0.1:5000:8080`, so any remote client already reaches the instance through something; an operator choosing that shape must configure forwarded headers *and* trust the proxy that sets them.
+- **Nothing records or locks out a failing account**, and the login response still distinguishes an unknown address from a deactivated one, which is an existence oracle. Both are `SEC-04`'s remaining halves, not this section's claim.
+
 
 ### 3.2 Automated Request Validation
 All CQRS commands pass through MediatR's `ValidationBehavior<TRequest, TResponse>` backed by **FluentValidation**:

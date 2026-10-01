@@ -69,20 +69,66 @@ builder.Services.AddProblemDetails(options =>
 });
 
 // Rate Limiting
+const string AuthRateLimitPolicy = "auth";
+const int AuthPermitsPerMinute = 10;
+
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    // A request over the budget used to sit in a 10-deep queue until the window turned: four authenticated
+    // GETs parked past five seconds without ever getting a status, and /health answered 429 because it was
+    // behind the same queue. Refusing immediately says the same thing sooner and holds nothing open.
     options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
     {
+        // A liveness probe is not traffic, and it must not be measured in the same bucket as traffic: /health
+        // answered 429 on a window an anonymous caller had just burned. It is not left unlimited either,
+        // because the readiness check runs a database query, so an unthrottled probe is a cheap way to flood SQL.
+        if (httpContext.Request.Path.StartsWithSegments("/health"))
+        {
+            return RateLimitPartition.GetFixedWindowLimiter("health", _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 120,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            });
+        }
+
         var clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "anonymous";
         return RateLimitPartition.GetFixedWindowLimiter(clientIp, _ => new FixedWindowRateLimiterOptions
         {
             PermitLimit = 100,
             Window = TimeSpan.FromMinutes(1),
-            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-            QueueLimit = 10
+            QueueLimit = 0
         });
     });
+
+    // docs/SECURITY.md 3.1 promised this tier and no code implemented it, so login spent the general 100/min
+    // bucket like any other request (measured: 95 unmatched-route GETs left exactly five permits for the next
+    // twenty login attempts). The partition is the address, not the account, because a limiter counts requests
+    // and cannot know whether one failed: per-account backoff is SEC-04's failure counting, not this.
+    options.AddPolicy(AuthRateLimitPolicy, httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            $"{AuthRateLimitPolicy}:{httpContext.Connection.RemoteIpAddress?.ToString() ?? "anonymous"}",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = AuthPermitsPerMinute,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
+
+    // Without this the client is told "too many" and nothing about when to come back: no rejection in the
+    // measurement carried Retry-After, so a well-behaved caller has no way to back off instead of retrying now.
+    options.OnRejected = (context, cancellationToken) =>
+    {
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+        {
+            context.HttpContext.Response.Headers.RetryAfter =
+                ((int)Math.Ceiling(retryAfter.TotalSeconds)).ToString();
+        }
+
+        return ValueTask.CompletedTask;
+    };
 });
 
 // Health Checks
