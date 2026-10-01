@@ -36,6 +36,38 @@ builder.Services.AddControllers()
 
 builder.Services.AddHttpContextAccessor();
 
+// An error that never reaches an action — a 401 from the JWT challenge, a 403 from the permission
+// handler, a 404 for a path nothing maps — used to be answered as a bare status code with no content
+// type and no body, while every error thrown inside an action carried a problem document. Two shapes
+// for one job. Registering the problem-details writer lets the status-code middleware emit the same
+// envelope; instance and correlation id are filled in here because the writer leaves both out, and the
+// title because the framework's status table has no entry for a rate-limited 429.
+builder.Services.AddProblemDetails(options =>
+{
+    options.CustomizeProblemDetails = context =>
+    {
+        var problem = context.ProblemDetails;
+        if (problem is null)
+        {
+            return;
+        }
+
+        if (problem.Title is null && problem.Status is { } status)
+        {
+            problem.Title = Microsoft.AspNetCore.WebUtilities.ReasonPhrases.GetReasonPhrase(status);
+        }
+
+        problem.Instance ??= context.HttpContext.Request.Path.HasValue ? context.HttpContext.Request.Path.Value : null;
+
+        // A 403 the user reports is otherwise unfindable in the logs: the correlation id is the one
+        // handle support has, and the exception path already carries it.
+        if (context.HttpContext.Response.Headers.TryGetValue(CorrelationIdMiddleware.CorrelationIdHeader, out var correlationId))
+        {
+            problem.Extensions["correlationId"] = correlationId.ToString();
+        }
+    };
+});
+
 // Rate Limiting
 builder.Services.AddRateLimiter(options =>
 {
@@ -120,6 +152,10 @@ if (args.Contains("--migrate-only") || builder.Configuration.GetValue<bool>("Aut
 // Middleware Pipeline
 app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseMiddleware<ExceptionHandlingMiddleware>();
+
+// Inside the exception handler (so a thrown exception stays its business) and outside authentication,
+// authorization and endpoint dispatch (so a status code set without running an action still gets a body).
+app.UseStatusCodePages();
 
 if (app.Environment.IsDevelopment())
 {

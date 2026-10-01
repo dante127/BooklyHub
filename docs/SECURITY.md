@@ -75,3 +75,8 @@ Configured in `Program.cs` via ASP.NET Core's built-in `RateLimiter`:
 All CQRS commands pass through MediatR's `ValidationBehavior<TRequest, TResponse>` backed by **FluentValidation**:
 - Requests containing malformed inputs, past dates, or invalid email formats fail *before* database transactions or domain logic can execute.
 - Prevents SQL injection and invalid state transitions at the gateway boundary.
+
+### 3.3 Every Denial Answers in the Same Shape
+A `401` from the JWT challenge, a `403` from the permission handler, a `404` for a path with no endpoint and a `429` from the limiter used to travel as a bare status code — no content type, no body — while anything thrown inside an action carried a problem document. The gap is not cosmetic: a client cannot show or log what it was refused for, and a refused request whose body is empty cannot be tied to a log line at all.
+
+Both paths now write `application/problem+json` carrying `status`, `title`, `instance` and `correlationId` (the full field table is in `API.md` §1.1). Note what this did **not** involve: `ExceptionHandlingMiddleware` was measured to be the *outermost* boundary over authentication, tenant resolution, authorization and idempotency, so those requests were never outside its reach and moving the boundary would have changed nothing. The missing piece was a writer for the statuses that no action produces.

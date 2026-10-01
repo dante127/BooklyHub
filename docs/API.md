@@ -11,6 +11,44 @@
   - `X-Correlation-ID`: `<string>` (Optional client tracing identifier)
   - `Idempotency-Key`: `<guid_or_string>` (Recommended for all state-changing `POST`/`PUT` operations)
 
+### 1.1 The Error Envelope
+
+Every failure the API answers is an `application/problem+json` document — including the failures raised
+before any action runs. Which members are present depends on who produced the response, so the table is
+the contract:
+
+| Member | Present on | Meaning |
+| :--- | :--- | :--- |
+| `status` | every failure | the HTTP status, repeated inside the body |
+| `title` | every failure | a short name for the failure; for a bare pipeline status it is the HTTP reason phrase |
+| `instance` | every failure | the request path that produced it |
+| `correlationId` | every failure | matches the `X-Correlation-Id` response header — the handle support searches logs by |
+| `detail` | action-path failures | the explanation, e.g. which appointment was not found |
+| `errors` | `400` validation failures | property name → messages |
+| `rule` | `422` business-rule failures | the machine-readable rule name, so a client never string-matches prose |
+| `type` | `401`/`403`/`404` from the pipeline | the RFC 9110 section for that status; absent on `429` and on the action path |
+| `traceId` | pipeline failures | the W3C trace context id; the action path carries `correlationId` instead |
+
+Two writers produce these documents and they are deliberately not merged:
+
+- **An action ran and failed.** `ExceptionHandlingMiddleware` maps the exception type to a status
+  (`ValidationException` → 400, `NotFoundException` → 404, `BookingConflictException` → 409,
+  `InvalidStateTransitionException` / `BusinessRuleValidationException` → 422,
+  `CrossTenantAccessViolationException` → 403, `UnauthorizedAccessException` → 401, anything else → 500).
+- **No action ran.** Authentication's `401` challenge, the permission handler's `403`, a `404` for a path
+  with no endpoint, a `429` from the rate limiter. `UseStatusCodePages` writes these through the same
+  problem-details service, and it sits *inside* the exception handler, so a thrown exception is still
+  answered by the mapping above rather than by a status page.
+
+For a client that means: parse `status`, `title`, `instance` and `correlationId` unconditionally, and treat
+`detail`, `errors`, `rule`, `type` and `traceId` as present only where the table says so.
+
+A request the client abandons mid-flight is the one failure with no body: it is answered `499` and logged
+at Warning, because a closed tab is not a server fault and must not be counted in the `5xx` rate. A
+cancellation nobody at the client asked for (an internal deadline, a provider that hung) is still a `500`
+and still logged at Error.
+
+
 ---
 
 ## 2. Authentication & Identity

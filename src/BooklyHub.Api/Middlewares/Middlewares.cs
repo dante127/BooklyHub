@@ -9,7 +9,7 @@ namespace BooklyHub.Api.Middlewares;
 
 public class CorrelationIdMiddleware
 {
-    private const string CorrelationIdHeader = "X-Correlation-Id";
+    public const string CorrelationIdHeader = "X-Correlation-Id";
     private readonly RequestDelegate _next;
 
     public CorrelationIdMiddleware(RequestDelegate next)
@@ -48,6 +48,19 @@ public class ExceptionHandlingMiddleware
         {
             await _next(context);
         }
+        catch (OperationCanceledException ex) when (context.RequestAborted.IsCancellationRequested)
+        {
+            // The caller hung up, which is not a server fault: the old path answered it 500 and wrote
+            // an ERROR with a stack trace, so a closed tab looked exactly like a broken endpoint. There
+            // is usually nobody left to read a response, but the status still has to be recorded because
+            // the access log line is written from it, and 499 keeps aborted traffic out of the 5xx rate.
+            _logger.LogWarning(ex, "Request aborted by the client: {Message}", ex.Message);
+
+            if (!context.Response.HasStarted)
+            {
+                context.Response.StatusCode = StatusCodes.Status499ClientClosedRequest;
+            }
+        }
         catch (Exception ex)
         {
             await HandleExceptionAsync(context, ex);
@@ -57,6 +70,14 @@ public class ExceptionHandlingMiddleware
     private async Task HandleExceptionAsync(HttpContext context, Exception exception)
     {
         _logger.LogError(exception, "Unhandled exception occurred: {Message}", exception.Message);
+
+        // Headers and the first bytes are already committed, so the status, the content type and a
+        // problem document cannot be added to what the client is already parsing. Stop here and leave
+        // the truncated response rather than corrupting it with a second one.
+        if (context.Response.HasStarted)
+        {
+            return;
+        }
 
         var (statusCode, title, detail, errors) = exception switch
         {
@@ -123,7 +144,7 @@ public class ExceptionHandlingMiddleware
             Instance = context.Request.Path
         };
 
-        if (context.Response.Headers.TryGetValue("X-Correlation-Id", out var corrId))
+        if (context.Response.Headers.TryGetValue(CorrelationIdMiddleware.CorrelationIdHeader, out var corrId))
         {
             problemDetails.Extensions["correlationId"] = corrId.ToString();
         }
