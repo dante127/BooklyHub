@@ -14,7 +14,12 @@
 ### 1.1 The Error Envelope
 
 Every failure the API answers is an `application/problem+json` document — including the failures raised
-before any action runs. Which members are present depends on who produced the response, so the table is
+before any action runs — with one named exception: seven `BadRequest(new { message = … })` guards that
+check for a missing tenant context (`AvailabilityController`, `ReviewsController`, `ReportsController` and
+four in `CatalogControllers`) still answer `application/json` with a single lowercase field. They are the
+open residue of `ENV-01`; until this paragraph was written the sentence above claimed them away.
+
+Which members are present depends on who produced the response, so the table is
 the contract:
 
 | Member | Present on | Meaning |
@@ -26,10 +31,10 @@ the contract:
 | `detail` | action-path failures | the explanation, e.g. which appointment was not found |
 | `errors` | `400` validation failures | property name → messages |
 | `rule` | `422` business-rule failures | the machine-readable rule name, so a client never string-matches prose |
-| `type` | `401`/`403`/`404` from the pipeline | the RFC 9110 section for that status; absent on `429` and on the action path |
-| `traceId` | pipeline failures | the W3C trace context id; the action path carries `correlationId` instead |
+| `type` | `401`/`403`/`404` from the pipeline, and the `401`s from `/auth/login` and `/auth/refresh-token` | the RFC 9110 section for that status; absent on `429` and on the thrown action path |
+| `traceId` | pipeline failures and the auth refusals | the W3C trace context id; a thrown action failure carries `correlationId` instead |
 
-Two writers produce these documents and they are deliberately not merged:
+Three writers produce these documents and they are deliberately not merged:
 
 - **An action ran and failed.** `ExceptionHandlingMiddleware` maps the exception type to a status
   (`ValidationException` → 400, `NotFoundException` → 404, `BookingConflictException` → 409,
@@ -39,6 +44,14 @@ Two writers produce these documents and they are deliberately not merged:
   with no endpoint, a `429` from the rate limiter. `UseStatusCodePages` writes these through the same
   problem-details service, and it sits *inside* the exception handler, so a thrown exception is still
   answered by the mapping above rather than by a status page.
+- **An action refused without throwing.** `POST /api/v1/auth/login` and `POST /api/v1/auth/refresh-token`
+  answer their `401` with `ControllerBase.Problem`, so they get the service's `type` and `traceId` along with
+  the `detail` only they can supply. Until this was fixed they returned `Unauthorized(new { message })`, an
+  `ObjectResult` that no problem writer ever saw: `application/json`, one lowercase field, no correlation id
+  in the body (`ENV-01`). Login additionally answers all three refusal reasons — no such user, wrong
+  password, inactive account — with the one `detail` "Invalid email or password.", because distinguishing
+  them tells a caller which addresses exist (`SEC-04`). A deactivated account therefore gets no explanation;
+  an administrator reads `IsActive` from the user list instead.
 
 For a client that means: parse `status`, `title`, `instance` and `correlationId` unconditionally, and treat
 `detail`, `errors`, `rule`, `type` and `traceId` as present only where the table says so.

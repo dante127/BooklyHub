@@ -12,6 +12,12 @@ namespace BooklyHub.Api.Controllers;
 [Route("api/v1/auth")]
 public class AuthController : ControllerBase
 {
+    /// <summary>
+    /// The only text a failed sign-in produces. Naming it once is what keeps the three refusal reasons from
+    /// drifting back into three different bodies.
+    /// </summary>
+    private const string InvalidCredentials = "Invalid email or password.";
+
     private readonly IApplicationDbContext _db;
     private readonly IPasswordHasher _passwordHasher;
     private readonly IJwtTokenGenerator _tokenGenerator;
@@ -37,6 +43,19 @@ public class AuthController : ControllerBase
     public record UserDto(Guid Id, string Email, string FirstName, string LastName, Guid? TenantId, IReadOnlyList<string> Roles, IReadOnlyList<string> Permissions);
     public record RefreshTokenRequest(string RefreshToken);
 
+    /// <summary>
+    /// ENV-01: <c>Unauthorized(new { message })</c> is an <c>ObjectResult</c>, so a refused sign-in answered
+    /// <c>application/json</c> with one lowercase field while the JWT challenge on the same status code answered
+    /// <c>application/problem+json</c> with <c>status</c>, <c>title</c>, <c>instance</c> and <c>correlationId</c>.
+    /// A client that has to read one shape per status code reads two here, and the field the support desk asks
+    /// for — the correlation id — was in the body of neither.
+    /// </summary>
+    private ObjectResult Refusal(string detail) => Problem(
+        detail: detail,
+        title: "Unauthorized",
+        statusCode: StatusCodes.Status401Unauthorized,
+        instance: HttpContext.Request.Path.Value);
+
     [HttpPost("login")]
     [AllowAnonymous]
     [EnableRateLimiting("auth")]
@@ -49,14 +68,14 @@ public class AuthController : ControllerBase
                     .ThenInclude(r => r.RolePermissions)
             .FirstOrDefaultAsync(u => u.Email == request.Email && !u.IsDeleted, cancellationToken);
 
-        if (user == null || !_passwordHasher.VerifyPassword(request.Password, user.PasswordHash))
+        // One answer for three reasons — no such user, wrong password, inactive account. The password is hashed
+        // before the activity check on every path that reaches it, so collapsing the branches does not hand the
+        // caller a cheaper question than the body already does.
+        if (user == null
+            || !_passwordHasher.VerifyPassword(request.Password, user.PasswordHash)
+            || !user.IsActive)
         {
-            return Unauthorized(new { message = "Invalid email or password." });
-        }
-
-        if (!user.IsActive)
-        {
-            return Unauthorized(new { message = "User account has been deactivated." });
+            return Refusal(InvalidCredentials);
         }
 
         var roles = user.UserRoles.Select(ur => ur.Role!.Name).Distinct().ToList();
@@ -98,9 +117,10 @@ public class AuthController : ControllerBase
                         .ThenInclude(r => r.RolePermissions)
             .FirstOrDefaultAsync(rt => rt.Token == request.RefreshToken, cancellationToken);
 
+        // Already one answer for three reasons (never issued, expired, revoked); only the shape was wrong.
         if (tokenRecord == null || !tokenRecord.IsActive(_clock.UtcNow) || tokenRecord.User == null)
         {
-            return Unauthorized(new { message = "Invalid or expired refresh token." });
+            return Refusal("Invalid or expired refresh token.");
         }
 
         // Revoke current token and issue new pair (rotation)
