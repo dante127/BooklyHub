@@ -169,7 +169,13 @@ public sealed class ReminderNoticeHoursTests : IAsyncLifetime
     {
         using var scope = _factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-        return await db.NotificationRecords.AsNoTracking()
+
+        // IgnoreQueryFilters because this scope has no tenant bound, and the global filter on an
+        // ITenantEntity reads "platform admin, or TenantId matches" — so without it the table looks empty
+        // whether or not the sweep wrote anything. A BeEmpty() against an unfiltered-but-invisible table
+        // asserts nothing, which is exactly the kind of passing test that hides a bug.
+        return await db.NotificationRecords
+            .IgnoreQueryFilters()
             .Select(n => n.Subject)
             .ToListAsync();
     }

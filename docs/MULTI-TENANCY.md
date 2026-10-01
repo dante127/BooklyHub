@@ -87,24 +87,51 @@ process zero rows. All three host workers — `OutboxProcessorBackgroundService`
 scope, which binds `SetTenant(Guid.Empty, isPlatformAdmin: true)` for that scope only.
 
 Because that scope is platform-admin, the cross-tenant write invariant above is not what limits it: the
-no-show sweep is the one worker that writes, and it scopes itself with an explicit
-`a.TenantId == tenantId` predicate per tenant, under a per-tenant `sp_getapplock`.
+no-show sweep is the worker that writes *appointment* rows, and it scopes itself with an explicit
+`a.TenantId == tenantId` predicate per tenant, under a per-tenant `sp_getapplock`. The reminder sweep writes
+notification rows only, one per booking, and scopes them the same way — by predicate, not by lock.
 
 - `IgnoreQueryFilters()` was rejected as the fix: it also drops the `!IsDeleted` soft-delete filter and has to be remembered per query.
 - Binding the scope to one tenant was rejected too: `OutboxMessage` carries no `TenantId`, and the reminder sweep is cross-tenant by design.
 - Request-path code must never call `CreateSystemScope()`; the middleware owns tenant binding for HTTP calls.
 
-**A cross-tenant read is not a cross-tenant policy.** The reminder sweep runs one pass over every tenant, so
-it left-joins each appointment to *its own* `TenantSettings` row and compares the start time against that
-tenant's `ReminderNoticeHours`. Hardcoding the window was the original shape, and it was wrong in both
-directions at once: a two-hour clinic was reminded a day early — and, because a reminder sends at most once
-per appointment, was therefore never reminded at the hour it asked for — while a forty-eight-hour clinic was
-never reached before its visit. The join is a left join with `TenantSetting.DefaultReminderNoticeHours` as the
-fallback, because a tenant with no settings row is still a tenant with appointments; an inner join there reads
-as a healthy sweep for every tenant that does have a row and silently un-reminds the ones that do not.
+**A cross-tenant read is not a cross-tenant policy.** The reminder sweep serves every tenant in one tick, but
+it does not do it with one query. It reads the active tenant list once, resolves each tenant's own
+`ReminderNoticeHours` (left join, `TenantSetting.DefaultReminderNoticeHours` as the fallback, because a tenant
+with no settings row is still a tenant with appointments — an inner join reads as a healthy sweep for every
+tenant that has a row and silently un-reminds the ones that do not), then runs **one bounded pass per tenant**,
+each judged against that tenant's own window. Hardcoding one window for the platform was the original shape and
+was wrong in both directions at once: a two-hour clinic was reminded a day early — and, because a reminder sends
+at most once per appointment, was therefore never reminded at the hour it asked for — while a forty-eight-hour
+clinic was never reached before its visit.
 
-Verified by `tests/BooklyHub.IntegrationTests/Notifications/ReminderNoticeHoursTests.cs`, which fails in both
-window directions and fails a join that drops the per-tenant key.
+Because the pass runs on a platform-admin scope, the per-tenant `a.TenantId == tenant.TenantId` predicate on
+that read is the only thing separating one clinic's bookings from another's, and it is load-bearing in a way an
+equal-window test cannot see: with both tenants asking for the same notice, a read that dropped the predicate
+still reaches the same conclusions. The binding test therefore gives the two tenants *unequal* windows.
+
+**The execution shape, and what it costs.** Each tenant's pass takes at most `BatchSize = 200` bookings,
+nearest start first, and the already-sent question is a `NOT EXISTS` inside that read rather than a filter
+applied to its results — the cap has to be taken over bookings that still need a reminder, because a page
+capped first and deduplicated afterwards is a page whose spent rows never leave, and a busy clinic would
+re-read its own reminded head every tick and never reach the bookings behind it. Each reminder is recorded in
+its own save as it leaves, and a save that fails ends that tenant's pass instead of continuing: the row is
+then both sent and unrecorded, and every booking behind it would be the same. At-least-once is the deliberate
+direction — a duplicate reminder is the cheaper mistake against a mail storm, which is what a single
+end-of-tick save becomes when it fails after the emails have left. A *send* that fails records nothing, so the
+next tick retries it; `NotificationRecord.Error` is unused here precisely because a row with a reminder subject
+is a row the dedupe treats as spent, and recording a refusal would suppress the retry.
+
+There is **no cross-instance claim** on this pass, unlike the no-show sweep: `sp_getapplock` in
+`LockOwner='Transaction'` cannot span the SMTP calls a reminder pass makes, and a session-scoped lock would
+need a lock lifecycle `ApplicationDbContext` does not have. Two concurrent instances would therefore both
+send. `docker-compose.yml` runs one API container with no `replicas:`, so this is not reachable in the
+deployment as documented; it is recorded as open rather than fixed, and named below.
+
+Verified by `tests/BooklyHub.IntegrationTests/Notifications/ReminderNoticeHoursTests.cs` (window direction and
+the missing settings row) and `tests/BooklyHub.IntegrationTests/Notifications/ReminderSweepExecutionTests.cs`
+(ceiling, drain past a spent head, record-before-next-send, send failure leaves no record, one notification
+read per tenant pass, inactive tenants, and the unequal-window cross-tenant binding).
 
 Verified by `tests/BooklyHub.IntegrationTests/Notifications/NotificationDeliveryTests.cs`, which fails when
 either worker is switched back to a plain scope (zero rows read, and the outbox message is marked processed
