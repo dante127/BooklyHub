@@ -50,6 +50,7 @@ public class AuthController : ControllerBase
     public record UserDto(Guid Id, string Email, string FirstName, string LastName, Guid? TenantId, IReadOnlyList<string> Roles, IReadOnlyList<string> Permissions);
     public record RefreshTokenRequest(string RefreshToken);
     public record LogoutRequest(string RefreshToken);
+    public record ChangePasswordRequest(string CurrentPassword, string NewPassword);
 
     /// <summary>
     /// ENV-01: <c>Unauthorized(new { message })</c> is an <c>ObjectResult</c>, so a refused sign-in answered
@@ -62,6 +63,18 @@ public class AuthController : ControllerBase
         detail: detail,
         title: "Unauthorized",
         statusCode: StatusCodes.Status401Unauthorized,
+        instance: HttpContext.Request.Path.Value);
+
+    /// <summary>
+    /// The <c>400</c> twin of <see cref="Refusal"/>, and named <c>InvalidRequest</c> rather than
+    /// <c>BadRequest</c> on purpose: a member called <c>BadRequest</c> hides the inherited
+    /// <c>ControllerBase.BadRequest(object)</c> overloads for every action in this file, which is how an
+    /// <c>ObjectResult</c> silently turns back into the bare <c>application/json</c> body ENV-01 removed.
+    /// </summary>
+    private ObjectResult InvalidRequest(string detail) => Problem(
+        detail: detail,
+        title: "Bad Request",
+        statusCode: StatusCodes.Status400BadRequest,
         instance: HttpContext.Request.Path.Value);
 
     /// <summary>
@@ -183,7 +196,7 @@ public class AuthController : ControllerBase
             || LoginLockoutPolicy.IsLockedOut(user.LockoutUntilUtc, nowUtc))
         {
             if (user != null && !passwordMatches)
-                await RecordFailedLoginAsync(user, nowUtc, cancellationToken);
+                await RecordFailedLoginAsync(user, nowUtc, "auth:login", cancellationToken);
 
             return Refusal(InvalidCredentials);
         }
@@ -222,8 +235,12 @@ public class AuthController : ControllerBase
     /// a losing swap writes nothing, because whoever moved that count first reported a real event this refusal never
     /// saw. Without it, a fifth failure decided on a four-deep streak could land after its owner signed in elsewhere
     /// and lock out the very account the rule exists to protect.
+    ///
+    /// PW-01: <c>source</c> names the door the wrong password came in, because a guesser who splits attempts between
+    /// signing in and changing a password is still one guesser — the same counter, the same threshold, the same
+    /// deadline, and only the audit trail tells the two apart.
     /// </summary>
-    private Task RecordFailedLoginAsync(User user, DateTime nowUtc, CancellationToken cancellationToken)
+    private Task RecordFailedLoginAsync(User user, DateTime nowUtc, string source, CancellationToken cancellationToken)
     {
         var next = LoginLockoutPolicy.NextFailedCount(user.FailedLoginCount, user.LastFailedLoginAtUtc, nowUtc);
         var lockoutUntil = LoginLockoutPolicy.LockoutUntil(next, user.LockoutUntilUtc, nowUtc);
@@ -235,7 +252,7 @@ public class AuthController : ControllerBase
                 .SetProperty(u => u.LastFailedLoginAtUtc, nowUtc)
                 .SetProperty(u => u.LockoutUntilUtc, lockoutUntil)
                 .SetProperty(u => u.LastModifiedAtUtc, nowUtc)
-                .SetProperty(u => u.LastModifiedBy, "auth:login"), cancellationToken);
+                .SetProperty(u => u.LastModifiedBy, source), cancellationToken);
     }
 
     /// <summary>
@@ -338,6 +355,102 @@ public class AuthController : ControllerBase
         // Reached even when nothing was revoked: a row written before SEC-05a carries its credential in plaintext,
         // and touching it here is one more chance to rewrite it as a digest on the way out.
         await _db.SaveChangesAsync(cancellationToken);
+
+        return NoContent();
+    }
+
+    /// <summary>
+    /// PW-01: lets the person who already holds a session take the account's secret back. Until this existed, a
+    /// password could only be replaced by someone with database access, which made a leaked password unfixable by
+    /// the one party who can tell it was leaked, and made the shared operator password in the seeding configuration
+    /// permanent.
+    ///
+    /// The refusal is <see cref="InvalidCredentials"/> for every reason this path can say no — no row behind the
+    /// token, wrong current password, deactivated account, account inside its lockout window — for the same reason
+    /// login says one thing: a route that answers 404 for a vanished user and 401 for a wrong password is an oracle
+    /// over who exists, and SEC-04(c) spent its budget closing exactly that.
+    ///
+    /// Wrong current passwords feed the <see cref="LoginLockoutPolicy"/> streak login uses, not a second one. A
+    /// separate counter would be a second door with a looser rule behind it, and the threshold is what stops the
+    /// guessing, not the door it comes through.
+    ///
+    /// The new password is judged <em>after</em> the current one. A shape check first would hand a caller who does
+    /// not know the secret a 400-versus-401 distinction to read the account's existence from, and would let the
+    /// malformed-password probes pass without ever touching the streak the rule exists to build.
+    ///
+    /// Success revokes every session the account holds, including the one making the call, and the count goes in
+    /// the log because "the stolen device is still signed in" is the claim this endpoint exists to settle. What it
+    /// cannot do is reach back into an access token already minted: that runs out on <c>Jwt:ExpirationMinutes</c>,
+    /// like every other refusal here. The client is expected to re-login; the response says nothing about it
+    /// because <c>204</c> has no body.
+    /// </summary>
+    [HttpPost("change-password")]
+    [Authorize]
+    [EnableRateLimiting("auth")]
+    public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordRequest request, CancellationToken cancellationToken)
+    {
+        var userId = _currentUser.UserId;
+
+        var user = userId == null
+            ? null
+            : await _db.Users
+                .IgnoreQueryFilters()
+                .FirstOrDefaultAsync(u => u.Id == userId.Value && !u.IsDeleted, cancellationToken);
+
+        var nowUtc = _clock.UtcNow;
+
+        // Verified on every path that reaches a row, a locked-out one included, for the reason login gives: a
+        // refusal that skips the hash answers in about a millisecond instead of the fifty-odd one costs.
+        var currentMatches = user != null
+            && !string.IsNullOrEmpty(request.CurrentPassword)
+            && _passwordHasher.VerifyPassword(request.CurrentPassword, user.PasswordHash);
+
+        if (user == null
+            || !currentMatches
+            || !user.IsActive
+            || LoginLockoutPolicy.IsLockedOut(user.LockoutUntilUtc, nowUtc))
+        {
+            if (user != null && !currentMatches)
+                await RecordFailedLoginAsync(user, nowUtc, "auth:change-password", cancellationToken);
+
+            return Refusal(InvalidCredentials);
+        }
+
+        var shapeRefusal = PasswordPolicy.RefusalFor(request.NewPassword);
+        if (shapeRefusal != null) return InvalidRequest(shapeRefusal);
+
+        // Captured before the statement, because a method call inside SetProperty is not translatable and EF would
+        // answer by trying to push the whole entity through the database.
+        var passwordHash = _passwordHasher.HashPassword(request.NewPassword);
+        var id = user.Id;
+
+        // One transaction, because these two writes are one promise. A new password that leaves the old sessions
+        // alive has taken nothing back from whoever is using them, and a revocation that runs without the hash
+        // change tells the caller they rotated a secret they still hold.
+        var revokedSessions = await _db.ExecuteInTransactionAsync(async () =>
+        {
+            var revoked = await _db.RefreshTokens
+                .Where(t => t.UserId == id && t.RevokedAtUtc == null)
+                .ExecuteUpdateAsync(s => s.SetProperty(t => t.RevokedAtUtc, nowUtc), cancellationToken);
+
+            await _db.Users
+                .Where(u => u.Id == id)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(u => u.PasswordHash, passwordHash)
+                    .SetProperty(u => u.FailedLoginCount, 0)
+                    .SetProperty(u => u.LastFailedLoginAtUtc, (DateTime?)null)
+                    .SetProperty(u => u.LockoutUntilUtc, (DateTime?)null)
+                    .SetProperty(u => u.LastModifiedAtUtc, nowUtc)
+                    .SetProperty(u => u.LastModifiedBy, "auth:change-password"), cancellationToken);
+
+            return revoked;
+        }, cancellationToken);
+
+        _logger.LogInformation(
+            "Password changed for user {UserId}; {RevokedSessions} active session(s) revoked. Correlation-Id {CorrelationId}",
+            user.Id,
+            revokedSessions,
+            HttpContext.Response.Headers[CorrelationIdMiddleware.CorrelationIdHeader]);
 
         return NoContent();
     }

@@ -31,7 +31,7 @@ the contract:
 | `detail` | action-path failures | the explanation, e.g. which appointment was not found |
 | `errors` | `400` validation failures | property name → messages |
 | `rule` | `422` business-rule failures | the machine-readable rule name, so a client never string-matches prose |
-| `type` | `401`/`403`/`404` from the pipeline, and the `401`s from `/auth/login` and `/auth/refresh-token` | the RFC 9110 section for that status; absent on `429` and on the thrown action path |
+| `type` | `401`/`403`/`404` from the pipeline, and the refusals the auth actions write themselves (`/auth/login`, `/auth/refresh-token`, `/auth/change-password`) | the RFC 9110 section for that status; absent on `429` and on the thrown action path |
 | `traceId` | pipeline failures and the auth refusals | the W3C trace context id; a thrown action failure carries `correlationId` instead |
 
 Three writers produce these documents and they are deliberately not merged:
@@ -44,11 +44,12 @@ Three writers produce these documents and they are deliberately not merged:
   with no endpoint, a `429` from the rate limiter. `UseStatusCodePages` writes these through the same
   problem-details service, and it sits *inside* the exception handler, so a thrown exception is still
   answered by the mapping above rather than by a status page.
-- **An action refused without throwing.** `POST /api/v1/auth/login` and `POST /api/v1/auth/refresh-token`
-  answer their `401` with `ControllerBase.Problem`, so they get the service's `type` and `traceId` along with
-  the `detail` only they can supply. Until this was fixed they returned `Unauthorized(new { message })`, an
-  `ObjectResult` that no problem writer ever saw: `application/json`, one lowercase field, no correlation id
-  in the body (`ENV-01`). Login additionally answers all four refusal reasons — no such user, wrong
+- **An action refused without throwing.** `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh-token` and
+  `POST /api/v1/auth/change-password` answer their refusals with `ControllerBase.Problem` — the first two their
+  `401`s, `change-password` its `401`s and its `400` for a malformed new password — so they get the service's
+  `type` and `traceId` along with the `detail` only they can supply. Until this was fixed they returned
+  `Unauthorized(new { message })`, an `ObjectResult` that no problem writer ever saw: `application/json`, one
+  lowercase field, no correlation id in the body (`ENV-01`). Login additionally answers all four refusal reasons — no such user, wrong
   password, inactive account, account inside its lockout window (`SEC-04(b)`) — with the one `detail`
   "Invalid email or password.", because distinguishing them tells a caller which addresses exist. A
   deactivated account therefore gets no explanation; an administrator reads `IsActive` from the user list
@@ -157,6 +158,39 @@ sign-out cannot later be mistaken for a replayed credential and burn a chain.
 What it does not do: revoke every session for the account at once, delete anything, or stop an access token this
 session already minted — that one runs out on its own, exactly as above. It sits in the same 10-per-minute
 authentication rate-limit tier as `/auth/login` and `/auth/refresh-token`.
+
+### `POST /api/v1/auth/change-password`
+Replaces the account's password with a new one, and stops every session the account holds while doing it. `PW-01` —
+before this route the only password in the product was the one an operator put in `Seed:AdminPassword`, and the only
+way to change it was to write the `Users` table by hand.
+
+Requires a bearer token (`[Authorize]`) and sits in the same authentication rate-limit tier as the routes above.
+
+**Request Payload:**
+```json
+{ "currentPassword": "correct horse battery staple", "newPassword": "the one you are choosing now" }
+```
+
+**`204` on success, with no body.** The new password is the only one that signs in; the old one is refused from that
+moment. Every refresh credential the account holds — including the one making this call, and including rows minted
+after it by rotation — is revoked in the same transaction as the password write, and the number revoked is written to
+the log with the request's correlation id.
+
+**`401` for four reasons, in one body.** `detail: "Invalid email or password."` whether the token names no row, the
+current password is wrong, the account is deactivated, or the account is inside its lockout window — the same
+collapse `/auth/login` makes, for the same reason: distinguishing them is an oracle over which accounts exist. A
+wrong current password here feeds **the same** five-in-fifteen-minutes account lockout as the login box
+(`SEC-04(b)`), so splitting guesses across the two routes does not buy a guesser a larger budget.
+
+**`400` when the new password is malformed, and only once the current one has been proven.**
+`The new password must be at least 12 characters.` / `… at most 256 characters.`, in the standard problem envelope.
+The order is the security property, not a style choice: judging the shape first would answer `400` to a caller who
+has not proven the secret, which both confirms the account exists and lets the probing requests pass without ever
+building the lockout streak. A `400` does not count as a failed password.
+
+What it does not do: reach an access token already minted. The token in the caller's hands keeps serving
+authenticated routes until `Jwt:ExpirationMinutes` runs out — 60 minutes as shipped — and the `204` deliberately
+says nothing about it, so a client that wants its own session ended must sign in again with the new password.
 
 ---
 
