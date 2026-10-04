@@ -117,8 +117,13 @@ public class AuthController : ControllerBase
                         .ThenInclude(r => r.RolePermissions)
             .FirstOrDefaultAsync(rt => rt.Token == request.RefreshToken, cancellationToken);
 
-        // Already one answer for three reasons (never issued, expired, revoked); only the shape was wrong.
-        if (tokenRecord == null || !tokenRecord.IsActive(_clock.UtcNow) || tokenRecord.User == null)
+        // Four reasons, one answer: never issued, expired, revoked, or the account behind it is no longer
+        // allowed to sign in. `IsActive` was a login-only rule, so deactivating a user was a delay of up to the
+        // refresh token's seven days rather than a stop. No `IsDeleted` test here on purpose: `User` carries the
+        // soft-delete query filter, so a deleted account already arrives as `tokenRecord.User == null`.
+        if (tokenRecord == null
+            || !tokenRecord.IsActive(_clock.UtcNow)
+            || tokenRecord.User is not { IsActive: true })
         {
             return Refusal("Invalid or expired refresh token.");
         }

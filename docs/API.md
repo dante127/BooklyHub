@@ -97,6 +97,20 @@ Authenticates a user and returns an access token with a rotating refresh token.
 }
 ```
 
+The sample above is stale in one way worth naming: the action returns `AuthResponse(accessToken, refreshToken, expiresAtUtc, user)` — a nested `user` object — not these flat `userId`/`tenantId`/`fullName` keys. Tracked as `DOC-03`; the endpoint below is described from the code, not from this block.
+
+### `POST /api/v1/auth/refresh-token`
+Exchanges a live refresh token for a new access token and a **new** refresh token; the old one is revoked in the same write, so replaying it gets a `401`.
+
+**Request Payload:**
+```json
+{ "refreshToken": "4f5c9e2b-7c51-4e76-88cf-9a9be8525b6a" }
+```
+
+**`401` — one body for four reasons.** The refusal says `detail: "Invalid or expired refresh token."` whether the string was never issued, is past its 7 days, has already been rotated, or **the account behind it is no longer allowed to sign in** (`IsActive`). It is deliberately not a way to learn which of the four it was. The document is the standard envelope (see §1.1), and the endpoint sits in the same 10-per-minute authentication rate-limit tier as `/auth/login`.
+
+A `401` here does **not** end sessions already issued: an access token minted before the account was switched off stays valid until it expires — 60 minutes at the shipped `Jwt:ExpirationMinutes`. There is no logout or revocation endpoint, which is `SEC-05`.
+
 ---
 
 ## 3. Availability Engine

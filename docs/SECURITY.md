@@ -16,13 +16,14 @@ sequenceDiagram
     User->>Auth: POST /api/v1/auth/login (email, password)
     Auth->>Hasher: Verify password against stored hash & salt
     Hasher-->>Auth: Verified
-    Auth->>JWT: Generate Access Token (60 mins expiry)
-    Auth->>DB: Store cryptographically secure Refresh Token (30 days expiry)
+    Auth->>JWT: Generate Access Token (Jwt:ExpirationMinutes, 60 by default)
+    Auth->>DB: Store refresh token (7 days, the value the client holds)
     Auth-->>User: Returns { accessToken, refreshToken, userProfile }
 
     Note over User,Auth: Subsequent Authenticated Requests
     User->>Auth: Request with Bearer AccessToken
     Auth->>Auth: Validate Signature, Issuer, Audience, Expiry
+    Auth->>DB: On /refresh-token: expiry, revocation AND the account's IsActive state
 ```
 
 ### 1.1 Password Security (PBKDF2)
@@ -33,8 +34,10 @@ Passwords are never stored in plaintext or weak cryptographic hashes (MD5, SHA1)
 - **Constant-Time Verification**: `CryptographicOperations.FixedTimeEquals` prevents timing attacks.
 
 ### 1.2 Sliding Refresh Token Rotation
-- Refresh tokens are hashed and stored with `ExpiresAtUtc`, `CreatedByIp`, and `RevokedAtUtc`.
+- Refresh tokens are stored with `ExpiresAtUtc`, `RevokedAtUtc` and `ReplacedByToken`. (Not hashed, not with `CreatedByIp` — this section claimed both until it was checked against the entity; hashing them at rest is `SEC-05`, and the column today holds the value a client sends.)
 - Each refresh token redemption generates a new replacement refresh token and revokes the old one, neutralizing stolen token replays.
+- **The account is re-checked on every redemption** (`ACT-01`). A refresh token is a seven-day credential, so `IsActive` cannot be a rule of the login box alone: without it, switching a user off changed nothing for the tokens that user already held. Redemption now refuses a deactivated account with the same body it uses for a token that was never issued, expired or revoked — the refusal does not announce that an account was disabled. A soft-deleted account needs no term in the controller: the global `!IsDeleted` filter makes its user arrive as `null`, which the same condition already refuses.
+- What that does **not** do: an **access token already minted** keeps working until it expires — measured at `200` on `/api/v1/auth/me` for a deactivated account holding the token it got before the switch-off. The window is the access token's own life, 60 minutes at the shipped `Jwt:ExpirationMinutes`. Closing it means a revocation claim or a per-request account read, which is `SEC-05`'s missing revocation path, not this section's.
 
 ---
 
