@@ -70,6 +70,15 @@ public class AuthController : ControllerBase
     /// compatibility branch: rows written before this change carry the wire string itself, and each one is
     /// rewritten to its digest the moment it is redeemed — which is how the table empties of plaintext without
     /// every session of every user being destroyed on deploy day.
+    ///
+    /// <c>KEY-01</c>: that transition read compares the presented string against the stored column, so unchecked
+    /// it accepts the stored value itself — a digest included. Whoever could read the table could then spend a
+    /// digest and mint a session, which is precisely the access the digest was added to take away, and the branch
+    /// never drains because digest rows are the ones this code writes from now on. Two tests close it, both
+    /// load-bearing: the row must not already be a digest (measured: presenting <c>SHA-256(wire)</c> as a refresh
+    /// token used to answer 200 and rewrite the row), and the match must be byte-for-byte (measured: these columns
+    /// are <c>SQL_Latin1_General_CP1_CI_AS</c>, and SQL Server's <c>=</c> ignores trailing space too, so a
+    /// case-flipped or space-padded copy of a legacy credential used to redeem it).
     /// </summary>
     private async Task<RefreshToken?> FindPresentedTokenAsync(string presented, CancellationToken cancellationToken)
     {
@@ -84,15 +93,15 @@ public class AuthController : ControllerBase
         if (record != null) return record;
 
         record = await ByStoredValue(presented);
-        if (record != null)
-        {
-            record.Token = _protector.Protect(presented);
+        if (record == null || _protector.IsProtected(record.Token) || !string.Equals(record.Token, presented, StringComparison.Ordinal))
+            return null;
 
-            // A row old enough to hold a plaintext credential holds a plaintext successor link too; leaving that
-            // behind would keep the next session's credential recoverable from this row.
-            if (record.ReplacedByToken != null)
-                record.ReplacedByToken = _protector.Protect(record.ReplacedByToken);
-        }
+        record.Token = _protector.Protect(presented);
+
+        // A row old enough to hold a plaintext credential holds a plaintext successor link too; leaving that
+        // behind would keep the next session's credential recoverable from this row.
+        if (record.ReplacedByToken != null)
+            record.ReplacedByToken = _protector.Protect(record.ReplacedByToken);
 
         return record;
     }

@@ -120,6 +120,19 @@ WHERE [ProcessedOnUtc] IS NULL;
 ```
 This **partial / filtered index** contains only unhandled outbox events. The background worker queries only the active queue without scanning millions of historically processed messages.
 
+### 3.4 String Collation: One Default, and the Two Places It Is Not the Right Answer
+Nothing in the model, the migrations or the connection string declares a collation, so **every** character column inherits the database default — measured at runtime (`SERVERPROPERTY`, `DATABASEPROPERTYEX`) as `SQL_Latin1_General_CP1_CI_AS`, and confirmed per column in `sys.columns`: `RefreshTokens.Token`, `RefreshTokens.ReplacedByToken`, `IdempotencyRecords.Id`, `IdempotencyRecords.RequestHash`, `Users.Email`, `Appointments.IdempotencyKey`, `Payments.IdempotencyKey`, `Permissions.Id`, the `Email` columns on `Customers`/`Locations`/`StaffMembers`. `uniqueidentifier` keys carry none, which is why case-folding has never touched an `Id` that is a GUID.
+
+That default is right for most of the schema and wrong in two specific places, so the rule is per-column rather than a sweep:
+
+| Column | What it holds | Case-folding there is |
+| :--- | :--- | :--- |
+| `Users.Email` | A sign-in address a human types | **Desired.** The login box and the `(TenantId, Email)` unique index both promise an address is matched without regard to case. Do not "unify" it with the rows below. |
+| `RefreshTokens.Token`, `ReplacedByToken` | An opaque credential, or its digest | **Wrong.** Two values differing only by case are the *same* value to `=`, and the unique index refuses them as one row (measured: `Cannot insert duplicate key row in object 'dbo.RefreshTokens' with unique index 'IX_RefreshTokens_Token'`). The identity of a credential is the string that was issued, byte for byte — enforced in code (`KEY-01`, `docs/SECURITY.md` §1.2) rather than by an `ALTER COLUMN` plus an index rebuild, because after that guard no authorization decision reads case, and a collation change would not have touched trailing space either. |
+| `IdempotencyRecords.Id` | `{tenant}:{client key}` | **Wrong, and open (`KEY-02`).** A client-chosen identifier whose case the client controls. Measured on the wire: `Idempotency-Key: KEY-02-PROBE` then `key-02-probe` with a different body → `201 Created`, `409 Conflict` — two distinct keys became one promise and the second request never ran. |
+
+Note that trailing space is folded by `=` for character types whatever the collation is (`SELECT CASE WHEN N'AbC' = N'AbC   ' THEN 1 END` is `1` on this database), so a case-sensitive collation alone would not have made any of these comparisons byte-exact. `IdempotencyMiddleware` already `Trim()`s the header, which is the only reason the padded form is not a third live case.
+
 ---
 
 ## 4. Auditing, Soft Deletes & Optimistic Concurrency

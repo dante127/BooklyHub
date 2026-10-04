@@ -113,4 +113,13 @@ public class RefreshTokenProtector : IRefreshTokenProtector
 {
     public string Protect(string token) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
+
+    /// <summary>
+    /// The output of <see cref="Protect"/> is exactly 64 characters from [0-9a-f]; a credential as it was issued is
+    /// 88 characters of base64. Nothing else writes this column, so shape separates the rows the digesting code
+    /// produced from the rows that pre-date it — and a row wrongly read as legacy would only ever be refused by
+    /// the transition branch, never accepted by the digest one.
+    /// </summary>
+    public bool IsProtected(string storedValue) =>
+        storedValue.Length == 64 && storedValue.All(c => c is (>= '0' and <= '9') or (>= 'a' and <= 'f'));
 }
