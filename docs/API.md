@@ -117,6 +117,16 @@ in clears the streak, and a failure while a lockout is open does not push its de
 itself and needs no administrator; it also ends no session — refresh tokens the account already holds keep refreshing,
 which is `/auth/logout` below.
 
+**A sixth sign-in retires the account's oldest live session** (`FAN-01`). An account holds at most five live refresh
+credentials (`SessionFanOutPolicy.MaxLiveSessions`), and "live" means a chain's *tip* — a row neither spent by
+rotation nor signed out — so refreshing never adds to the count and this is not a refresh budget; only a sign-in does.
+A sign-in past the cap revokes the oldest live credentials, by `ExpiresAtUtc` then `CreatedAtUtc`, and the credential
+being handed out is never among them. Nothing is deleted, and the response is unchanged: there is no field naming the
+device that just stopped working, because the sessions being pruned belong to other devices and announcing them would
+tell a caller which ones exist. The record is the `LogInformation` carrying the user id, the cap, how many were
+revoked and the request's `correlationId`. To a client on an old device this is indistinguishable from a sign-out, and
+the handling is the same: sign in again.
+
 ### `POST /api/v1/auth/refresh-token`
 Exchanges a live refresh token for a new access token and a **new** refresh token; the old one is revoked in the same write, so replaying it gets a `401`.
 
@@ -152,10 +162,11 @@ answer `204`, and the last two write nothing: the endpoint is idempotent and is 
 whether a refresh token exists. It is anonymous (`[AllowAnonymous]`) and reads the body rather than the bearer
 token, because what is being revoked is a refresh credential and the client that wants to sign out is often the one
 whose access token already expired. Its reach is the credential you hold: it revokes that row only, so the
-account's other sessions — the ones repeated sign-ins create — stay standing, and it writes no successor link, so a
-sign-out cannot later be mistaken for a replayed credential and burn a chain.
+account's other sessions — the ones repeated sign-ins create, up to the five `/auth/login` allows — stay standing,
+and it writes no successor link, so a sign-out cannot later be mistaken for a replayed credential and burn a chain.
 
-What it does not do: revoke every session for the account at once, delete anything, or stop an access token this
+What it does not do: revoke every session for the account at once (only `/auth/change-password` above does that),
+delete anything, or stop an access token this
 session already minted — that one runs out on its own, exactly as above. It sits in the same 10-per-minute
 authentication rate-limit tier as `/auth/login` and `/auth/refresh-token`.
 

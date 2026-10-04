@@ -168,6 +168,62 @@ public class AuthController : ControllerBase
             HttpContext.Response.Headers[CorrelationIdMiddleware.CorrelationIdHeader]);
     }
 
+    /// <summary>
+    /// FAN-01: brings the account back inside <see cref="SessionFanOutPolicy.MaxLiveSessions"/> by revoking the
+    /// oldest live credentials, and runs only when the mint that just happened pushed it past the cap.
+    ///
+    /// A live credential is a row that was neither spent nor signed out — the tip of a chain, not the chain — and
+    /// only a sign-in creates one. A rotation revokes the row it was given and mints exactly one successor, so the
+    /// live count is unchanged by refreshing; running this same gate on the refresh path changed no result, which is
+    /// why keeping it off that path is a cost decision and not a safety one. Reading the bound over <em>rows</em>
+    /// instead of tips is what would have been an outage: a cap of five would then sign an ordinary client out on
+    /// its sixth refresh of the day, which is the opposite of what the finding is about.
+    ///
+    /// The eviction writes <c>RevokedAtUtc</c> and no successor link, which is what keeps it out of
+    /// <see cref="BurnChainAsync"/>'s way: a revoked row with nothing behind it reads as a session that was ended,
+    /// exactly like <c>SEC-05c</c>'s logout, not as a credential that was replayed. Two different mechanisms
+    /// sharing one column would otherwise turn routine housekeeping into a false theft signal.
+    ///
+    /// It is not announced. The response is the one the caller already gets, because the sessions being revoked
+    /// belong to other devices, and a field naming them would tell whoever is guessing that the account is being
+    /// pruned — and which device just stopped working. What it does leave is the log line below, with the count and
+    /// the correlation id, so an owner's complaint that "my phone signed me out" is answerable from the data.
+    ///
+    /// The cap is per sign-in, not per request, so N concurrent logins can transiently leave the account a few
+    /// credentials over it; the next sign-in trims back to the cap. That overshoot is bounded and harmless here —
+    /// unlike SEC-04(b)'s streak, where a stale write could lock out the account the rule protects.
+    /// </summary>
+    private async Task BoundLiveSessionsAsync(Guid userId, Guid newestTokenId, DateTime nowUtc, CancellationToken cancellationToken)
+    {
+        var live = await _db.RefreshTokens
+            .CountAsync(t => t.UserId == userId && t.RevokedAtUtc == null && t.ExpiresAtUtc > nowUtc, cancellationToken);
+
+        var excess = SessionFanOutPolicy.EvictionsNeeded(live);
+        if (excess == 0) return;
+
+        var evicted = await _db.RefreshTokens
+            .Where(t => t.UserId == userId
+                        && t.RevokedAtUtc == null
+                        && t.ExpiresAtUtc > nowUtc
+                        && t.Id != newestTokenId)
+            .OrderBy(t => t.ExpiresAtUtc)
+            .ThenBy(t => t.CreatedAtUtc)
+            .Take(excess)
+            .Select(t => t.Id)
+            .ToListAsync(cancellationToken);
+
+        await _db.RefreshTokens
+            .Where(t => evicted.Contains(t.Id))
+            .ExecuteUpdateAsync(s => s.SetProperty(t => t.RevokedAtUtc, nowUtc), cancellationToken);
+
+        _logger.LogInformation(
+            "Live sessions for user {UserId} capped at {Cap}: {Evicted} oldest credential(s) revoked. Correlation-Id {CorrelationId}",
+            userId,
+            SessionFanOutPolicy.MaxLiveSessions,
+            evicted.Count,
+            HttpContext.Response.Headers[CorrelationIdMiddleware.CorrelationIdHeader]);
+    }
+
     [HttpPost("login")]
     [AllowAnonymous]
     [EnableRateLimiting("auth")]
@@ -224,6 +280,10 @@ public class AuthController : ControllerBase
         _db.RefreshTokens.Add(refreshToken);
 
         await _db.SaveChangesAsync(cancellationToken);
+
+        // FAN-01: bounded after the save, so the credential being handed out now is part of the live set the rule
+        // counts — and is the newest member of it, which is what keeps it out of the evicted range.
+        await BoundLiveSessionsAsync(user.Id, refreshToken.Id, nowUtc, cancellationToken);
 
         var userDto = new UserDto(user.Id, user.Email, user.FirstName, user.LastName, user.TenantId, roles, permissions);
         return Ok(new AuthResponse(accessToken, refreshTokenString, _clock.UtcNow.AddMinutes(60), userDto));
