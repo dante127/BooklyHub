@@ -49,6 +49,7 @@ public class AuthController : ControllerBase
     public record AuthResponse(string AccessToken, string RefreshToken, DateTime ExpiresAtUtc, UserDto User);
     public record UserDto(Guid Id, string Email, string FirstName, string LastName, Guid? TenantId, IReadOnlyList<string> Roles, IReadOnlyList<string> Permissions);
     public record RefreshTokenRequest(string RefreshToken);
+    public record LogoutRequest(string RefreshToken);
 
     /// <summary>
     /// ENV-01: <c>Unauthorized(new { message })</c> is an <c>ObjectResult</c>, so a refused sign-in answered
@@ -246,6 +247,40 @@ public class AuthController : ControllerBase
 
         var userDto = new UserDto(user.Id, user.Email, user.FirstName, user.LastName, user.TenantId, roles, permissions);
         return Ok(new AuthResponse(newAccessToken, newRefreshToken, _clock.UtcNow.AddMinutes(60), userDto));
+    }
+
+    /// <summary>
+    /// SEC-05c: ends the session whose refresh credential the caller holds.
+    ///
+    /// Anonymous and driven by the body rather than <c>[Authorize]</c>, on purpose: the thing being revoked is a
+    /// refresh credential, and a client whose access token has already expired is exactly the client that wants to
+    /// sign out. The reach is bounded by what the credential already buys — a caller can revoke a row only by
+    /// presenting the string that authorizes it, and whoever holds that string can already mint an access token
+    /// with it, so this adds no capability beyond ending the session being used.
+    ///
+    /// It revokes the presented row and nothing else. It is not a reuse signal, so it burns no chain, and it does
+    /// not touch the other live sessions the same account holds (`FAN-01`). The answer is always <c>204</c>: a
+    /// string that was never issued and a string that is the live tip of a session get the same response, so the
+    /// endpoint tells a caller nothing about which credentials exist. It is idempotent for the same reason.
+    ///
+    /// What it does not do: stop an access token this session already minted. That runs out on
+    /// <c>Jwt:ExpirationMinutes</c> like every other refusal here.
+    /// </summary>
+    [HttpPost("logout")]
+    [AllowAnonymous]
+    [EnableRateLimiting("auth")]
+    public async Task<IActionResult> Logout([FromBody] LogoutRequest request, CancellationToken cancellationToken)
+    {
+        var tokenRecord = await FindPresentedTokenAsync(request.RefreshToken, cancellationToken);
+
+        if (tokenRecord is { IsRevoked: false })
+            tokenRecord.RevokedAtUtc = _clock.UtcNow;
+
+        // Reached even when nothing was revoked: a row written before SEC-05a carries its credential in plaintext,
+        // and touching it here is one more chance to rewrite it as a digest on the way out.
+        await _db.SaveChangesAsync(cancellationToken);
+
+        return NoContent();
     }
 
     [HttpGet("me")]

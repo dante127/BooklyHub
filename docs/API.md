@@ -119,7 +119,27 @@ issued from the chain — those run out on their own (`Jwt:ExpirationMinutes`).
 
 **`401` — one body for four reasons.** The refusal says `detail: "Invalid or expired refresh token."` whether the string was never issued, is past its 7 days, has already been rotated, or **the account behind it is no longer allowed to sign in** (`IsActive`). It is deliberately not a way to learn which of the four it was. The document is the standard envelope (see §1.1), and the endpoint sits in the same 10-per-minute authentication rate-limit tier as `/auth/login`.
 
-A `401` here does **not** end sessions already issued: an access token minted before the account was switched off stays valid until it expires — 60 minutes at the shipped `Jwt:ExpirationMinutes`. There is no logout or revocation endpoint, which is `SEC-05`.
+A `401` here does **not** end the access token already in the caller's hands: it stays valid until it expires — 60 minutes at the shipped `Jwt:ExpirationMinutes`. `/auth/logout` below revokes refresh credentials, and neither it nor a deactivation reaches an access token that was already minted.
+
+### `POST /api/v1/auth/logout`
+Ends the session whose refresh credential you present. `SEC-05c` — before this route existed the only thing a user could do with an issued session was wait out its seven days.
+
+**Request Payload:**
+```json
+{ "refreshToken": "4f5c9e2b-7c51-4e76-88cf-9a9be8525b6a" }
+```
+
+**`204` always, with no body.** A live session, a credential that was never issued, and the same call repeated all
+answer `204`, and the last two write nothing: the endpoint is idempotent and is not a way to ask the database
+whether a refresh token exists. It is anonymous (`[AllowAnonymous]`) and reads the body rather than the bearer
+token, because what is being revoked is a refresh credential and the client that wants to sign out is often the one
+whose access token already expired. Its reach is the credential you hold: it revokes that row only, so the
+account's other sessions — the ones repeated sign-ins create — stay standing, and it writes no successor link, so a
+sign-out cannot later be mistaken for a replayed credential and burn a chain.
+
+What it does not do: revoke every session for the account at once, delete anything, or stop an access token this
+session already minted — that one runs out on its own, exactly as above. It sits in the same 10-per-minute
+authentication rate-limit tier as `/auth/login` and `/auth/refresh-token`.
 
 ---
 
