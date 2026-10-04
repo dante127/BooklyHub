@@ -31,17 +31,14 @@ public class ReportsController : ControllerBase
         [FromQuery] DateTime? toUtc,
         CancellationToken cancellationToken)
     {
-        if (!_tenantContext.TenantId.HasValue)
-        {
-            return BadRequest(new { message = "Active tenant context is required." });
-        }
+        var tenantId = TenantGuard.RequireId(_tenantContext);
 
         // One instant for both bounds, so the period is 30 days wide rather than 30 days plus the gap between two reads.
         var nowUtc = _clock.UtcNow;
         var start = fromUtc ?? nowUtc.AddDays(-30);
         var end = toUtc ?? nowUtc;
 
-        var query = new GetDashboardReportQuery(_tenantContext.TenantId.Value, start, end, nowUtc);
+        var query = new GetDashboardReportQuery(tenantId, start, end, nowUtc);
         var report = await _sender.Send(query, cancellationToken);
         return Ok(report);
     }

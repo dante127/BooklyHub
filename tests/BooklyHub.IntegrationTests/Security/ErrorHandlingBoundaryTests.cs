@@ -161,4 +161,69 @@ public class ErrorHandlingBoundaryTests
         (await new StreamReader(body).ReadToEndAsync()).Should().Contain("Resource Not Found",
             "the started-response guard must stay narrow enough to leave the normal path writing");
     }
+
+    /// <summary>
+    /// ENV-01's other half. Three controllers threw <c>BadHttpRequestException</c> for a request with no resolved
+    /// tenant, a type this switch had never carried, so the mapping fell through to the default arm: the caller got
+    /// 500 and the generic "contact support" line, and the log got an ERROR with a stack trace for a mistake the
+    /// client made. Driven here rather than only from the wire because the log level is half of the finding and a
+    /// round trip cannot see it.
+    /// </summary>
+    [Fact]
+    public async Task ARefusalThatNamesItsOwnStatus_IsLoggedAsARefusal()
+    {
+        var body = new MemoryStream();
+        var context = new DefaultHttpContext();
+        context.Response.Body = body;
+
+        var (thrown, logger) = await RunAsync(context, () =>
+            throw new BadHttpRequestException("Active tenant context is required.", StatusCodes.Status400BadRequest));
+
+        thrown.Should().BeNull();
+        context.Response.StatusCode.Should().Be(StatusCodes.Status400BadRequest,
+            "the exception says which status it means, so the boundary has no business second-guessing it as 500");
+        logger.Entries.Should().ContainSingle().Which.Level.Should().Be(LogLevel.Warning,
+            "a caller who sent no tenant is not a server fault, and an ERROR per such request pages anyone for free");
+
+        body.Position = 0;
+        var document = await new StreamReader(body).ReadToEndAsync();
+        document.Should().Contain("Bad Request")
+            .And.Contain("Active tenant context is required.",
+                "the reason belongs in the body the client reads, not only in the log nobody reads");
+    }
+
+    [Fact]
+    public async Task TheStatusComesFromTheException_NotFromTheMappingTable()
+    {
+        var body = new MemoryStream();
+        var context = new DefaultHttpContext();
+        context.Response.Body = body;
+
+        var (_, logger) = await RunAsync(context, () =>
+            throw new BadHttpRequestException("Request body exceeded the limit.", StatusCodes.Status413PayloadTooLarge));
+
+        // The framework raises this same type for a body it will not accept, and that one already knows it means
+        // 413. Hardcoding 400 in the arm would answer a too-large upload with the wrong number.
+        context.Response.StatusCode.Should().Be(StatusCodes.Status413PayloadTooLarge);
+        body.Position = 0;
+        (await new StreamReader(body).ReadToEndAsync())
+            .Should().Contain("Payload Too Large")
+            .And.NotContain("Bad Request");
+        logger.Entries.Should().ContainSingle().Which.Level.Should().Be(LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task ABadRequestExceptionThatMeansAServerFault_StillLogsAnError()
+    {
+        var body = new MemoryStream();
+        var context = new DefaultHttpContext();
+        context.Response.Body = body;
+
+        var (_, logger) = await RunAsync(context, () =>
+            throw new BadHttpRequestException("Unacceptable.", StatusCodes.Status500InternalServerError));
+
+        // The downgrade is bounded by the status, not by the type name: a 5xx wearing this type is still a fault.
+        context.Response.StatusCode.Should().Be(StatusCodes.Status500InternalServerError);
+        logger.Entries.Should().ContainSingle().Which.Level.Should().Be(LogLevel.Error);
+    }
 }

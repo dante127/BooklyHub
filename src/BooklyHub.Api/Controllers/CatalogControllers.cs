@@ -27,11 +27,11 @@ public class ServicesController : ControllerBase
     [AllowAnonymous]
     public async Task<ActionResult> GetServices([FromQuery] Guid? categoryId, CancellationToken cancellationToken)
     {
-        if (!_tenantContext.TenantId.HasValue) return BadRequest(new { message = "Tenant ID is required." });
+        var tenantId = TenantGuard.RequireId(_tenantContext);
 
         var query = _db.Services
             .AsNoTracking()
-            .Where(s => s.TenantId == _tenantContext.TenantId.Value && s.IsActive);
+            .Where(s => s.TenantId == tenantId && s.IsActive);
 
         if (categoryId.HasValue) query = query.Where(s => s.CategoryId == categoryId.Value);
 
@@ -72,11 +72,11 @@ public class StaffController : ControllerBase
     [AllowAnonymous]
     public async Task<ActionResult> GetStaff([FromQuery] Guid? locationId, [FromQuery] Guid? serviceId, CancellationToken cancellationToken)
     {
-        if (!_tenantContext.TenantId.HasValue) return BadRequest(new { message = "Tenant ID is required." });
+        var tenantId = TenantGuard.RequireId(_tenantContext);
 
         var query = _db.StaffMembers
             .AsNoTracking()
-            .Where(s => s.TenantId == _tenantContext.TenantId.Value && s.IsActive);
+            .Where(s => s.TenantId == tenantId && s.IsActive);
 
         if (locationId.HasValue) query = query.Where(s => s.LocationId == locationId.Value);
         if (serviceId.HasValue) query = query.Where(s => s.StaffServices.Any(ss => ss.ServiceId == serviceId.Value));
@@ -128,11 +128,11 @@ public class CustomersController : ControllerBase
     [HasPermission(Permissions.Customers.Read)]
     public async Task<ActionResult> Search([FromQuery] string? search, [FromQuery] int page = 1, [FromQuery] int pageSize = 20, CancellationToken cancellationToken = default)
     {
-        if (!_tenantContext.TenantId.HasValue) return BadRequest(new { message = "Tenant ID is required." });
+        var tenantId = TenantGuard.RequireId(_tenantContext);
 
         var query = _db.Customers
             .AsNoTracking()
-            .Where(c => c.TenantId == _tenantContext.TenantId.Value);
+            .Where(c => c.TenantId == tenantId);
 
         if (!string.IsNullOrWhiteSpace(search))
         {
@@ -165,12 +165,10 @@ public class CustomersController : ControllerBase
     [HasPermission(Permissions.Customers.Create)]
     public async Task<ActionResult> Create([FromBody] CreateCustomerRequest request, CancellationToken cancellationToken)
     {
-        if (!_tenantContext.TenantId.HasValue) return BadRequest(new { message = "Tenant ID is required." });
-
         var customer = new Customer
         {
             Id = Guid.NewGuid(),
-            TenantId = _tenantContext.TenantId.Value,
+            TenantId = TenantGuard.RequireId(_tenantContext),
             FirstName = request.FirstName,
             LastName = request.LastName,
             Email = request.Email,

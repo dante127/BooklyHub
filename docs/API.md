@@ -14,10 +14,15 @@
 ### 1.1 The Error Envelope
 
 Every failure the API answers is an `application/problem+json` document — including the failures raised
-before any action runs — with one named exception: seven `BadRequest(new { message = … })` guards that
-check for a missing tenant context (`AvailabilityController`, `ReviewsController`, `ReportsController` and
-four in `CatalogControllers`) still answer `application/json` with a single lowercase field. They are the
-open residue of `ENV-01`; until this paragraph was written the sentence above claimed them away.
+before any action runs. A missing tenant context is one of those: every route that needs a tenant asks the
+same guard (`TenantGuard.RequireId`), which throws a `BadHttpRequestException` carrying status `400`, and
+the error boundary maps that type. Before this the ten guards on that condition split three ways (`ENV-01`,
+now closed): seven answered `application/json` with a bare `new { message = … }`, three threw the same
+`BadHttpRequestException` for which no mapping existed and so answered `500` with the contact-support text
+— a client mistake reported as a server fault — and the refusals used three different wordings.
+
+One wording still differs, deliberately: `GET /api/v1/availability` says *"Tenant ID must be specified either
+via context, header, or query."* because that route genuinely has three sources and the others have one.
 
 Which members are present depends on who produced the response, so the table is
 the contract:

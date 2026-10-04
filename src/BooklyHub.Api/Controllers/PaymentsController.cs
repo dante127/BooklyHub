@@ -37,14 +37,7 @@ public class PaymentsController : ControllerBase
         decimal Amount,
         string? Reason = null);
 
-    private Guid GetRequiredTenantId()
-    {
-        if (!_tenantContext.TenantId.HasValue)
-        {
-            throw new BadHttpRequestException("Active tenant context is required.");
-        }
-        return _tenantContext.TenantId.Value;
-    }
+    private Guid GetRequiredTenantId() => TenantGuard.RequireId(_tenantContext);
 
     [HttpGet("outstanding-visits")]
     [HasPermission(Permissions.Payments.Read)]

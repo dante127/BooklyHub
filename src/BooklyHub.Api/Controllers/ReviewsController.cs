@@ -29,14 +29,7 @@ public class ReviewsController : ControllerBase
         int Rating,
         string? Comment = null);
 
-    private Guid GetRequiredTenantId()
-    {
-        if (!_tenantContext.TenantId.HasValue)
-        {
-            throw new BadHttpRequestException("Active tenant context is required.");
-        }
-        return _tenantContext.TenantId.Value;
-    }
+    private Guid GetRequiredTenantId() => TenantGuard.RequireId(_tenantContext);
 
     [HttpPost]
     [Authorize]
@@ -57,11 +50,11 @@ public class ReviewsController : ControllerBase
         [FromQuery] int pageSize = 20,
         CancellationToken cancellationToken = default)
     {
-        if (!_tenantContext.TenantId.HasValue) return BadRequest(new { message = "Tenant ID is required." });
+        var tenantId = TenantGuard.RequireId(_tenantContext);
 
         var query = _db.Reviews
             .AsNoTracking()
-            .Where(r => r.TenantId == _tenantContext.TenantId.Value && r.IsPublished);
+            .Where(r => r.TenantId == tenantId && r.IsPublished);
 
         if (staffId.HasValue) query = query.Where(r => r.StaffId == staffId.Value);
         if (serviceId.HasValue) query = query.Where(r => r.ServiceId == serviceId.Value);

@@ -3,6 +3,7 @@ using System.Text.Json;
 using BooklyHub.Domain.Exceptions;
 using FluentValidation;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.WebUtilities;
 using Serilog.Context;
 
 namespace BooklyHub.Api.Middlewares;
@@ -69,7 +70,19 @@ public class ExceptionHandlingMiddleware
 
     private async Task HandleExceptionAsync(HttpContext context, Exception exception)
     {
-        _logger.LogError(exception, "Unhandled exception occurred: {Message}", exception.Message);
+        // BadHttpRequestException is the framework's own "this request was bad" type and it carries the status it
+        // means, so a refusal of that kind is a client's mistake rather than a server fault: a Warning line and no
+        // stack trace, the same way an aborted request is handled above. The downgrade is deliberately limited to
+        // that type - a thrown NotFoundException or ValidationException still writes an ERROR here, and whether a
+        // mapped 4xx should stop paging anyone is a separate decision, not part of this one.
+        if (exception is BadHttpRequestException { StatusCode: < StatusCodes.Status500InternalServerError })
+        {
+            _logger.LogWarning("Request refused: {Message}", exception.Message);
+        }
+        else
+        {
+            _logger.LogError(exception, "Unhandled exception occurred: {Message}", exception.Message);
+        }
 
         // Headers and the first bytes are already committed, so the status, the content type and a
         // problem document cannot be added to what the client is already parsing. Stop here and leave
@@ -123,6 +136,14 @@ public class ExceptionHandlingMiddleware
                 (int)HttpStatusCode.Unauthorized,
                 "Unauthorized",
                 "You are not authorized to perform this operation.",
+                null
+            ),
+            // The status comes from the exception, not from this switch: the framework raises the same type for a
+            // body it cannot accept, and that one already knows whether it means 400 or 413.
+            BadHttpRequestException badRequestEx => (
+                badRequestEx.StatusCode,
+                ReasonPhrases.GetReasonPhrase(badRequestEx.StatusCode),
+                badRequestEx.Message,
                 null
             ),
             _ => (

@@ -28,14 +28,13 @@ public class AvailabilityController : ControllerBase
         [FromQuery] Guid? tenantId = null,
         CancellationToken cancellationToken = default)
     {
-        var resolvedTenantId = _tenantContext.TenantId ?? tenantId;
-        if (!resolvedTenantId.HasValue)
-        {
-            return BadRequest(new { message = "Tenant ID must be specified either via context, header, or query." });
-        }
+        // The public booking portal is the one caller allowed to name the tenant itself, so this guard's condition
+        // really does differ from every other one in the API and gets to say where to put the value.
+        var resolvedTenantId = TenantGuard.RequireId(_tenantContext.TenantId ?? tenantId,
+            "Tenant ID must be specified either via context, header, or query.");
 
         var query = new GetAvailabilityQuery(
-            resolvedTenantId.Value,
+            resolvedTenantId,
             locationId,
             serviceId,
             staffId,

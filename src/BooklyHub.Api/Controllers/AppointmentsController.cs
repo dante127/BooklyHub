@@ -47,14 +47,7 @@ public class AppointmentsController : ControllerBase
         AppointmentStatus NewStatus,
         string? Reason = null);
 
-    private Guid GetRequiredTenantId()
-    {
-        if (!_tenantContext.TenantId.HasValue)
-        {
-            throw new BadHttpRequestException("Active tenant context is required.");
-        }
-        return _tenantContext.TenantId.Value;
-    }
+    private Guid GetRequiredTenantId() => TenantGuard.RequireId(_tenantContext);
 
     [HttpPost]
     [HasPermission(Permissions.Appointments.Create)]
