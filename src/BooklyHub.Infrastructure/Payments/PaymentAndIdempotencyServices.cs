@@ -121,6 +121,17 @@ public class IdempotencyService : IIdempotencyService
 
         try
         {
+            // An expired row is no longer a promise, but it is still a row carrying this key's primary key:
+            // the read above had stopped serving it while the write below would collide with it. So every retry
+            // that arrived after the window closed re-ran the request and then could not store its own answer —
+            // the replay guarantee silently stopped working for exactly the keys that had been used before.
+            // Guarded on expiry because a row that is still inside its window is somebody else's promise: two
+            // concurrent first-time requests with one key must not have the loser's response overwrite the
+            // winner's, and deleting only the dead row is what leaves the live one to be replayed.
+            await _db.IdempotencyRecords
+                .Where(r => r.Id == key && r.ExpiresAtUtc <= nowUtc)
+                .ExecuteDeleteAsync(cancellationToken);
+
             await _db.SaveChangesAsync(cancellationToken);
 
             await _cache.SetAsync(

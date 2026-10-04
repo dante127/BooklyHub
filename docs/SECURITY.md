@@ -64,6 +64,8 @@ What the sweep deliberately does **not** delete, and why it says so rather than 
 
 Two properties of the sweep are choices worth naming. It runs in the **system scope**, platform-wide rather than per tenant, because every predicate is a column age — a tenant that has been quiet for a year is not owed a sweep, and one that reads only its own tenant's rows would delete nothing while still logging a number. And it takes **no application lock**: unlike the dispatcher, there is nothing here a second instance could do twice harmfully, since two instances deleting the same aged rows reach the same end state and the loser simply finds nothing. A duplicated delivery is a bug; a duplicated purge is not.
 
+**An expired row is replaced, not merely outlived** (`IDEM-01`). The replay window used to stop a row from being *read* without stopping it from being *there*, and the primary key is the same string either way: a key used again after its window closed re-ran its request and then could not store the answer it had just given, because the dead row was still sitting on that key. The save now clears the row whose window has closed before writing the new one, so the response a caller was actually given is the response the next retry replays. The clear is guarded on expiry, and that guard is the difference between fixing the reuse case and breaking the concurrent one: two callers holding one key both miss the read and both run, and the loser must not delete the winner's still-live row — its response is the one the key promises to hand back. Both halves are pinned by facts on the stored row itself, since the HTTP answer looks the same either way.
+
 ---
 
 ## 2. Granular Permission-Based Authorization (RBAC)

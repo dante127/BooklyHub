@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using BooklyHub.Api.Controllers;
+using BooklyHub.Application.Payments;
 using BooklyHub.Application.Security;
 using BooklyHub.Domain.Entities.Customers;
 using BooklyHub.Domain.Entities.Organizations;
@@ -20,9 +21,12 @@ using Xunit;
 namespace BooklyHub.IntegrationTests.Security;
 
 /// <summary>
-/// An idempotency key is a promise a tenant makes to itself. These tests pin the two ways that promise was
-/// broken: a key stored without its tenant let one tenant replay another tenant's cached response, and a
-/// key checked without its payload let a caller reuse it for a different request and get the old answer.
+/// An idempotency key is a promise a tenant makes to itself. These tests pin the ways that promise was broken:
+/// a key stored without its tenant let one tenant replay another tenant's cached response, a key checked without
+/// its payload let a caller reuse it for a different request and get the old answer, a key whose window had closed
+/// was still refused to the response that replaced it (<c>IDEM-01</c>), and a save that cleared the key's row
+/// without asking whether that row was still alive would have let the loser of a concurrent pair overwrite the
+/// winner.
 /// </summary>
 public class IdempotencyScopeTests : IClassFixture<BooklyHubWebApplicationFactory>
 {
@@ -281,6 +285,110 @@ public class IdempotencyScopeTests : IClassFixture<BooklyHubWebApplicationFactor
         finally
         {
             _factory.Clock.Release();
+        }
+    }
+
+    /// <summary>
+    /// IDEM-01: the window closing stopped the row from being *read* but did not stop it being *there*, and the
+    /// primary key is the same string either way. Every retry that arrived after the window re-ran its request and
+    /// then silently failed to record what it had answered, so the key stopped being replayable for as long as the
+    /// dead row stayed. The stored deadline moving forward is the observable half of that; the re-run is not
+    /// allowed to leave the caller with an answer nobody kept.
+    /// </summary>
+    [Fact]
+    public async Task AKeyReusedAfterItsWindow_MustStoreTheAnswerThatReplacedTheExpiredRow()
+    {
+        var graph = await SeedGraphAsync("reused-window-tenant");
+        var key = Guid.NewGuid().ToString("N");
+
+        try
+        {
+            var first = await BookAsync(graph, Slot(10), key);
+            Assert.True(first.StatusCode == HttpStatusCode.Created,
+                $"expected 201, got {(int)first.StatusCode}: {await first.Content.ReadAsStringAsync()}");
+
+            var original = await ReadRecordAsync(graph, key);
+            original.Should().NotBeNull();
+            var originalExpiry = original!.ExpiresAtUtc;
+
+            _factory.Clock.AdvanceBy(TimeSpan.FromHours(25));
+
+            var retry = await BookAsync(graph, Slot(10), key);
+            var retryBody = await retry.Content.ReadAsStringAsync();
+            Assert.True(retry.StatusCode == HttpStatusCode.Created,
+                $"the re-run must answer on its own, got {(int)retry.StatusCode}: {retryBody}");
+            retry.Headers.Contains("X-Idempotent-Replay").Should().BeFalse(
+                "the window had closed, so this request really executed");
+
+            var replaced = await ReadRecordAsync(graph, key);
+            replaced.Should().NotBeNull("a key that was used again is a key with a response to keep");
+            replaced!.ExpiresAtUtc.Should().BeAfter(originalExpiry,
+                "the expired row is replaced rather than collided with, so what is stored is what the caller was answered");
+            replaced.ResponseBody.Should().Be(retryBody,
+                "the body a replay hands back is the body this re-run produced, byte for byte");
+            (replaced.ExpiresAtUtc - replaced.CreatedAtUtc).Should().Be(RetentionPolicy.IdempotencyWindow,
+                "the replacement carries the same window the middleware promises, not the dead row's");
+
+            var replay = await BookAsync(graph, Slot(10), key);
+            replay.Headers.Contains("X-Idempotent-Replay").Should().BeTrue(
+                "one re-run buys one execution: the retry after it must be served from what it stored");
+            (await CountAppointmentsAsync(graph.TenantId)).Should().Be(1,
+                "and neither layer has booked the patient twice");
+        }
+        finally
+        {
+            _factory.Clock.Release();
+        }
+    }
+
+    /// <summary>
+    /// The other half of the same write, and the half that a fix could easily destroy while fixing the first:
+    /// the row being cleared has to be the dead one. Two callers holding one key concurrently both miss the
+    /// read, both run, and the loser arrives at the store while the winner's row is still inside its window.
+    /// Deleting on key alone would hand the winner's response to the loser's failure, so a later retry would
+    /// replay an answer that is not the one that booked the appointment.
+    /// </summary>
+    [Fact]
+    public async Task ASave_MustNotClearALiveRowThatSharesItsKey()
+    {
+        var graph = await SeedGraphAsync("live-row-tenant");
+        var scopedKey = $"{graph.TenantId:N}:{Guid.NewGuid():N}";
+
+        var winnerBody = "{\"appointmentId\":\"00000000-0000-0000-0000-000000000001\",\"winner\":true}";
+        // One clock reading for both the row and the expectation: the unpinned test clock drifts by the
+        // microsecond, and a `datetime2` column compared against a second reading would fail on the drift.
+        var seededAt = _factory.Clock.UtcNow;
+        var winnerExpiry = seededAt.Add(RetentionPolicy.IdempotencyWindow);
+
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var seedDb = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            seedDb.IdempotencyRecords.Add(new IdempotencyRecord(
+                scopedKey, graph.TenantId, "hash-of-the-winner", 201, winnerBody,
+                RetentionPolicy.IdempotencyWindow, seededAt));
+            await seedDb.SaveChangesAsync();
+        }
+
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var service = scope.ServiceProvider.GetRequiredService<IIdempotencyService>();
+            await service.SaveEntryAsync(scopedKey, graph.TenantId, "hash-of-the-loser", 409,
+                "{\"detail\":\"this is not the response that booked it\"}",
+                RetentionPolicy.IdempotencyWindow, CancellationToken.None);
+        }
+
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var readDb = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            var stored = await readDb.IdempotencyRecords.AsNoTracking().FirstOrDefaultAsync(r => r.Id == scopedKey);
+
+            stored.Should().NotBeNull("a key that was answered once is a key with a stored answer");
+            stored!.ResponseBody.Should().Be(winnerBody,
+                "the loser of a concurrent pair may not overwrite the response a replay owes");
+            stored.RequestHash.Should().Be("hash-of-the-winner",
+                "and the payload check on the next retry must still be measured against the winner's request");
+            stored.ExpiresAtUtc.Should().Be(winnerExpiry,
+                "the row that survives is the row whose window is still open");
         }
     }
 }
