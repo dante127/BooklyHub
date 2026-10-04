@@ -1,3 +1,4 @@
+using BooklyHub.Api.Middlewares;
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Application.Security;
 using BooklyHub.Domain.Entities.Identity;
@@ -24,6 +25,7 @@ public class AuthController : ControllerBase
     private readonly IRefreshTokenProtector _protector;
     private readonly ICurrentUser _currentUser;
     private readonly IClock _clock;
+    private readonly ILogger<AuthController> _logger;
 
     public AuthController(
         IApplicationDbContext db,
@@ -31,7 +33,8 @@ public class AuthController : ControllerBase
         IJwtTokenGenerator tokenGenerator,
         IRefreshTokenProtector protector,
         ICurrentUser currentUser,
-        IClock clock)
+        IClock clock,
+        ILogger<AuthController> logger)
     {
         _db = db;
         _passwordHasher = passwordHasher;
@@ -39,6 +42,7 @@ public class AuthController : ControllerBase
         _protector = protector;
         _currentUser = currentUser;
         _clock = clock;
+        _logger = logger;
     }
 
     public record LoginRequest(string Email, string Password);
@@ -90,6 +94,55 @@ public class AuthController : ControllerBase
         }
 
         return record;
+    }
+
+    /// <summary>
+    /// SEC-05b: revokes every row this spent credential leads to, following the successor links rotation already
+    /// writes. The walk runs <em>through</em> already-revoked rows rather than stopping at the first one, because
+    /// that is the only shape the signal ever arrives in: an honest client has consumed every link behind the
+    /// stolen copy, so the row the replay points at is revoked before the replay is ever seen, and the live
+    /// credential sits at the far end of that run of consumed rows. Stopping at a revoked link would burn nothing
+    /// on the case the finding is about. A row's original <c>RevokedAtUtc</c> is left alone — overwriting it would
+    /// destroy the record of when the honest client spent it.
+    ///
+    /// One link is one redemption, and a redemption hands out roughly <c>Jwt:ExpirationMinutes</c> of access, so
+    /// seven days of one honest client is on the order of 168 links; the bound is not a policy threshold, it is
+    /// the guard against a cycle the data cannot form — a link points at a row created after it, and the digest
+    /// column is unique-indexed.
+    /// </summary>
+    private async Task BurnChainAsync(RefreshToken spent, CancellationToken cancellationToken)
+    {
+        const int MaxChainLinks = 500;
+
+        var revoked = 0;
+        var next = spent.ReplacedByToken;
+
+        // Counted in steps, not in revocations: the run behind a replayed link is mostly already-revoked rows, and
+        // a bound that only fires on newly revoked ones would let an exhausted chain be walked without limit.
+        for (var steps = 0; next != null && steps < MaxChainLinks; steps++)
+        {
+            var link = next;
+            var row = await _db.RefreshTokens
+                .FirstOrDefaultAsync(rt => rt.Token == link, cancellationToken);
+
+            if (row == null) break;
+
+            if (!row.IsRevoked)
+            {
+                row.RevokedAtUtc = _clock.UtcNow;
+                revoked++;
+            }
+
+            next = row.ReplacedByToken;
+        }
+
+        await _db.SaveChangesAsync(cancellationToken);
+
+        _logger.LogWarning(
+            "Refresh token reuse detected for user {UserId}: {RevokedLinks} later credential(s) burned with it. Correlation-Id {CorrelationId}",
+            spent.UserId,
+            revoked,
+            HttpContext.Response.Headers[CorrelationIdMiddleware.CorrelationIdHeader]);
     }
 
     [HttpPost("login")]
@@ -156,6 +209,13 @@ public class AuthController : ControllerBase
             || !tokenRecord.IsActive(_clock.UtcNow)
             || tokenRecord.User is not { IsActive: true })
         {
+            // SEC-05b: a credential that was already spent being offered again is the one signal this table can
+            // give, and a refusal alone throws it away — the thief keeps the rest of the chain and the owner sees
+            // nothing. Burn the chain first, then refuse in exactly the same words as any other refusal, so the
+            // signal stays in the data and not in the response.
+            if (tokenRecord is { IsRevoked: true, ReplacedByToken: not null })
+                await BurnChainAsync(tokenRecord, cancellationToken);
+
             return Refusal("Invalid or expired refresh token.");
         }
 

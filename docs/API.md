@@ -102,6 +102,16 @@ The sample above is stale in one way worth naming: the action returns `AuthRespo
 ### `POST /api/v1/auth/refresh-token`
 Exchanges a live refresh token for a new access token and a **new** refresh token; the old one is revoked in the same write, so replaying it gets a `401`.
 
+**A replayed credential ends the chain it belongs to** (`SEC-05b`). Redemption of a row that is already revoked and
+records which credential replaced it revokes every later row in that chain before the `401` is written, following the
+successor links through the rows honest rotation already spent. The response is unchanged — the same
+`Invalid or expired refresh token.` a token that was never issued gets — so a caller cannot tell a detected replay
+from an expired token; the record of it is the `LogWarning` carrying the user id, the number of credentials burned
+and the request's `correlationId`. For a client this means one thing concretely: after a refresh call fails on a
+token that used to work, **every refresh token from that session is dead**, so the app must sign in again rather
+than retry the copies it held before. A burn revokes and mints nothing, and it does not stop access tokens already
+issued from the chain — those run out on their own (`Jwt:ExpirationMinutes`).
+
 **Request Payload:**
 ```json
 { "refreshToken": "4f5c9e2b-7c51-4e76-88cf-9a9be8525b6a" }
