@@ -21,6 +21,7 @@ public class AuthController : ControllerBase
     private readonly IApplicationDbContext _db;
     private readonly IPasswordHasher _passwordHasher;
     private readonly IJwtTokenGenerator _tokenGenerator;
+    private readonly IRefreshTokenProtector _protector;
     private readonly ICurrentUser _currentUser;
     private readonly IClock _clock;
 
@@ -28,12 +29,14 @@ public class AuthController : ControllerBase
         IApplicationDbContext db,
         IPasswordHasher passwordHasher,
         IJwtTokenGenerator tokenGenerator,
+        IRefreshTokenProtector protector,
         ICurrentUser currentUser,
         IClock clock)
     {
         _db = db;
         _passwordHasher = passwordHasher;
         _tokenGenerator = tokenGenerator;
+        _protector = protector;
         _currentUser = currentUser;
         _clock = clock;
     }
@@ -55,6 +58,39 @@ public class AuthController : ControllerBase
         title: "Unauthorized",
         statusCode: StatusCodes.Status401Unauthorized,
         instance: HttpContext.Request.Path.Value);
+
+    /// <summary>
+    /// SEC-05: the column stores a digest of the credential, so the presented string is digested before it is
+    /// compared and a read of the table authorizes nothing. The second read is the transition, not a permanent
+    /// compatibility branch: rows written before this change carry the wire string itself, and each one is
+    /// rewritten to its digest the moment it is redeemed — which is how the table empties of plaintext without
+    /// every session of every user being destroyed on deploy day.
+    /// </summary>
+    private async Task<RefreshToken?> FindPresentedTokenAsync(string presented, CancellationToken cancellationToken)
+    {
+        async Task<RefreshToken?> ByStoredValue(string stored) => await _db.RefreshTokens
+            .Include(rt => rt.User)
+                .ThenInclude(u => u!.UserRoles)
+                    .ThenInclude(ur => ur.Role!)
+                        .ThenInclude(r => r.RolePermissions)
+            .FirstOrDefaultAsync(rt => rt.Token == stored, cancellationToken);
+
+        var record = await ByStoredValue(_protector.Protect(presented));
+        if (record != null) return record;
+
+        record = await ByStoredValue(presented);
+        if (record != null)
+        {
+            record.Token = _protector.Protect(presented);
+
+            // A row old enough to hold a plaintext credential holds a plaintext successor link too; leaving that
+            // behind would keep the next session's credential recoverable from this row.
+            if (record.ReplacedByToken != null)
+                record.ReplacedByToken = _protector.Protect(record.ReplacedByToken);
+        }
+
+        return record;
+    }
 
     [HttpPost("login")]
     [AllowAnonymous]
@@ -91,7 +127,7 @@ public class AuthController : ControllerBase
         {
             Id = Guid.NewGuid(),
             UserId = user.Id,
-            Token = refreshTokenString,
+            Token = _protector.Protect(refreshTokenString),
             ExpiresAtUtc = _clock.UtcNow.AddDays(7),
             CreatedAtUtc = _clock.UtcNow
         };
@@ -110,12 +146,7 @@ public class AuthController : ControllerBase
     [EnableRateLimiting("auth")]
     public async Task<ActionResult<AuthResponse>> RefreshToken([FromBody] RefreshTokenRequest request, CancellationToken cancellationToken)
     {
-        var tokenRecord = await _db.RefreshTokens
-            .Include(rt => rt.User)
-                .ThenInclude(u => u!.UserRoles)
-                    .ThenInclude(ur => ur.Role!)
-                        .ThenInclude(r => r.RolePermissions)
-            .FirstOrDefaultAsync(rt => rt.Token == request.RefreshToken, cancellationToken);
+        var tokenRecord = await FindPresentedTokenAsync(request.RefreshToken, cancellationToken);
 
         // Four reasons, one answer: never issued, expired, revoked, or the account behind it is no longer
         // allowed to sign in. `IsActive` was a login-only rule, so deactivating a user was a delay of up to the
@@ -131,7 +162,7 @@ public class AuthController : ControllerBase
         // Revoke current token and issue new pair (rotation)
         tokenRecord.RevokedAtUtc = _clock.UtcNow;
         var newRefreshToken = _tokenGenerator.GenerateRefreshToken();
-        tokenRecord.ReplacedByToken = newRefreshToken;
+        tokenRecord.ReplacedByToken = _protector.Protect(newRefreshToken);
 
         var user = tokenRecord.User;
         var roles = user.UserRoles.Select(ur => ur.Role!.Name).Distinct().ToList();
@@ -146,7 +177,7 @@ public class AuthController : ControllerBase
         {
             Id = Guid.NewGuid(),
             UserId = user.Id,
-            Token = newRefreshToken,
+            Token = _protector.Protect(newRefreshToken),
             ExpiresAtUtc = _clock.UtcNow.AddDays(7),
             CreatedAtUtc = _clock.UtcNow
         });

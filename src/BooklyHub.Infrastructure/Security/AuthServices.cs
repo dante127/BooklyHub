@@ -102,3 +102,15 @@ public class PasswordHasher : IPasswordHasher
         return CryptographicOperations.FixedTimeEquals(actualHash, expectedHash);
     }
 }
+
+/// <summary>
+/// SEC-05. A refresh token is 64 cryptographically random bytes, so a plain digest is the right construction and
+/// the password hasher's salt and iteration count would buy nothing here: they exist to make a *human* secret
+/// expensive to guess, and there is nothing to guess at in this input. Lowercase hex is 64 characters, which fits
+/// the existing <c>nvarchar(256)</c> column and its unique index, so the change costs no schema migration.
+/// </summary>
+public class RefreshTokenProtector : IRefreshTokenProtector
+{
+    public string Protect(string token) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
+}

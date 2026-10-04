@@ -120,7 +120,11 @@ public sealed class RefreshTokenWindowTests : IAsyncLifetime
 
         using var scope = _factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-        var rows = await db.RefreshTokens.IgnoreQueryFilters().Where(t => t.Token == original).ToListAsync();
+        var protector = scope.ServiceProvider.GetRequiredService<IRefreshTokenProtector>();
+
+        // SEC-05: the row is keyed by the digest of the string the client presented, not by that string.
+        var rows = await db.RefreshTokens.IgnoreQueryFilters()
+            .Where(t => t.Token == protector.Protect(original)).ToListAsync();
         rows.Should().ContainSingle();
         rows[0].RevokedAtUtc.Should().NotBeNull();
     }
