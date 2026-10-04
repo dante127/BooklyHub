@@ -67,6 +67,7 @@ To guarantee sub-second responses even with millions of rows across hundreds of 
 | `IX_Appointments_Tenant_Staff_TimeRange` | `(TenantId, StaffId, StartAtUtc, EndAtUtc)` | High-frequency availability overlap checks and calendar queries. |
 | `IX_Appointments_Tenant_Customer_StartAt` | `(TenantId, CustomerId, StartAtUtc)` | Customer booking history and duplicate appointment detection. |
 | `IX_Appointments_Tenant_Status_StartAt` | `(TenantId, Status, StartAtUtc)` | Operational dashboards, the background reminder dispatcher, and the no-show sweep. |
+| `IX_Appointments_Tenant_Location_EndAt` | `(TenantId, LocationId, EndAtUtc)` INCLUDE `(StartAtUtc, StaffId, Status)` | The availability guard's occupancy read for one location over a forward window. |
 
 The no-show sweep asks for `TenantId = @t AND Status = Confirmed AND EndAtUtc BETWEEN @floor AND @deadline`,
 ordered by `EndAtUtc`. It seeks on the first two columns of the index above and applies `EndAtUtc` as a
@@ -81,6 +82,29 @@ That gap is now a surface: `GET /api/v1/payments/outstanding-visits` asks for
 payment aggregate per candidate row — and it runs while a human pages through it rather than once every
 15 minutes. Still the intended shape for a small tenant's open book; the same
 `(TenantId, Status, EndAtUtc)` index is what both the sweep and the queue are waiting on.
+
+The availability guard reads a different thing: one location's occupancy for the window it is about to answer —
+`TenantId = @t AND LocationId = @l AND Status <> Cancelled AND StartAtUtc < @to AND EndAtUtc > @from` — and until
+PERF-09 nothing on the table led with `(TenantId, LocationId)`. Measured with `SET STATISTICS IO` on the guard's own
+statement (60 000 rows in the table, 5 000 of them at the measured location, spread over four years, and 5 000
+resource rows so the child join is not free): **363 logical reads**, whichever window was asked for — tomorrow, a
+year, last week. That cost was the optimizer intersecting three indexes (`IX_Appointments_LocationId`,
+`IX_Appointments_Tenant_Staff_TimeRange`, `IX_Appointments_Tenant_Status_StartAt`) because an overlap predicate
+carries two range columns and a nonclustered index can seek only one. `IX_Appointments_Tenant_Location_EndAt`
+replaces that with a single seek and **29 reads**, and keeps the projection in `INCLUDE` so no key lookup comes back.
+
+`EndAtUtc` was chosen as the seekable column on a scaling argument, not on the measured gap: at this distribution
+leading with `StartAtUtc` cost 35 reads for a tomorrow window and 47 for a one-year window, against 29 for
+`EndAtUtc` in every window. Both beat the old shape by an order of magnitude; they differ in *what they grow with*.
+Seeking `StartAtUtc < @to` must walk everything the location booked before the window closes — its whole history —
+while `EndAtUtc > @from` walks the forward tail, which the tenant's own `MaxAdvanceBookingDays` bounds. Rejected by
+the same measurement: the same keys without the `INCLUDE` set (348 reads — the win was coverage, not column
+choice), a bare `(TenantId, LocationId, StartAtUtc)` (352), and `(TenantId, LocationId, Status, StartAtUtc)` (58 —
+`<>` cannot seek, so it opens two ranges and reads the location twice). Pinned by
+`OccupancyIndexTests.Occupancy_index_must_lead_with_the_location_seek_on_the_forward_bound_and_cover_the_projection`
+and by `…Occupancy_read_must_reach_appointments_through_one_access_path_and_read_a_fraction_of_the_table`, which
+drives the real guard and asserts its read stays under a quarter of the clustered index (26 pages of 321 at the
+seeded volume; 300 without the `INCLUDE` set, 306 with no index at all).
 
 ### 3.2 Staff & Availability Indexing
 | Index Name | Columns | Purpose |

@@ -317,6 +317,14 @@ public class OperationalConfigurations :
         builder.HasIndex(a => new { a.TenantId, a.CustomerId, a.StartAtUtc })
             .HasDatabaseName("IX_Appointments_Tenant_Customer_StartAt");
 
+        // Occupancy read for one location over a forward window. A nonclustered index can seek only one range
+        // column, so EndAtUtc leads: bounded by the tenant's booking horizon rather than by its accumulated
+        // history, which StartAtUtc would drag in. The INCLUDE set is where the measured win came from
+        // (363 -> 29 logical reads) — without it the optimizer keeps intersecting three indexes and key-lookup.
+        builder.HasIndex(a => new { a.TenantId, a.LocationId, a.EndAtUtc })
+            .IncludeProperties(a => new { a.StartAtUtc, a.StaffId, a.Status })
+            .HasDatabaseName("IX_Appointments_Tenant_Location_EndAt");
+
         builder.HasIndex(a => new { a.TenantId, a.Status, a.StartAtUtc })
             .HasDatabaseName("IX_Appointments_Tenant_Status_StartAt");
 

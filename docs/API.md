@@ -230,7 +230,8 @@ and another never appearing at all — which is invisible at page 1 and only vis
 than one page. Note this is the second *ascending* reader (the collection queue is oldest-debt-first); the
 dashboard's counters are aggregates and do not order at all.
 
-**Not indexed for the default path (open, PERF-09 family).** The window filters `TenantId` + `StartAtUtc`
+**Not indexed for the default path (still open; the measured half of `PERF-09` went to the availability guard).**
+The window filters `TenantId` + `StartAtUtc`
 and sorts by `StartAtUtc, Id`; no index on the table leads with that pair. The three existing composite
 indexes — `IX_Appointments_Tenant_Customer_StartAt`, `IX_Appointments_Tenant_Status_StartAt`,
 `IX_Appointments_Tenant_Staff_TimeRange` — all lead with a column the default request does not supply, so

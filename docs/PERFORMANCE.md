@@ -59,3 +59,34 @@ All list endpoints enforce standardized pagination:
 Every CQRS Query in BooklyHub applies `.AsNoTracking()`:
 - Bypasses the EF Core identity map and snapshot change tracking dictionary.
 - Yields a **30-45% reduction in CPU allocation** and **50% lower garbage collection overhead** on high-traffic read paths.
+
+---
+
+## 5. Index Changes Are Measured, Not Proposed
+
+A new index taxes every insert on the table, so `PERF-09` set the bar before adding one: **at most one index per
+read, and only if it removes a sort, a key lookup, or at least half the logical reads.** Anything else is written
+down and left alone.
+
+How to reproduce the measurement, on the throwaway path only:
+
+1. Seed volume through the fixture's own private database (`BooklyHubWebApplicationFactory` creates one per test
+   class, so a heavy probe never touches the developer database), then `UPDATE STATISTICS … WITH FULLSCAN` — the
+   optimizer's choices are only as good as the histogram it reads.
+2. Bind a tenant before calling the service (`ITenantContext.SetTenant`). With no tenant bound the global query
+   filter returns zero rows and the guard short-circuits before the read being measured.
+3. Capture the statement the code actually sends — `_factory.QueryInterceptor.ExecutedCommands` — instead of
+   handwriting an equivalent. Then replay that text with `SET STATISTICS IO, XML ON` and one candidate index at a
+   time, and read the per-table `logical reads` from the connection's `InfoMessage` channel after the reader closes.
+4. Two things on that channel are not what they look like: `SET STATISTICS XML` yields the *estimated* plan, so
+   operator costs are estimates and only the read counts are actual; and `sys.dm_exec_query_stats` returned no row
+   for a replayed batch even with `VIEW SERVER STATE` granted, so plan-cache totals are not a usable second source
+   here.
+5. Do not trust a cost that a single window shape produced. The `Appointments` overlap read asks for two range
+   columns (`StartAtUtc < @to`, `EndAtUtc > @from`) and a nonclustered index can seek one; the column that leads
+   decides whether the read grows with the location's history or with the tenant's booking horizon. Estimates are
+   nearly identical for both — `SET STATISTICS IO` across four window shapes is what separates them.
+
+The `Appointments` result is in `DATABASE.md` §3.1. What remains open in the same family, deliberately unindexed
+because no volume was measured behind it: the appointment list's default page (`API.md`), the no-show sweep and the
+outstanding-visits queue (`DATABASE.md` §3.1), and the three aged-row deletes in the retention sweep (§5).
