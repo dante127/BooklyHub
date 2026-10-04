@@ -48,10 +48,12 @@ Three writers produce these documents and they are deliberately not merged:
   answer their `401` with `ControllerBase.Problem`, so they get the service's `type` and `traceId` along with
   the `detail` only they can supply. Until this was fixed they returned `Unauthorized(new { message })`, an
   `ObjectResult` that no problem writer ever saw: `application/json`, one lowercase field, no correlation id
-  in the body (`ENV-01`). Login additionally answers all three refusal reasons — no such user, wrong
-  password, inactive account — with the one `detail` "Invalid email or password.", because distinguishing
-  them tells a caller which addresses exist (`SEC-04`). A deactivated account therefore gets no explanation;
-  an administrator reads `IsActive` from the user list instead.
+  in the body (`ENV-01`). Login additionally answers all four refusal reasons — no such user, wrong
+  password, inactive account, account inside its lockout window (`SEC-04(b)`) — with the one `detail`
+  "Invalid email or password.", because distinguishing them tells a caller which addresses exist. A
+  deactivated account therefore gets no explanation; an administrator reads `IsActive` from the user list
+  instead. A locked-out one gets no explanation either: the streak is a pair of columns on the `Users` row
+  (`FailedLoginCount`, `LockoutUntilUtc`), and it is not part of any response body.
 
 For a client that means: parse `status`, `title`, `instance` and `correlationId` unconditionally, and treat
 `detail`, `errors`, `rule`, `type` and `traceId` as present only where the table says so.
@@ -98,6 +100,21 @@ Authenticates a user and returns an access token with a rotating refresh token.
 ```
 
 The sample above is stale in one way worth naming: the action returns `AuthResponse(accessToken, refreshToken, expiresAtUtc, user)` — a nested `user` object — not these flat `userId`/`tenantId`/`fullName` keys. Tracked as `DOC-03`; the endpoint below is described from the code, not from this block.
+
+**Five wrong passwords close the door on the account, not on the address** (`SEC-04(b)`). After five failed sign-ins
+for one address inside fifteen minutes, that account refuses even the *correct* password for fifteen minutes, whoever
+knocks and from whichever address. The 10-per-minute tier could not be this defence: a threshold above ten permits is
+unreachable from one machine before the tier answers first — measured before the change, ten wrong passwords all
+returned `401` and the owner's own correct attempt, eleventh in the minute, was refused `429`
+(`LoginLockoutPolicy`, columns added by migration `20261004083238_AddUserLoginLockout`).
+
+To a client it looks exactly like a wrong password: the same `401`, the same `Invalid email or password.` body, the
+same cost, because the password is still verified on the locked path. Nothing names the lockout — no status, header or
+detail — since one would be an answer about which addresses exist *and* are being kept out of them. So three rules are
+worth knowing without asking the API: a mistype older than the window is not part of this streak, a sign-in that gets
+in clears the streak, and a failure while a lockout is open does not push its deadline back. The penalty lifts by
+itself and needs no administrator; it also ends no session — refresh tokens the account already holds keep refreshing,
+which is `/auth/logout` below.
 
 ### `POST /api/v1/auth/refresh-token`
 Exchanges a live refresh token for a new access token and a **new** refresh token; the old one is revoked in the same write, so replaying it gets a `401`.

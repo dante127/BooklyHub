@@ -158,15 +158,28 @@ public class AuthController : ControllerBase
                     .ThenInclude(r => r.RolePermissions)
             .FirstOrDefaultAsync(u => u.Email == request.Email && !u.IsDeleted, cancellationToken);
 
-        // One answer for three reasons — no such user, wrong password, inactive account. The password is hashed
-        // before the activity check on every path that reaches it, so collapsing the branches does not hand the
-        // caller a cheaper question than the body already does.
+        var nowUtc = _clock.UtcNow;
+
+        // The password is verified on every path that reaches a known address, including one that is locked out: a
+        // refusal that skips the hash answers in about a millisecond instead of the fifty-odd one costs, and that
+        // gap would be a cheaper question than the body already permits.
+        var passwordMatches = user != null && _passwordHasher.VerifyPassword(request.Password, user.PasswordHash);
+
+        // One answer for four reasons: no such user, wrong password, inactive account, account inside its lockout
+        // window (`SEC-04(b)`). A 423 or a distinct detail would announce that this address exists *and* that
+        // somebody is being kept out of it — the oracle the rest of SEC-04 was spent closing.
         if (user == null
-            || !_passwordHasher.VerifyPassword(request.Password, user.PasswordHash)
-            || !user.IsActive)
+            || !passwordMatches
+            || !user.IsActive
+            || LoginLockoutPolicy.IsLockedOut(user.LockoutUntilUtc, nowUtc))
         {
+            if (user != null && !passwordMatches)
+                await RecordFailedLoginAsync(user, nowUtc, cancellationToken);
+
             return Refusal(InvalidCredentials);
         }
+
+        await ResetLoginLockoutAsync(user, nowUtc, cancellationToken);
 
         var roles = user.UserRoles.Select(ur => ur.Role!.Name).Distinct().ToList();
         var permissions = user.UserRoles
@@ -187,13 +200,50 @@ public class AuthController : ControllerBase
         };
 
         _db.RefreshTokens.Add(refreshToken);
-        user.LastLoginAtUtc = _clock.UtcNow;
 
         await _db.SaveChangesAsync(cancellationToken);
 
         var userDto = new UserDto(user.Id, user.Email, user.FirstName, user.LastName, user.TenantId, roles, permissions);
         return Ok(new AuthResponse(accessToken, refreshTokenString, _clock.UtcNow.AddMinutes(60), userDto));
     }
+
+    /// <summary>
+    /// SEC-04(b): writes the streak forward and opens a lockout when the threshold is reached, as one statement that
+    /// touches only the columns the auth path owns. The guard is a compare-and-swap on the count this request read:
+    /// a losing swap writes nothing, because whoever moved that count first reported a real event this refusal never
+    /// saw. Without it, a fifth failure decided on a four-deep streak could land after its owner signed in elsewhere
+    /// and lock out the very account the rule exists to protect.
+    /// </summary>
+    private Task RecordFailedLoginAsync(User user, DateTime nowUtc, CancellationToken cancellationToken)
+    {
+        var next = LoginLockoutPolicy.NextFailedCount(user.FailedLoginCount, user.LastFailedLoginAtUtc, nowUtc);
+        var lockoutUntil = LoginLockoutPolicy.LockoutUntil(next, user.LockoutUntilUtc, nowUtc);
+
+        return _db.Users
+            .Where(u => u.Id == user.Id && u.FailedLoginCount == user.FailedLoginCount)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(u => u.FailedLoginCount, next)
+                .SetProperty(u => u.LastFailedLoginAtUtc, nowUtc)
+                .SetProperty(u => u.LockoutUntilUtc, lockoutUntil)
+                .SetProperty(u => u.LastModifiedAtUtc, nowUtc)
+                .SetProperty(u => u.LastModifiedBy, "auth:login"), cancellationToken);
+    }
+
+    /// <summary>
+    /// A sign-in that got in says the account is not being guessed, so the streak and any deadline go with it.
+    /// Set-based for the same reason as the failure write, and it carries <c>LastLoginAtUtc</c> because that is now
+    /// the only place the auth path records a successful entry.
+    /// </summary>
+    private Task ResetLoginLockoutAsync(User user, DateTime nowUtc, CancellationToken cancellationToken) =>
+        _db.Users
+            .Where(u => u.Id == user.Id)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(u => u.FailedLoginCount, 0)
+                .SetProperty(u => u.LastFailedLoginAtUtc, (DateTime?)null)
+                .SetProperty(u => u.LockoutUntilUtc, (DateTime?)null)
+                .SetProperty(u => u.LastLoginAtUtc, nowUtc)
+                .SetProperty(u => u.LastModifiedAtUtc, nowUtc)
+                .SetProperty(u => u.LastModifiedBy, "auth:login"), cancellationToken);
 
     [HttpPost("refresh-token")]
     [AllowAnonymous]

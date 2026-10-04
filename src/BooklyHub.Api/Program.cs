@@ -106,7 +106,8 @@ builder.Services.AddRateLimiter(options =>
     // docs/SECURITY.md 3.1 promised this tier and no code implemented it, so login spent the general 100/min
     // bucket like any other request (measured: 95 unmatched-route GETs left exactly five permits for the next
     // twenty login attempts). The partition is the address, not the account, because a limiter counts requests
-    // and cannot know whether one failed: per-account backoff is SEC-04's failure counting, not this.
+    // and cannot know whether one failed. That is why the threshold here is not the account's defence: SEC-04(b)
+    // counts failures on the user row and answers below this limit (`LoginLockoutPolicy`).
     options.AddPolicy(AuthRateLimitPolicy, httpContext =>
         RateLimitPartition.GetFixedWindowLimiter(
             $"{AuthRateLimitPolicy}:{httpContext.Connection.RemoteIpAddress?.ToString() ?? "anonymous"}",

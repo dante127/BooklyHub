@@ -13,6 +13,13 @@ public class User : AggregateRoot<Guid>, IAuditableEntity, ISoftDeletable
     public bool IsActive { get; set; } = true;
     public DateTime? LastLoginAtUtc { get; set; }
 
+    // SEC-04(b): the streak of wrong passwords inside the current window, and the deadline it opened if it reached
+    // the threshold. Owned by LoginLockoutPolicy, and written only by the auth path's own guarded update — see
+    // AuthController.RecordFailedLoginAsync for what that guard is against.
+    public int FailedLoginCount { get; set; }
+    public DateTime? LastFailedLoginAtUtc { get; set; }
+    public DateTime? LockoutUntilUtc { get; set; }
+
     public string FullName => $"{FirstName} {LastName}".Trim();
 
     public ICollection<UserRole> UserRoles { get; set; } = [];
