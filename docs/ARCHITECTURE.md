@@ -90,3 +90,5 @@ All `POST` and `PUT` endpoints accept an optional or required `Idempotency-Key` 
 - In-flight requests are tracked to prevent duplicate concurrent submissions.
 - Completed responses are cached with HTTP status code and response payload.
 - Network re-transmissions receive the exact previous result immediately without executing redundant database writes or payment transactions.
+- The key is scoped by tenant (`<tenantId:N>:<key>`, or a `global` bucket for a request with no tenant), and the stored `RequestHash` is compared on replay: the same key with a different payload is refused with `409`, not silently served the old answer.
+- The record lives for `RetentionPolicy.IdempotencyWindow` (24 h), which is one constant shared with the retention sweep rather than a number written twice — the middleware mints the deadline and the sweep deletes past it, so a key cannot be replayable and collectable at the same time. Both ends are pinned by one test that stores a key through the wire and sweeps it inside and outside the window. See `SECURITY.md` §1.3.

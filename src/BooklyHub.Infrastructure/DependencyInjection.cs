@@ -115,6 +115,10 @@ public static class DependencyInjection
         services.AddHostedService<BooklyHub.Infrastructure.BackgroundJobs.AppointmentReminderBackgroundService>();
         services.AddHostedService<BooklyHub.Infrastructure.BackgroundJobs.AppointmentNoShowBackgroundService>();
 
+        // DB-04: the append-only operational tables have no other writer that removes rows, so without this the
+        // four horizons in RetentionPolicy are a wish list.
+        services.AddHostedService<BooklyHub.Infrastructure.BackgroundJobs.RetentionSweepBackgroundService>();
+
         return services;
     }
 }

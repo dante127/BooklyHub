@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Application.Payments;
+using BooklyHub.Domain.Entities.System;
 
 namespace BooklyHub.Api.Middlewares;
 
@@ -92,7 +93,7 @@ public class IdempotencyMiddleware
                     requestHash,
                     context.Response.StatusCode,
                     responseBody,
-                    TimeSpan.FromHours(24),
+                    RetentionPolicy.IdempotencyWindow,
                     context.RequestAborted);
             }
 

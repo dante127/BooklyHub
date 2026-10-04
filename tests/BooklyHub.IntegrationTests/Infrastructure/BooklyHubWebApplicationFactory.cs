@@ -83,12 +83,17 @@ public class BooklyHubWebApplicationFactory : WebApplicationFactory<Program>, IA
         {
             // The polling workers issue their own SQL against the same database, which makes the
             // query-count assertions in the performance tests non-deterministic — and the no-show sweep
-            // would close rows a test is still about to read. The sweep tests call it themselves.
+            // would close rows a test is still about to read. The sweep tests call it themselves. The retention
+            // sweep is on this list because it deletes: leaving it running was measured taking a refresh-token
+            // test down with "Execution Timeout Expired" after 60s of contending with the test's own writes, and
+            // which test lost varied between runs. A worker that empties tables a test is reading back is not a
+            // flaky test, it is a destructive job that was never asked to run.
             var backgroundWorkers = services
                 .Where(d => d.ServiceType == typeof(IHostedService)
                             && (d.ImplementationType == typeof(OutboxProcessorBackgroundService)
                                 || d.ImplementationType == typeof(AppointmentReminderBackgroundService)
-                                || d.ImplementationType == typeof(AppointmentNoShowBackgroundService)))
+                                || d.ImplementationType == typeof(AppointmentNoShowBackgroundService)
+                                || d.ImplementationType == typeof(RetentionSweepBackgroundService)))
                 .ToList();
 
             foreach (var worker in backgroundWorkers)

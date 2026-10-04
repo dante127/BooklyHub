@@ -105,3 +105,18 @@ All core entities inherit from `AggregateRoot<TId>` and implement enterprise tra
 1. **`IAuditableEntity`**: Automatically populates `CreatedAtUtc`, `CreatedBy`, `LastModifiedAtUtc`, and `LastModifiedBy` within `ApplicationDbContext.SaveChangesAsync()` using `IClock` and `ICurrentUser`.
 2. **`ISoftDeletable`**: Overrides EF Core entity deletion to set `IsDeleted = true`, `DeletedAtUtc = DateTime.UtcNow`, and `DeletedBy = CurrentUser`. Soft-deleted records are automatically filtered out by query filters.
 3. **`RowVersion` Concurrency Tokens**: The `Appointments` table includes a `byte[] RowVersion` column decorated with `IsRowVersion()`, preventing lost updates during simultaneous modifications. EF materialises it as a SQL Server `rowversion`, so every update to the row — including a bare `UPDATE` from another session — bumps it, and an update issued against a stale token affects 0 rows and throws `DbUpdateConcurrencyException` instead of overwriting what the other writer committed. The writer that depends on it today is the no-show sweep: it judges a batch of `Confirmed` rows and closes them in one transaction, and a staff member who checked a patient in during that window would otherwise be restated as an absence. Money writes depend on it too, in the other direction: a charge or a refund settles a booking without changing the appointment row, so both paths restamp that row's audit columns after their tracked save — that is what moves the token and makes a closure decided against the old ledger get refused and re-judged. See section 5 of [SCHEDULING-CONCURRENCY.md](./SCHEDULING-CONCURRENCY.md) for how the sweep reacts to the conflict. Removing `.IsRowVersion()` is a schema change, not a config-only one: the model then diverges from the snapshot and `Database.MigrateAsync()` fails with `PendingModelChangesWarning`.
+
+---
+
+## 5. Retention of Operational Rows
+
+Four tables append and, before this section, never removed: `IdempotencyRecords`, `RefreshTokens`, `OutboxMessages`, `NotificationRecords`. The horizons and the reasoning are in `SECURITY.md` §1.3; the mechanism is `RetentionSweepBackgroundService`, which reads a page of ids and deletes exactly those ids — `ExecuteDeleteAsync` cannot carry a `TOP`, so the batching is a read plus a `WHERE Id IN (…)` rather than one bounded statement.
+
+| Table | Age column the sweep reads | Index backing that read |
+| :--- | :--- | :--- |
+| `IdempotencyRecords` | `ExpiresAtUtc` | `IX_IdempotencyRecords_ExpiresAtUtc` — the index the schema already shipped for exactly this purpose. |
+| `RefreshTokens` | `ExpiresAtUtc` | No index. `IX_RefreshTokens_Token` is unique on the credential and does not help an age predicate. |
+| `OutboxMessages` | `OccurredOnUtc` (delivered rows only) | No index. `IX_OutboxMessages_PendingQueue` is **filtered on `ProcessedOnUtc IS NULL`**, so it covers the dispatcher's queue and deliberately does not contain the delivered rows the sweep reads. |
+| `NotificationRecords` | `SentAtUtc` (sent rows only) | No index. `IX_NotificationRecords_TenantId_IsSent` leads on the tenant and does not order by age. |
+
+Three of the four deletes therefore scan. That is stated rather than fixed here because the size at which a scan of an aged-out operational table stops being trivial is a measurement this repository does not have yet; adding three indexes to satisfy a shape rather than an observed cost would tax every insert to serve a job that runs every six hours. The batch bound (2 000 rows per statement, 50 batches per table per tick) is what keeps a first run against an unpruned backlog from becoming one long lock.
