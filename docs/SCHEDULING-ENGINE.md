@@ -40,6 +40,15 @@ A service can require one or more physical resources from a `ResourceGroup` (e.g
 
 All internal database timestamps (`StartAtUtc`, `EndAtUtc`, `CreatedAtUtc`) are stored strictly in **UTC**.
 
+The columns are `datetime2`, which stores the ticks it is handed and converts nothing, so the label a value carries on
+the way in is the only thing that says which instant it is. `BL-05` closed that gap at the edge: `UtcInstant.cs` reads
+every inbound instant as UTC — an explicit offset is converted back, a value with no designator is taken as the zone
+its own field name names — and `Appointment.Create` / `Appointment.Reschedule` refuse a value still labeled for a
+machine's zone with the rule `InvalidDateKind`. What is *inside* the engine keeps the opposite convention: the
+availability guard builds candidate times from a staff member's local calendar as `Kind=Unspecified` and converts them
+with `TimeZoneHelper`, so a refusal there would refuse every booking. The narrowness is the point — `Local` is the one
+label that means "these ticks belong to somebody's zone".
+
 However, business hours and booking rules are defined in the tenant's or location's **local time zone** (e.g., `America/New_York` or `Europe/London`):
 
 ### Conversion Workflow (`TimeZoneHelper.cs`)

@@ -35,8 +35,8 @@ public class ReportsController : ControllerBase
 
         // One instant for both bounds, so the period is 30 days wide rather than 30 days plus the gap between two reads.
         var nowUtc = _clock.UtcNow;
-        var start = fromUtc ?? nowUtc.AddDays(-30);
-        var end = toUtc ?? nowUtc;
+        var start = UtcInstant.Resolve(fromUtc) ?? nowUtc.AddDays(-30);
+        var end = UtcInstant.Resolve(toUtc) ?? nowUtc;
 
         var query = new GetDashboardReportQuery(tenantId, start, end, nowUtc);
         var report = await _sender.Send(query, cancellationToken);

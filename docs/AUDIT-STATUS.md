@@ -25,7 +25,7 @@ which this remediation does not do from a bug queue.
 | API-08 — anonymous review wall exposes staff/service names | Low | **live by design** | `ReviewsController.cs:48-49` `[AllowAnonymous]`, tenant from header/query, `IsPublished` rows only (`:61`) | already documented as the public half; the stronger disclosure is `GET /api/v1/staff`, which answers `Email` and `PhoneNumber` (`CatalogControllers.cs:94-95`) |
 | BL-01 — booking guard ignores working hours, business hours, holidays, leave | High | **fixed** | `52aff50` put preview and guard behind one rule set; all four calendars are read in `AvailabilityService.cs:468` (Holidays), `:500` (WorkingHours), `:509` (BusinessHours), `:517` (AvailabilityExceptions) and consumed by `Classify` (`:340-386`) | the real residual is **`CAL-01`** (coined here): only `WorkingHours` is ever seeded (`DatabaseSeeder.cs:126-129`), and Holidays / BusinessHours / AvailabilityExceptions have **no route and no seed**, so the guard enforces a calendar nobody can currently maintain |
 | BL-02 — resource conflict ignores location scope and buffers | High | **fixed** | `62beadb` (location-wide allocator) + `f404dc3` (the index the occupancy read needed); occupancy loads by tenant+location (`AvailabilityService.cs:487-491`), the guard returns the resource ids it verified and the commands persist exactly those (`BookAppointmentCommand.cs:219,245-253`) | buffers applying to staff but not rooms is a documented choice (`SCHEDULING-CONCURRENCY.md` §3.2) |
-| BL-05 — `DateTime.Kind` unvalidated; DST-gap conversion shifts wall time | High | **half live, half stale** | the DST mapping is deliberate and documented (`TimeZoneHelper.cs:36-44`, `SCHEDULING-ENGINE.md` §DST); the `Kind` half is live: one `DateTimeKind` use in all of `src` (`TimeZoneHelper.cs:60`) and no boundary check on `StartAtUtc.Kind` (`BookAppointmentCommand.cs:37-40` only checks "future") | validate `Kind == Utc` (or reject offset-bearing values) at the API boundary; changing the DST policy is a product decision, not a repair |
+| BL-05 — `DateTime.Kind` unvalidated; DST-gap conversion shifts wall time | High | **`Kind` half fixed, DST half stale** | the DST mapping is deliberate and documented (`TimeZoneHelper.cs:36-44`, `SCHEDULING-ENGINE.md` §DST). The `Kind` half was live and is now closed on measurement: the columns are `datetime2` and store the ticks they are handed, so a body of `09:00:00+00:00` on a host at UTC+3 was written as **12:00** — the shift equals the deployment's own offset. `UtcInstant.cs` resolves every inbound instant at the two POST bodies and the dashboard window, `Appointment.Create`/`Reschedule` refuse a `Kind=Local` value as `InvalidDateKind`, and the answers carry `Z` (`UtcInstantWriterTests`, `UtcInstantBoundaryTests`) | the query bounds are deliberately not routed through the resolver — measured, `fromUtc`/`toUtc` already bind offset-bearing values to a UTC instant and naked ones to the ticks the UTC column holds, so nothing observable would change; changing the DST policy stays a product decision |
 | BL-08 — no actor↔appointment check on reviews; auto-published | Medium | **live, product decision** | `[Authorize]` with no permission (`ReviewsController.cs:35-36`); the review's `CustomerId`/`StaffId`/`ServiceId` are derived from the appointment, never from the caller (`SubmitReviewCommand.cs:76-84`); `Review.Create` sets `IsVerified`/`IsPublished` true (`ReviewEntities.cs:29-30,67-68`) | a relationship check needs a `User → Customer` identity that does not exist in the model; moderation needs a policy. Both are features |
 | CONC-01 — lock scope plus a silent no-op provider | Medium | **fixed except a documented bypass** | location-then-staff ordering (`ApplicationDbContext.cs:256-265`); no fake providers in production (`d767c25`, `3696b2d`) | `TryAcquire*`/`ExecuteAppLock*` still return success on a non-SqlServer provider (`:302`, `:314`, `:322`); production is hard-wired to `UseSqlServer` (`DependencyInjection.cs:25-30`), so it is unreachable outside tests |
 | DB-01 — two individually-incomplete isolation controls; "filter missing from the migration snapshot" | Medium | **fixed / stale** | the pairing is the remedy: global filters for `ITenantEntity`/`ISoftDeletable` (`ApplicationDbContext.cs:83-129`), a save-time cross-tenant write rejection (`:140-157`), explicit predicates where a filter provably cannot help (`:281-298`) — all added in `52aff50`. The snapshot claim is a category error: query filters are runtime translation, never schema | covered by `TenantIsolationTests` |
@@ -59,14 +59,21 @@ Recording these because each one was stated as fact at some point, and the tree 
    `_providers` and never enumerates the registered ones, so such a collector stays empty forever and every
    privacy fact written against it passes by finding nothing. `SEC-09`'s collector sits on the `ILogger<>` seam
    instead; the measurement is recorded in `CollectingLogger`'s remarks and `SECURITY.md` §3.4.
+8. **"`Kind=Utc` at the API boundary" is not the rule `BL-05` needed.** Applied literally it refuses a naked
+   `2027-06-01T09:00:00` — which the field name `…AtUtc` already promises to read as UTC, and whose ticks are
+   already right — while accepting nothing the binder breaks. What the measurement showed is that only
+   `Kind=Local` carries a defect: an explicit offset is re-based onto the server's zone by the serializer and then
+   written into `datetime2` as those shifted ticks. The rule is therefore convert-`Local`-back, label-`Unspecified`,
+   and refuse `Local` at the writers. Routed through the same measurement, the two `GET` date bounds turned out to
+   need nothing at all: MVC binds an offset to a UTC instant and a naked bound to the ticks the column holds, so a
+   resolver there would be code no test can observe.
 
 ## 3. What is genuinely live, in the order the next work should take it
 
-1. `BL-05` (`Kind` half) — reject an offset-bearing or unspecified-`Kind` start at the boundary. Small.
-2. `SEC-13` / `SEC-11` — sanitize the correlation ID; decide whether `search` wildcards are a feature.
-3. `PERF-04` residue + `CAL-01` — bound the candidate-staff list and the slot grid, decide the two catalog reads,
+1. `SEC-13` / `SEC-11` — sanitize the correlation ID; decide whether `search` wildcards are a feature.
+2. `PERF-04` residue + `CAL-01` — bound the candidate-staff list and the slot grid, decide the two catalog reads,
    and give the calendars a way to be populated; `PERF-05`'s annual-holiday column.
-4. `QUAL-04` residue — three payment stamps onto `IClock`.
-5. Product decisions, not to be taken from this queue: `SEC-03`'s tenant gate, `BL-08`'s authorship and moderation,
+3. `QUAL-04` residue — three payment stamps onto `IClock`.
+4. Product decisions, not to be taken from this queue: `SEC-03`'s tenant gate, `BL-08`'s authorship and moderation,
    `DB-02`'s recurring-series definition, `QUAL-05`'s module split.
-6. Operator action only: `SEC-02` — rotate the secret committed before `d767c25`.
+5. Operator action only: `SEC-02` — rotate the secret committed before `d767c25`.

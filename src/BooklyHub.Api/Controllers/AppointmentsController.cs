@@ -64,7 +64,7 @@ public class AppointmentsController : ControllerBase
             request.ServiceId,
             request.StaffId,
             request.CustomerId,
-            request.StartAtUtc,
+            UtcInstant.Resolve(request.StartAtUtc),
             request.Notes,
             idempotencyKey);
 
@@ -121,7 +121,7 @@ public class AppointmentsController : ControllerBase
         CancellationToken cancellationToken)
     {
         var tenantId = GetRequiredTenantId();
-        var command = new RescheduleAppointmentCommand(tenantId, id, request.NewStartAtUtc, request.Reason);
+        var command = new RescheduleAppointmentCommand(tenantId, id, UtcInstant.Resolve(request.NewStartAtUtc), request.Reason);
         var result = await _sender.Send(command, cancellationToken);
         return Ok(result);
     }

@@ -381,6 +381,29 @@ Atomically books an appointment with transactional concurrency locks.
 }
 ```
 
+**Which instant a date field means (`BL-05`).** Every `…AtUtc` field on this server is read as UTC and answered as
+UTC, whichever of the three ISO shapes the client used:
+
+| Sent | Read as |
+|---|---|
+| `2026-10-25T13:00:00Z` | that instant. The shape to send. |
+| `2026-10-25T16:00:00+03:00` | `13:00:00Z` — the same instant in another zone, converted back |
+| `2026-10-25T13:00:00` | `13:00:00Z` — no designator is read as the zone the field name names |
+
+The conversion happens at the edge (`UtcInstant.cs`), before the value reaches a command, and the appointment writers
+refuse a value still labeled for a machine's zone (`InvalidDateKind`). It matters because the columns are
+`datetime2`, which stores the ticks it is handed: measured before this rule, a body of `09:00:00+00:00` on a host at
+UTC+3 was written as 12:00 — the appointment moved by the deployment's own offset. Responses always carry `Z`,
+including for a value sent without a designator, so the server states the reading it made.
+
+A key is promised to one payload, not one instant: `IdempotencyMiddleware` hashes the request body as text, so
+sending the same start time twice in two different shapes is answered `409` with "This Idempotency-Key was already
+used for a different request." Send one shape per retry.
+
+The two `GET` query bounds (`fromUtc`, `toUtc`) need no conversion: an offset-bearing bound already binds to a UTC
+instant and a naked one already carries the ticks the UTC column holds. The dashboard echoes its window with `Z`
+either way, because a period that names no zone is a period two readers can differ on.
+
 **Response (201 Created):**
 ```json
 {
@@ -417,6 +440,9 @@ Atomically moves an appointment to a new slot while preserving the original appo
   "reason": "Client requested change of schedule"
 }
 ```
+
+`newStartAtUtc` is read by the same rule as `startAtUtc` above: whatever shape it arrives in, the appointment moves
+to the instant it names.
 
 ### `POST /api/v1/appointments/{id}/transition`
 Transitions an appointment status according to the domain state machine.
@@ -491,6 +517,9 @@ Executes high-performance set-based SQL aggregations for executive reporting.
 **Query Parameters:**
 - `fromUtc` (DateTime, optional; defaults to 30 days ago)
 - `toUtc` (DateTime, optional; defaults to now)
+
+Both bounds are read as instants — an offset is honoured, a value with no designator is the UTC the parameter name
+promises — and the echoed window always carries `Z`.
 
 **Response (200 OK):**
 ```json

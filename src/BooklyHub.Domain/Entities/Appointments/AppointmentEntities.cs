@@ -78,6 +78,15 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
             throw new BusinessRuleValidationException("InvalidTimeRange", "Appointment EndAtUtc must be greater than StartAtUtc.");
         }
 
+        // BL-05: the column is datetime2 and stores the ticks it is handed, so a value still labeled for a machine's
+        // zone would be booked at that zone's offset from the instant its caller meant. Every HTTP path resolves the
+        // Kind before it reaches here (`UtcInstant`); this is the writer's own rule, so a route added later cannot
+        // reopen the hole by forgetting it. An Unspecified value is not refused: it claims nothing about a zone.
+        if (startAtUtc.Kind == DateTimeKind.Local || endAtUtc.Kind == DateTimeKind.Local)
+        {
+            throw new BusinessRuleValidationException("InvalidDateKind", "Appointment times must be UTC instants.");
+        }
+
         var appointment = new Appointment
         {
             Id = Guid.NewGuid(),
@@ -239,6 +248,11 @@ public class Appointment : AggregateRoot<Guid>, ITenantEntity, IAuditableEntity,
         if (newEndAtUtc <= newStartAtUtc)
         {
             throw new BusinessRuleValidationException("InvalidTimeRange", "Rescheduled EndAtUtc must be greater than StartAtUtc.");
+        }
+
+        if (newStartAtUtc.Kind == DateTimeKind.Local || newEndAtUtc.Kind == DateTimeKind.Local)
+        {
+            throw new BusinessRuleValidationException("InvalidDateKind", "Appointment times must be UTC instants.");
         }
 
         if (Status != AppointmentStatus.Confirmed && Status != AppointmentStatus.Pending)
