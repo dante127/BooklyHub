@@ -46,14 +46,27 @@ public class TenantSetting : Entity<Guid>, ITenantEntity
     /// </summary>
     public const int DefaultReminderNoticeHours = 24;
 
+    /// <summary>
+    /// The value a tenant that never configured anything is judged by. Every one of these had two copies: the
+    /// initializer below, which runs when a settings row is created, and a <c>??</c> fallback at each reader,
+    /// which runs when no row exists. Two copies of one number can disagree in exactly the way the initializer
+    /// and the fallback did, and only one of them is ever edited, so the readers now name these constants
+    /// instead of repeating what they stand for.
+    /// </summary>
+    public const int DefaultMinBookingNoticeMinutes = 120;
+    public const int DefaultMaxAdvanceBookingDays = 60;
+    public const int DefaultCancellationCutoffHours = 24;
+    public const int DefaultReschedulingCutoffHours = 12;
+    public const int DefaultSlotIntervalMinutes = 15;
+
     public Guid TenantId { get; set; }
     public Tenant? Tenant { get; set; }
 
-    public int MinBookingNoticeMinutes { get; set; } = 120; // 2 hours
-    public int MaxAdvanceBookingDays { get; set; } = 60; // 60 days
-    public int CancellationCutoffHours { get; set; } = 24; // 24 hours
-    public int ReschedulingCutoffHours { get; set; } = 12; // 12 hours
-    public int SlotIntervalMinutes { get; set; } = 15; // default grid step
+    public int MinBookingNoticeMinutes { get; set; } = DefaultMinBookingNoticeMinutes;
+    public int MaxAdvanceBookingDays { get; set; } = DefaultMaxAdvanceBookingDays;
+    public int CancellationCutoffHours { get; set; } = DefaultCancellationCutoffHours;
+    public int ReschedulingCutoffHours { get; set; } = DefaultReschedulingCutoffHours;
+    public int SlotIntervalMinutes { get; set; } = DefaultSlotIntervalMinutes;
     public bool ConfirmationEmailEnabled { get; set; } = true;
     public int ReminderNoticeHours { get; set; } = DefaultReminderNoticeHours;
     public bool RequireUpfrontPayment { get; set; } = false;

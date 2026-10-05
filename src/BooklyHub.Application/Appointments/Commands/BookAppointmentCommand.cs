@@ -4,6 +4,7 @@ using BooklyHub.Application.Payments.Commands;
 using BooklyHub.Application.Scheduling;
 using BooklyHub.Domain.Entities.Appointments;
 using BooklyHub.Domain.Entities.Resources;
+using BooklyHub.Domain.Entities.Tenancy;
 using BooklyHub.Domain.Enums;
 using BooklyHub.Domain.Exceptions;
 using FluentValidation;
@@ -113,8 +114,8 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
         }
 
         // 6. Booking rules: notice & advance horizon
-        var minNoticeMinutes = tenant.Settings?.MinBookingNoticeMinutes ?? 120;
-        var maxAdvanceDays = tenant.Settings?.MaxAdvanceBookingDays ?? 60;
+        var minNoticeMinutes = tenant.Settings?.MinBookingNoticeMinutes ?? TenantSetting.DefaultMinBookingNoticeMinutes;
+        var maxAdvanceDays = tenant.Settings?.MaxAdvanceBookingDays ?? TenantSetting.DefaultMaxAdvanceBookingDays;
 
         if (request.StartAtUtc < _clock.UtcNow.AddMinutes(minNoticeMinutes))
         {

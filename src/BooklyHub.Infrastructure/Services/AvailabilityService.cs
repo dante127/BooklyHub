@@ -3,6 +3,7 @@ using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Application.Scheduling;
 using BooklyHub.Domain.Entities.Organizations;
 using BooklyHub.Domain.Entities.Scheduling;
+using BooklyHub.Domain.Entities.Tenancy;
 using BooklyHub.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 
@@ -445,9 +446,9 @@ public class AvailabilityService : IAvailabilityService
             service.ResourceRequirements
                 .Select(r => new ResourceRequirement(r.ResourceGroupId, r.QuantityRequired))
                 .ToList(),
-            tenant.Settings?.MinBookingNoticeMinutes ?? 120,
-            tenant.Settings?.MaxAdvanceBookingDays ?? 60,
-            Math.Max(1, tenant.Settings?.SlotIntervalMinutes ?? 15));
+            tenant.Settings?.MinBookingNoticeMinutes ?? TenantSetting.DefaultMinBookingNoticeMinutes,
+            tenant.Settings?.MaxAdvanceBookingDays ?? TenantSetting.DefaultMaxAdvanceBookingDays,
+            Math.Max(1, tenant.Settings?.SlotIntervalMinutes ?? TenantSetting.DefaultSlotIntervalMinutes));
     }
 
     private async Task<DayCalendar> LoadCalendarAsync(

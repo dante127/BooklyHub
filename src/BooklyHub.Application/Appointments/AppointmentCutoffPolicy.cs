@@ -13,9 +13,10 @@ namespace BooklyHub.Application.Appointments;
 /// </summary>
 public static class AppointmentCutoffPolicy
 {
-    // A tenant with no settings row still gets a cutoff; these mirror TenantSetting's own defaults.
-    private const int DefaultCancellationCutoffHours = 24;
-    private const int DefaultReschedulingCutoffHours = 12;
+    // A tenant with no settings row still gets a cutoff, and it gets the one the entity hands a tenant that did
+    // create a row and never edited it. The two used to be copies of the same number written in two files.
+    private const int DefaultCancellationCutoffHours = TenantSetting.DefaultCancellationCutoffHours;
+    private const int DefaultReschedulingCutoffHours = TenantSetting.DefaultReschedulingCutoffHours;
 
     private static readonly string[] CutoffOverrideRoles =
     [

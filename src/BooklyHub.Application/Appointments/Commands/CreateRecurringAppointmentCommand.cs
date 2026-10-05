@@ -4,6 +4,7 @@ using BooklyHub.Application.Payments.Commands;
 using BooklyHub.Application.Scheduling;
 using BooklyHub.Domain.Entities.Appointments;
 using BooklyHub.Domain.Entities.Resources;
+using BooklyHub.Domain.Entities.Tenancy;
 using BooklyHub.Domain.Enums;
 using BooklyHub.Domain.Exceptions;
 using FluentValidation;
@@ -121,7 +122,7 @@ public class CreateRecurringAppointmentCommandHandler : IRequestHandler<CreateRe
         // The range is resolved against the tenant's booking horizon, not against a constant invented
         // here: a series that reaches past the horizon can never be booked, and silently shortening it
         // would report a smaller request than the one that was made.
-        var maxAdvanceDays = tenant.Settings?.MaxAdvanceBookingDays ?? 60;
+        var maxAdvanceDays = tenant.Settings?.MaxAdvanceBookingDays ?? TenantSetting.DefaultMaxAdvanceBookingDays;
         var lastBookableDate = DateOnly.FromDateTime(_clock.UtcNow.AddDays(maxAdvanceDays));
 
         if (request.StartDate > lastBookableDate || request.EndDate > lastBookableDate)

@@ -110,6 +110,28 @@ that read is the only thing separating one clinic's bookings from another's, and
 equal-window test cannot see: with both tenants asking for the same notice, a read that dropped the predicate
 still reaches the same conclusions. The binding test therefore gives the two tenants *unequal* windows.
 
+**A tenant that never configured anything is still a tenant with rules.** Each number below is one constant on
+`TenantSetting`, used both by the property initializer (so a settings row created and never edited carries it) and
+by every reader that has to answer when there is no row at all. They used to be written twice — a literal in the
+entity and a literal in the `??` fallback — and the copies were in five files, which is how one policy could drift
+without anything observable happening: every test in the suite seeded a settings row, so the fallback branch ran
+only in code.
+
+| Policy | Constant | Read by |
+| :--- | :--- | :--- |
+| Earliest notice a booking must respect | `DefaultMinBookingNoticeMinutes = 120` | the booking command, the availability grid |
+| How far ahead a booking may be made | `DefaultMaxAdvanceBookingDays = 60` | the booking command, the recurring command, the availability grid |
+| How late a visit may still be cancelled | `DefaultCancellationCutoffHours = 24` | `AppointmentCutoffPolicy` (both cancel doors) |
+| How late a visit may still be moved | `DefaultReschedulingCutoffHours = 12` | `AppointmentCutoffPolicy` |
+| The step the slot grid is built on | `DefaultSlotIntervalMinutes = 15` | the availability grid |
+| Notice a reminder asks for | `DefaultReminderNoticeHours = 24` | the reminder sweep, in SQL |
+
+The two cutoffs are deliberately different numbers, and that difference is the reason the cancellation and
+reschedule doors cannot be collapsed into one rule: at thirteen hours before a visit, cancelling is refused and
+moving it is allowed. `TenantDefaultsWithoutSettingsRowTests` pins each row of this table on the wire — including
+the refusal text, which quotes the resolved number, so a reader that stopped honouring the constant is visible in
+which value it prints.
+
 **The execution shape, and what it costs.** Each tenant's pass takes at most `BatchSize = 200` bookings,
 nearest start first, and the already-sent question is a `NOT EXISTS` inside that read rather than a filter
 applied to its results — the cap has to be taken over bookings that still need a reminder, because a page
