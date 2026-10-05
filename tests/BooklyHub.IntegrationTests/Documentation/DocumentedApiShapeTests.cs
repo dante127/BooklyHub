@@ -27,9 +27,11 @@ namespace BooklyHub.IntegrationTests.Documentation;
 /// </summary>
 /// <remarks>
 /// These facts read the document itself, so the fixture is the thing that is supposed to drift: correcting a sample
-/// in <c>API.md</c> is a change these tests react to. The route assertion runs in one direction only — documented
-/// paths must exist — because the reverse (every endpoint must be documented) is a different finding with seven
-/// known failures, and asserting it here would only teach the next reader to mute the test.
+/// in <c>API.md</c> is a change these tests react to. The route assertion here runs in one direction — documented
+/// paths must exist — and its reverse, that every route the server answers on has a section, is
+/// <see cref="EveryEndpointIsDocumentedTests"/> (<c>DOC-04</c>). Two directions stay two facts because they fail for
+/// opposite reasons: a heading naming nothing is a client being sent to a 404, and a live route with no heading is a
+/// client inventing a contract nobody wrote down.
 /// </remarks>
 internal static class ApiDoc
 {
@@ -59,6 +61,39 @@ internal static class ApiDoc
             @"\b(GET|POST|PUT|PATCH|DELETE)\s+(/api/v1/[^\s`<>)""\]]*)");
 
         return matches.Select(m => (m.Groups[1].Value, Normalize(m.Groups[2].Value.TrimEnd('.', ',', ';'))))
+            .Distinct()
+            .ToList();
+    }
+
+    /// <summary>
+    /// The paths under a <c>### `METHOD /path`</c> heading — the document's own claim that a route exists and is
+    /// described. Deliberately narrower than <see cref="DocumentedRoutes"/>, which also catches the prose mentions a
+    /// section makes of the verb its caller uses next; a bullet that names a route is not a reader being sent to it.
+    /// </summary>
+    public static IReadOnlyList<(string Verb, string Path)> DocumentedHeadings()
+    {
+        var matches = Regex.Matches(FileText.Value,
+            @"^### `(?<verb>GET|POST|PUT|PATCH|DELETE) (?<path>/api/v1/[^\s`]*)`",
+            RegexOptions.Multiline);
+
+        return matches.Select(m => (m.Groups["verb"].Value, Normalize(m.Groups["path"].Value)))
+            .Distinct()
+            .ToList();
+    }
+
+    /// <summary>
+    /// The route table as the host actually built it, in the same (verb, normalized path) shape the document is read
+    /// in. Both directions of the comparison go through this, so a disagreement cannot come from two different
+    /// notions of what the server exposes.
+    /// </summary>
+    public static IReadOnlyList<(string Verb, string Path)> ImplementedRoutes(BooklyHubWebApplicationFactory factory)
+    {
+        var provider = factory.Services.GetRequiredService<IApiDescriptionGroupCollectionProvider>();
+
+        return provider.ApiDescriptionGroups.Items
+            .SelectMany(g => g.Items)
+            .Where(d => d.HttpMethod is not null)
+            .Select(d => (d.HttpMethod!, Normalize(d.RelativePath!)))
             .Distinct()
             .ToList();
     }
@@ -163,12 +198,7 @@ public class DocumentedApiShapeTests : IClassFixture<BooklyHubWebApplicationFact
     [Fact]
     public void EveryRouteTheDocsDocument_MustExistInTheRouteTable()
     {
-        var provider = _factory.Services.GetRequiredService<IApiDescriptionGroupCollectionProvider>();
-        var implemented = provider.ApiDescriptionGroups.Items
-            .SelectMany(g => g.Items)
-            .Where(d => d.HttpMethod is not null)
-            .Select(d => (d.HttpMethod!, ApiDoc.Normalize(d.RelativePath!)))
-            .ToHashSet();
+        var implemented = ApiDoc.ImplementedRoutes(_factory).ToHashSet();
 
         var documented = ApiDoc.DocumentedRoutes();
         documented.Should().NotBeEmpty("a document with no routes would make this fact pass by saying nothing");
@@ -298,5 +328,39 @@ public class DocumentedApiShapeTests : IClassFixture<BooklyHubWebApplicationFact
             .Should().BeTrue("this fixture needs the configured tenant, the opposite of the fallback facts");
 
         return graph;
+    }
+}
+
+/// <summary>
+/// <c>DOC-04</c>, the direction the audit called a documentation gap and the code called nothing: the controllers
+/// answer on a set of routes and <c>docs/API.md</c> gave a section to only part of them. Every behaviour a client of
+/// the undocumented half has to know — which permission gates the call, which of this server's two pagination
+/// envelopes the list comes in, what the <c>201</c> of <c>POST /api/v1/customers</c> puts in <c>Location</c> — was
+/// learned by sending requests and reading what came back. The missing sections are written now, and this fact is
+/// what keeps the document from drifting again: it reads the host's own route table, so an action added without a
+/// section fails a test instead of quietly joining the undocumented set.
+/// </summary>
+public class EveryEndpointIsDocumentedTests : IClassFixture<BooklyHubWebApplicationFactory>
+{
+    private readonly BooklyHubWebApplicationFactory _factory;
+
+    public EveryEndpointIsDocumentedTests(BooklyHubWebApplicationFactory factory) => _factory = factory;
+
+    [Fact]
+    public void EveryRouteTheControllersAnswerOn_MustHaveASectionInTheDocs()
+    {
+        var implemented = ApiDoc.ImplementedRoutes(_factory);
+
+        // Not decoration: an ApiExplorer that saw no controllers would make the assertion below pass on an empty set,
+        // which is the exact way a document-versus-code fact goes vacuously green.
+        implemented.Should().NotBeEmpty("a route table this read found nothing in is not evidence about a document");
+
+        var documented = ApiDoc.DocumentedHeadings().ToHashSet();
+        documented.Should().NotBeEmpty("an API.md with no headings would make this fact fire for the wrong reason");
+
+        // Collected, not failed on the first: one run should name every route a client can call and cannot look up.
+        var missing = implemented.Where(e => !documented.Contains(e)).ToList();
+        missing.Should().BeEmpty(
+            $"routes a client can call but has no section to read: {string.Join(", ", missing.Select(m => $"{m.Verb} /{m.Path}"))}");
     }
 }

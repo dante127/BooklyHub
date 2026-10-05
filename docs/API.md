@@ -224,6 +224,36 @@ What it does not do: reach an access token already minted. The token in the call
 authenticated routes until `Jwt:ExpirationMinutes` runs out — 60 minutes as shipped — and the `204` deliberately
 says nothing about it, so a client that wants its own session ended must sign in again with the new password.
 
+### `GET /api/v1/auth/me`
+The caller's own identity, as the server would apply it to the next request.
+
+**Response (200 OK)** — the same `UserDto` the login response nests under `user`, returned at the top level:
+```json
+{
+  "id": "51ca245f-a256-42ce-875c-0843ef6dac3d",
+  "email": "me@probe.test",
+  "firstName": "Sam",
+  "lastName": "One",
+  "tenantId": "416a5c42-9686-4a3c-bd62-e793dfdad7b7",
+  "roles": [],
+  "permissions": []
+}
+```
+
+**`roles` and `permissions` are read from the database, not from the token.** Measured: a token carrying
+`TenantAdmin` claims, presented for a user with no `UserRole` rows, answered `"roles": []` and
+`"permissions": []`. That is the honest reading of the two fields — they describe what the server would grant on
+the *next* request, not what the presented credential asserts — and it is why this route disagrees with a stale
+token rather than with the database. A client that wants to know whether a permission change has landed reads it
+here; a client that wants to know whether its current access token still passes a gate must send the request it
+actually cares about.
+
+**Refusals.** No `Authorization` header, or a bearer token that fails validation: `401`. A token that validates but
+names no row in the user table — deleted, or minted for an id the table no longer holds: `404`. Both answers are the
+`application/problem+json` envelope of §1.1 with the caller's `correlationId` in the body (`SEC-10a`), measured with
+no `detail` member on either, because neither is a rule the server chose to break — there is nothing to explain
+beyond the status.
+
 ---
 
 ## 3. Availability Engine
@@ -315,6 +345,26 @@ they serve the *filtered* variants and the default page reads via the `TenantId`
 here rather than migrated: an index is a schema change with a write cost, and the read that needs it has no
 measured volume behind it yet.
 
+### `GET /api/v1/appointments/{id}`
+One booking by its id — the reader `CrossTenantSecurityTests` exercises, and the shape every write verb below
+returns.
+
+**Permission:** `appointments.read`. **`{id}` is constrained to a GUID** (`{id:guid}` in the route template), so a
+non-GUID segment is answered `404` by routing rather than reaching the query with a parse error.
+
+**Response (200 OK):** an `AppointmentDto` — the same record the booking response returns, key for key, including
+`cancellationReason` (which the sample under `POST /api/v1/appointments` above does not name; the field is there on
+both).
+
+**A foreign id is a miss, not a refusal.** The appointment is read with the tenant the request resolved to
+(`a.TenantId == request.TenantId`, and the global query filter behind it), so
+`GET /api/v1/appointments/{tenantBId}` as Tenant A answers `404` — not `403`. The difference is the point of the IDOR
+work: a `403` would confirm the row exists and belongs to somebody else, and answer that to a caller who is
+enumerating ids. The `404` detail does echo the requested id (`Appointment with ID … was not found.`), which says
+nothing the caller did not already type; what it never says is whether a row was found under *another* tenant.
+Measured and pinned in `tests/BooklyHub.IntegrationTests/Security/CrossTenantSecurityTests.cs`, including the case
+where the caller spoofs `X-Tenant-Id` to reach the other tenant's row.
+
 ### `POST /api/v1/appointments`
 Atomically books an appointment with transactional concurrency locks.
 
@@ -350,6 +400,7 @@ Atomically books an appointment with transactional concurrency locks.
   "currency": "USD",
   "status": "Confirmed",
   "notes": "First-time patient consultation",
+  "cancellationReason": null,
   "allocatedResourceIds": ["c1e2d3f4-5678-90ab-cdef-1234567890ab"],
   "createdAtUtc": "2026-09-23T10:15:30Z"
 }
@@ -391,6 +442,40 @@ Transitions an appointment status according to the domain state machine.
 - The refusal is the point: a `NoShow` cannot be charged and the outstanding queue lists only `Confirmed` and
   `Completed`, so writing an unexplained balance off takes the debt off every surface at once. Refused, the
   row stays `Confirmed` and stays on the queue.
+
+### `POST /api/v1/appointments/{id}/cancel`
+Ends a booking and gives the counted visit back.
+
+**Permission:** `appointments.cancel`. **`{id}` is GUID-constrained**, as on the reader above.
+
+**Request Payload:**
+```json
+{
+  "reason": "Patient called in the evening to move the slot"
+}
+```
+
+**The reason is required here, and it is stored.** `CancelAppointmentCommandValidator` refuses an empty one
+(`400`, the `errors` map names `Reason`, max 500 characters), and the text lands on the row as
+`cancellationReason` — which is what `GET /api/v1/appointments/{id}` returns and what the status history row
+records. This route has always demanded it; `…/transition` with `newStatus: Cancelled` was made to demand the same
+thing so the rule could not be stepped around by choosing the other URL (WRI-01).
+
+**Response (204 No Content).** No body: the row this call changed is readable at
+`GET /api/v1/appointments/{id}`, and a client that wants the new status asks for it. This is the only appointment
+write verb that answers `204` — `…/transition` and `…/reschedule` both return the updated `AppointmentDto`.
+
+**What the cancel does, in one transaction:** appends a status history row, moves `Status` to `Cancelled`, and
+decrements `Customer.TotalBookings` (`BL-07`). A cancel that saved without the decrement would inflate the booking
+count forever, which is why the three writes are not three statements.
+
+**Refusals:** `404` when no booking of that id belongs to the calling tenant. `422` with rule
+`CancellationCutoffExceeded` when the visit starts inside the tenant's
+`TenantSetting.CancellationCutoffHours` window — `PlatformAdmin`, `TenantOwner`, `TenantAdmin` and `Manager` are the
+roles allowed past it (`AppointmentCutoffPolicy`), and the same gate stands behind `…/transition` to `Cancelled`, so
+neither door can be used to cancel late. Money is not touched: a cancel neither charges nor refunds. A deposit that
+was captured stays captured until `POST /api/v1/payments/refund` draws against it, and the cancelled row leaves the
+collection queue because `Cancelled` is not in `PaymentLedger.Collectable`.
 
 ### `POST /api/v1/appointments/recurring`
 Creates a series of recurring appointments with configurable conflict policies (`SkipConflicts` or `AbortSeries`).
@@ -580,3 +665,351 @@ neither repeat a booking nor drop one between two page reads).
   written-down justification the money question needs. One property of this path is still open and recorded
   rather than changed here: `AppointmentCutoffPolicy.EnsureCancellable` runs only when the target is
   `Cancelled`, so a write-off is never gated by the tenant's cancellation cutoff.
+
+
+### `POST /api/v1/payments/charge`
+Captures money against a booking, inside the ledger's limits.
+
+**Permission:** `payments.manage`. **Honours `Idempotency-Key`** (§1): one key buys one charge, and the key is
+matched byte for byte (`KEY-02`). A key that already paid *this* appointment replays the stored receipt; the same
+key arriving for a **different** appointment is refused `422 IdempotencyKeyReused` rather than silently capturing a
+second payment — a retry is one event, whichever appointment the caller points it at.
+
+**Request Payload:**
+```json
+{
+  "appointmentId": "e3b0c442-98fc-1c14-9afb-4c8996fb9242",
+  "amount": 40.00,
+  "currency": "USD",
+  "paymentMethodToken": "pm_1M4uQ8K"
+}
+```
+`currency` defaults to `USD` when the field is absent; `paymentMethodToken` is optional and is passed through to the
+provider. `amount` must be greater than zero — measured `400` with `errors.Amount` =
+`'Amount' must be greater than '0'.`
+
+**Response (200 OK)** — a `PaymentDto`, not `201`: the charge is a step on an appointment the client already names,
+and a replay of the same key has to be able to hand back an identical body.
+```json
+{
+  "id": "9f2c0f4e-1a2b-4c3d-9e8f-0a1b2c3d4e5f",
+  "tenantId": "e1f13b64-897c-473d-9d78-b11c2ad4cb59",
+  "appointmentId": "e3b0c442-98fc-1c14-9afb-4c8996fb9242",
+  "amount": 40.00,
+  "currency": "USD",
+  "status": "Paid",
+  "providerPaymentId": "sim-3f1a2b",
+  "createdAtUtc": "2026-10-05T08:35:56Z"
+}
+```
+`status` is a `PaymentStatus`, and every enum on this API is serialized by name (`Program.cs` registers
+`JsonStringEnumConverter`), so the client reads `"Paid"` rather than `1`.
+
+**The money rules are one object.** `PaymentLedger.ValidateCharge` is the same rule set the collection queue above
+reads with, and it is decided on payment rows fetched *after* the per-appointment payment lock, so a concurrent
+charge cannot slip between the read and the write.
+
+| Refusal | When |
+|---|---|
+| `422 AppointmentNotChargeable` | the status ends collection (`Cancelled`, `NoShow`) — a closed visit is not rendered |
+| `422 PaymentCurrencyMismatch` | the requested currency is not the currency the booking was priced in |
+| `422 AppointmentAlreadyPaid` | ledger outstanding is zero — a second capture of a settled visit |
+| `422 PaymentExceedsAmountDue` | the amount is more than the outstanding balance |
+| `404` | no appointment of that id in this tenant (measured text: `Appointment with ID … was not found.`) |
+| `422 PaymentFailed` | the provider answered not-success; the detail is the provider's message |
+
+### `POST /api/v1/payments/refund`
+Draws against one payment's remaining balance.
+
+**Permission:** `payments.refund`, which the role map gives to `PlatformAdmin`, `TenantOwner`, `TenantAdmin` and
+`Accountant` only. `Manager` and `Receptionist` hold `payments.manage` but not this one: the desk that takes money
+in is not the desk that gives it back. **Honours `Idempotency-Key`** as the charge does.
+
+**Request Payload:**
+```json
+{
+  "paymentId": "9f2c0f4e-1a2b-4c3d-9e8f-0a1b2c3d4e5f",
+  "amount": 20.00,
+  "reason": "Deposit returned after the clinic cancelled the room"
+}
+```
+`reason` is optional **on this door**. The write-off reason rule (`DebtWriteOffReasonRequired`, §4) is about
+*stranding* a balance by moving a status; returning money that was actually captured is a different act, and it
+leaves its own row behind.
+
+**Response (200 OK):**
+```json
+{ "success": true }
+```
+Nothing else. The refund's own amount and status live on the payment it drew against, whose `status` becomes
+`PartiallyRefunded` or `Refunded`; the action returns a bool, so a client that wants the refund row's identifier
+cannot get one from here. Recorded as the shape it has rather than argued.
+
+**Refusals:** `404` when no payment of that id belongs to the tenant (measured:
+`Payment with ID … was not found.`); `422 InvalidPaymentStatusForRefund` when the payment is not in a refundable
+status; `422 RefundAmountExceeded` when the amount is more than what is still refundable **on that payment** — the
+bound is per payment, not per appointment, so an appointment paid in two captures is refunded in two calls;
+`422 RefundFailed` when the provider says no.
+
+---
+
+## 7. Catalog
+
+The two catalog reads are the public half of the product's data: both are `[AllowAnonymous]`, both take the tenant
+from `X-Tenant-Id` (or from the authenticated context when there is one), and both answer `400` with
+`Active tenant context is required.` when neither resolves a tenant (`ENV-01`, §1.1) — measured with no header at
+all.
+
+### `GET /api/v1/services`
+The bookable service list.
+
+**Query parameters:** `categoryId` (optional GUID). **No paging** — the response is the tenant's whole active
+catalog, ordered by `Name`.
+
+**Response (200 OK)** — a bare JSON array, not an envelope:
+```json
+[
+  {
+    "id": "4c919d69-2dcd-4ae2-ae65-a9c77d442164",
+    "name": "Consult",
+    "description": "A consult",
+    "durationMinutes": 30,
+    "price": 100.00,
+    "currency": "USD",
+    "bufferBeforeMinutes": 0,
+    "bufferAfterMinutes": 0,
+    "categoryName": null
+  }
+]
+```
+Only `IsActive` services appear, and `categoryName` is the joined label — `null` for an uncategorized service. The
+three fields a booking portal has to get right are here deliberately: `durationMinutes` is what the slot is sized
+to, and `bufferBeforeMinutes`/`bufferAfterMinutes` are what the availability guard widens it by, so a calendar that
+renders only the duration will offer slots the booking route then refuses.
+
+### `GET /api/v1/staff`
+The staff directory, with what each member offers.
+
+**Query parameters:** `locationId`, `serviceId` — both optional GUIDs, and `serviceId` matches through the
+`StaffServices` join, so it answers "who can perform this service". **No paging.** Ordered by `LastName`.
+
+**Response (200 OK)** — a bare JSON array:
+```json
+[
+  {
+    "id": "0ce79108-3015-481c-8bcf-1e5df1423933",
+    "firstName": "Ava",
+    "lastName": "Doc",
+    "title": "Dr",
+    "bio": "bio",
+    "email": "ava@probe.test",
+    "phoneNumber": "+1",
+    "colorHex": "#FFF",
+    "locationId": "7b1ce065-0eaf-41ef-902e-6cdfda8ba21b",
+    "offeredServices": [
+      {
+        "serviceId": "4c919d69-2dcd-4ae2-ae65-a9c77d442164",
+        "serviceName": "Consult",
+        "customDuration": null,
+        "customPrice": null
+      }
+    ]
+  }
+]
+```
+Only `IsActive` members appear. `customDuration`/`customPrice` are the per-staff overrides; when they are `null` the
+service's own `durationMinutes` and `price` are what the slot uses, which is the same precedence
+`GET /api/v1/availability` computes with. Note that this anonymous route returns `email` and `phoneNumber` for every
+active member of the tenant — a directory, not a masked list.
+
+---
+
+## 8. Customers
+
+Both customer routes sit behind the bearer token **and** a permission, and the tenant comes from the resolved
+context, never from the query string. `customers.update` and `customers.delete` exist in the role map and are
+granted to `TenantOwner`, `TenantAdmin`, `Manager` and `Receptionist` with **no route behind them**: the customers
+controller has no by-id read, no update verb and no delete verb. Two permissions the role map hands out buy
+nothing today.
+
+### `GET /api/v1/customers`
+The customer book, paged.
+
+**Permission:** `customers.read` — measured on one server: the same call as `Staff`, which holds it, answers `200`;
+as `Accountant`, which does not, answers `403` in the §1.1 envelope.
+
+**Query parameters:** `search`, `page` (default 1), `pageSize` (default 20). `search` is a `CONTAINS` match on first
+name, last name or email; ordering is `LastName` then `FirstName`.
+
+**Response (200 OK):**
+```json
+{
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "items": [
+    {
+      "id": "cc49c0b2-7025-4c60-bfc0-2b312e815ef2",
+      "firstName": "Nour",
+      "lastName": "Ali",
+      "email": "nour@probe.test",
+      "phoneNumber": "+963",
+      "totalBookings": 0,
+      "totalSpent": 0.00,
+      "isBlocked": false
+    }
+  ]
+}
+```
+**This is the other pagination envelope.** The appointment list and the collection queue answer `PaginatedList<T>`
+(`items`, `pageNumber`, `pageSize`, `totalCount`, `totalPages`, `hasNextPage`, `hasPreviousPage`); the customer and
+review lists answer `{ total, page, pageSize, items }` — the same idea under different member names, and a client
+that reads `totalCount` off this response reads a field that is not there. Recorded rather than renamed: two shapes
+is a wart, and changing a live field name from a documentation commit is worse than writing the wart down.
+
+**`page` and `pageSize` are not clamped, and a bad one is a `500` (open, `PAG-01`).** The appointment search clamps
+its page size to 1..100; this route passes both values straight into `Skip((page - 1) * pageSize).Take(pageSize)`.
+Measured on the wire: `?page=0` and `?pageSize=-5` each answer `500` with the contact-support text, and
+`?pageSize=100000` is honoured exactly as asked. So a client mistake is reported as a server fault, and a page size is
+a way to ask this table for the whole book. `GET /api/v1/reviews` carries the same expression and gave the same
+answer (`?page=0` measured `500`), which is why `PAG-01` is one rule for both list routes and not two bugs.
+
+### `POST /api/v1/customers`
+Adds a row to the book.
+
+**Permission:** `customers.create`. `Idempotency-Key` applies as it does to every state-changing `POST` (§1).
+
+**Request Payload** — `firstName`, `lastName` and `email` are required; `phoneNumber` and `notes` are optional:
+```json
+{
+  "firstName": "Ziad",
+  "lastName": "Haddad",
+  "email": "ziad@probe.test",
+  "phoneNumber": "+963999"
+}
+```
+An absent required field is `400` in the §1.1 envelope with the `errors` map naming each one — measured on an empty
+body: `The Email field is required.`, `The LastName field is required.`, `The FirstName field is required.` There is
+**no format check** on `email` and **no uniqueness rule** on it: the same address can be added twice and the second
+row is a second `CustomerId`. Written down rather than fixed from here — a client that deduplicates by email is
+doing work the server does not do.
+
+**Response (201 Created)** — the whole `Customer` entity, serialized raw:
+```json
+{
+  "tenantId": "416a5c42-9686-4a3c-bd62-e793dfdad7b7",
+  "firstName": "Ziad",
+  "lastName": "Haddad",
+  "email": "ziad@probe.test",
+  "phoneNumber": "+963999",
+  "notes": null,
+  "isBlocked": false,
+  "totalBookings": 0,
+  "totalSpent": 0,
+  "fullName": "Ziad Haddad",
+  "customerNotes": [],
+  "createdAtUtc": "2026-10-05T08:35:56.1837378Z",
+  "createdBy": "51ca245f-a256-42ce-875c-0843ef6dac3d",
+  "lastModifiedAtUtc": null,
+  "lastModifiedBy": null,
+  "isDeleted": false,
+  "deletedAtUtc": null,
+  "deletedBy": null,
+  "id": "fd3f3ee4-60cb-4ab2-8d06-6ea137e17d86",
+  "domainEvents": []
+}
+```
+Three things a client should not have to lean on are visible in that body, and they are the reason it has no DTO:
+`domainEvents` is the domain's in-memory outbox, `isDeleted`/`deletedAtUtc`/`deletedBy` are soft-delete plumbing, and
+`customerNotes` is a navigation collection caught while it is still empty. The list route above projects eight
+fields; this one returns the entity. Named as part of `LOC-01` instead of being quietly reshaped: the shape is what
+it is today, and a client that reads `id` and stops there is fine.
+
+**`Location`.** Measured: `http://localhost/api/v1/customers?id=fd3f3ee4-…`. The `201` points at
+`GET /api/v1/customers` with the new id as a query parameter, and that route has no `id` parameter — so following
+the `Location` returns page 1 of the whole book, not the customer just created. `CreatedAtAction(nameof(Search),
+new { id = … })` is the line that does it, and the URI is a leftover of that choice (`LOC-01`, same finding as the
+raw entity above).
+
+---
+
+## 9. Reviews
+
+### `GET /api/v1/reviews`
+The published reviews, paged.
+
+**Anonymous**, with the tenant from `X-Tenant-Id` or the token's context; no permission gate. **Query parameters:**
+`staffId`, `serviceId`, `page` (default 1), `pageSize` (default 20). Ordering is `CreatedAtUtc` descending.
+
+**Response (200 OK)** — `{ total, page, pageSize, items }`, the customer list's shape and not the `PaginatedList`
+one (§8):
+```json
+{
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "items": [
+    {
+      "id": "7a5e1c9d-2b34-4f6a-9c8b-1d0e9f8a7b6c",
+      "rating": 5,
+      "comment": "Clean clinic, quick visit.",
+      "response": null,
+      "staffId": "0ce79108-3015-481c-8bcf-1e5df1423933",
+      "staffName": "Ava Doc",
+      "serviceId": "4c919d69-2dcd-4ae2-ae65-a9c77d442164",
+      "serviceName": "Consult",
+      "createdAtUtc": "2026-10-05T09:12:00Z"
+    }
+  ]
+}
+```
+Only rows with `IsPublished` are listed, and the projection carries `response` — the tenant's reply — but never the
+`customerId`: a public review wall does not name the patient. `PAG-01` covers this route's paging too, measured
+above.
+
+### `POST /api/v1/reviews`
+Submits a review for a visit that happened.
+
+**`[Authorize]` only — there is no permission on this route.** Any authenticated account of the resolved tenant can
+submit, and the handler derives `customerId`, `staffId` and `serviceId` from the **appointment** rather than from the
+caller, so the request cannot name them. The access question this route asks is therefore "whose completed visit is
+this", and the answer it trusts is the `appointmentId` in the body.
+
+**Request Payload:**
+```json
+{
+  "appointmentId": "0b6a2b3c-2f77-4b1c-9d0e-1a2b3c4d5e6f",
+  "rating": 5,
+  "comment": "Clean clinic, quick visit."
+}
+```
+`rating` is `1..5` — measured `400` with `errors.Rating` = `'Rating' must be between 1 and 5. You entered 7.`
+— and `comment` is optional, max 2000.
+
+**Response (201 Created)** — a `ReviewDto`, which unlike the public wall above does name the customer:
+```json
+{
+  "id": "7a5e1c9d-2b34-4f6a-9c8b-1d0e9f8a7b6c",
+  "tenantId": "416a5c42-9686-4a3c-bd62-e793dfdad7b7",
+  "appointmentId": "0b6a2b3c-2f77-4b1c-9d0e-1a2b3c4d5e6f",
+  "customerId": "cc49c0b2-7025-4c60-bfc0-2b312e815ef2",
+  "customerName": "Nour Ali",
+  "staffId": "0ce79108-3015-481c-8bcf-1e5df1423933",
+  "staffName": "Ava Doc",
+  "serviceId": "4c919d69-2dcd-4ae2-ae65-a9c77d442164",
+  "serviceName": "Consult",
+  "rating": 5,
+  "comment": "Clean clinic, quick visit.",
+  "createdAtUtc": "2026-10-05T09:12:00Z"
+}
+```
+Its `Location` header is `/api/v1/reviews?appointmentId=…` — the same `CreatedAtAction` shape as `LOC-01`, with the
+same consequence: that route filters by `staffId` and `serviceId`, not by appointment, so following it returns the
+tenant's published wall instead of the review just written.
+
+**Refusals:** `404` when no appointment of that id is in the tenant (measured:
+`Appointment with ID … was not found.`); `422 AppointmentNotCompleted` — reviews exist only for visits that reached
+`Completed`, so the status machine in §4 is what decides what is reviewable; `422 DuplicateReview` for a second
+review on the same appointment. `Review.Create` sets both `IsVerified` and `IsPublished` to `true`, so a review this
+call accepts is on the public wall immediately: there is no moderation step to wait for, and no route to unpublish it
+again — the `response` column is writable only through the domain, and nothing here reaches it.
