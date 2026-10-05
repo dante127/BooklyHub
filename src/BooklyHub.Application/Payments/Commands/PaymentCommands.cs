@@ -1,5 +1,6 @@
 using BooklyHub.Application.Common.Interfaces;
 using BooklyHub.Domain.Entities.Payments;
+using BooklyHub.Domain.Entities.System;
 using BooklyHub.Domain.Enums;
 using BooklyHub.Domain.Exceptions;
 using FluentValidation;
@@ -78,11 +79,15 @@ public class ProcessPaymentCommandHandler : IRequestHandler<ProcessPaymentComman
                 // One key buys one charge. Reusing it for this appointment replays it; reusing it for a
                 // different appointment is refused instead of silently capturing a second payment, which
                 // is what the caller's retry means either way.
-                var keyed = await _db.Payments
+                // KEY-02: measured as a lost charge — a case-flipped key carrying 70.00 was answered 200 with the
+                // receipt of an earlier 40.00 payment, so the second capture never ran. The SQL equality narrows
+                // with the case the collation folds; the identity is decided here, byte for byte.
+                var candidates = await _db.Payments
                     .AsNoTracking()
-                    .FirstOrDefaultAsync(
-                        p => p.TenantId == request.TenantId && p.IdempotencyKey == request.IdempotencyKey,
-                        cancellationToken);
+                    .Where(p => p.TenantId == request.TenantId && p.IdempotencyKey == request.IdempotencyKey)
+                    .ToListAsync(cancellationToken);
+                var keyed = candidates.FirstOrDefault(p =>
+                    IdempotencyIdentity.SameKey(p.IdempotencyKey, request.IdempotencyKey));
 
                 if (keyed != null)
                 {

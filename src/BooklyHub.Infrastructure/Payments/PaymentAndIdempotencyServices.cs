@@ -71,7 +71,11 @@ public class IdempotencyService : IIdempotencyService
     {
         if (string.IsNullOrWhiteSpace(key)) return null;
 
-        var cacheKey = CacheKey(key);
+        // KEY-02: the row is addressed by a digest, so the collation has no case left to fold and the cache and
+        // the store are handed the same identity — which they were not, because an in-memory cache key is
+        // ordinal while SQL's equality was case-insensitive.
+        var storageId = IdempotencyIdentity.StorageId(key);
+        var cacheKey = CacheKey(storageId);
         var cached = await _cache.GetAsync<IdempotencyEntry>(cacheKey, cancellationToken);
 
         // The cache holds a copy of the record, so a copy must die when the record does. Checking the window
@@ -86,7 +90,7 @@ public class IdempotencyService : IIdempotencyService
         var nowUtc = _clock.UtcNow;
         var record = await _db.IdempotencyRecords
             .AsNoTracking()
-            .FirstOrDefaultAsync(r => r.Id == key && r.ExpiresAtUtc > nowUtc, cancellationToken);
+            .FirstOrDefaultAsync(r => r.Id == storageId && r.ExpiresAtUtc > nowUtc, cancellationToken);
 
         if (record == null) return null;
 
@@ -115,8 +119,9 @@ public class IdempotencyService : IIdempotencyService
     {
         if (string.IsNullOrWhiteSpace(key)) return;
 
+        var storageId = IdempotencyIdentity.StorageId(key);
         var nowUtc = _clock.UtcNow;
-        var record = new IdempotencyRecord(key, tenantId, requestHash, statusCode, responseBody, ttl, nowUtc);
+        var record = new IdempotencyRecord(storageId, tenantId, requestHash, statusCode, responseBody, ttl, nowUtc);
         _db.IdempotencyRecords.Add(record);
 
         try
@@ -129,20 +134,20 @@ public class IdempotencyService : IIdempotencyService
             // concurrent first-time requests with one key must not have the loser's response overwrite the
             // winner's, and deleting only the dead row is what leaves the live one to be replayed.
             await _db.IdempotencyRecords
-                .Where(r => r.Id == key && r.ExpiresAtUtc <= nowUtc)
+                .Where(r => r.Id == storageId && r.ExpiresAtUtc <= nowUtc)
                 .ExecuteDeleteAsync(cancellationToken);
 
             await _db.SaveChangesAsync(cancellationToken);
 
             await _cache.SetAsync(
-                CacheKey(key),
-                new IdempotencyEntry(key, requestHash, statusCode, responseBody, nowUtc, record.ExpiresAtUtc),
+                CacheKey(storageId),
+                new IdempotencyEntry(storageId, requestHash, statusCode, responseBody, nowUtc, record.ExpiresAtUtc),
                 ttl,
                 cancellationToken);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to persist idempotency key {Key}", key);
+            _logger.LogWarning(ex, "Failed to persist idempotency key {Key} (stored as {StorageId})", key, storageId);
         }
     }
 

@@ -4,6 +4,7 @@ using BooklyHub.Application.Payments.Commands;
 using BooklyHub.Application.Scheduling;
 using BooklyHub.Domain.Entities.Appointments;
 using BooklyHub.Domain.Entities.Resources;
+using BooklyHub.Domain.Entities.System;
 using BooklyHub.Domain.Entities.Tenancy;
 using BooklyHub.Domain.Enums;
 using BooklyHub.Domain.Exceptions;
@@ -139,9 +140,14 @@ public class BookAppointmentCommandHandler : IRequestHandler<BookAppointmentComm
                 // One key buys one booking. A retry that arrives while the first request is still in
                 // flight waits on the locks above and finds the committed row here, so the client gets its
                 // booking back instead of a conflict for a slot it already owns.
-                var keyed = await _db.Appointments
+                // KEY-02: the SQL equality narrows the set with the case the collation folds, so the decision is
+                // made here, byte for byte, over the few rows that fold together. Two clients whose keys differ
+                // only by case are two clients making two promises, and the second one gets its own booking.
+                var candidates = await _db.Appointments
                     .AsNoTracking()
-                    .FirstOrDefaultAsync(a => a.TenantId == request.TenantId && a.IdempotencyKey == idempotencyKey, cancellationToken);
+                    .Where(a => a.TenantId == request.TenantId && a.IdempotencyKey == idempotencyKey)
+                    .ToListAsync(cancellationToken);
+                var keyed = candidates.FirstOrDefault(a => IdempotencyIdentity.SameKey(a.IdempotencyKey, idempotencyKey));
 
                 if (keyed != null)
                 {

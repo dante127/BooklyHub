@@ -179,30 +179,31 @@ public class RetentionSweepBoundaryTests : IClassFixture<BooklyHubWebApplication
         _factory.Clock.Pin(Retention.Now);
         try
         {
+            var before = await Retention.IdempotencyKeysAsync(_factory);
+
             var client = _factory.CreateClient();
             client.DefaultRequestHeaders.Add("Idempotency-Key", "retention:wire");
             var response = await client.PostAsJsonAsync("/api/v1/auth/refresh-token", new { RefreshToken = token });
             response.StatusCode.Should().Be(HttpStatusCode.OK, await response.Content.ReadAsStringAsync());
 
-            // The middleware stores the caller's key behind the tenant that issued it, so the row is found by the
-            // suffix the client sent rather than by a prefix this file would have to guess.
+            // Tracked by what this one call added rather than by the caller's string: the middleware writes the
+            // key under an identity the sweep has no opinion about, and a horizon test that had to guess that
+            // identity would be testing its own guess. The row is the one the wire created, whoever it is keyed as.
             // The deadline is the middleware's own, so this is the two ends of one rule meeting: a sweep horizon
             // copied from a second constant would delete the row while the key still promises a replay.
-            (await Retention.IdempotencyKeysAsync(_factory))
-                .Should().Contain(key => key.EndsWith(":retention:wire"));
+            var storedId = (await Retention.IdempotencyKeysAsync(_factory)).Except(before).Single();
 
             _factory.Clock.AdvanceBy(RetentionPolicy.IdempotencyWindow - TimeSpan.FromHours(1));
             var stillLive = await Retention.SweepAsync(_factory);
             stillLive.IdempotencyRecords.Should().Be(0, "an hour before the deadline the response is still owed");
-            (await Retention.IdempotencyKeysAsync(_factory))
-                .Should().Contain(key => key.EndsWith(":retention:wire"));
+            (await Retention.IdempotencyKeysAsync(_factory)).Should().Contain(storedId);
 
             // One hour past the deadline, not a day past it: a horizon that deleted only grossly-aged rows would
             // pass a test that overshot.
             _factory.Clock.AdvanceBy(TimeSpan.FromHours(2));
             (await Retention.SweepAsync(_factory)).IdempotencyRecords.Should().Be(1);
             (await Retention.IdempotencyKeysAsync(_factory))
-                .Should().NotContain(key => key.EndsWith(":retention:wire"),
+                .Should().NotContain(storedId,
                     "past the window the stored body is a copy of somebody's booking in a table nobody reads");
         }
         finally

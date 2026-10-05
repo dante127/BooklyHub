@@ -146,9 +146,14 @@ public class IdempotencyScopeTests : IClassFixture<BooklyHubWebApplicationFactor
     {
         using var scope = _factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+        // KEY-02: the store addresses a key by a digest, so this helper borrows the same function to find the row.
+        // It is allowed to: what these three facts claim is about the *window* and the replacement, and the
+        // identity's own shape is pinned by IdempotencyIdentityTests, not by a lookup here.
+        var storageId = IdempotencyIdentity.StorageId($"{graph.TenantId:N}:{key}");
         return await db.IdempotencyRecords
             .AsNoTracking()
-            .FirstOrDefaultAsync(r => r.Id == $"{graph.TenantId:N}:{key}");
+            .FirstOrDefaultAsync(r => r.Id == storageId);
     }
 
     [Fact]
@@ -353,6 +358,9 @@ public class IdempotencyScopeTests : IClassFixture<BooklyHubWebApplicationFactor
     {
         var graph = await SeedGraphAsync("live-row-tenant");
         var scopedKey = $"{graph.TenantId:N}:{Guid.NewGuid():N}";
+        // Seeded under the identity the service writes under, not the caller's string: a row at the verbatim key
+        // would be a row the loser never sees, and the test would pass by missing the collision entirely.
+        var storageId = IdempotencyIdentity.StorageId(scopedKey);
 
         var winnerBody = "{\"appointmentId\":\"00000000-0000-0000-0000-000000000001\",\"winner\":true}";
         // One clock reading for both the row and the expectation: the unpinned test clock drifts by the
@@ -364,7 +372,7 @@ public class IdempotencyScopeTests : IClassFixture<BooklyHubWebApplicationFactor
         {
             var seedDb = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
             seedDb.IdempotencyRecords.Add(new IdempotencyRecord(
-                scopedKey, graph.TenantId, "hash-of-the-winner", 201, winnerBody,
+                storageId, graph.TenantId, "hash-of-the-winner", 201, winnerBody,
                 RetentionPolicy.IdempotencyWindow, seededAt));
             await seedDb.SaveChangesAsync();
         }
@@ -380,7 +388,7 @@ public class IdempotencyScopeTests : IClassFixture<BooklyHubWebApplicationFactor
         using (var scope = _factory.Services.CreateScope())
         {
             var readDb = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-            var stored = await readDb.IdempotencyRecords.AsNoTracking().FirstOrDefaultAsync(r => r.Id == scopedKey);
+            var stored = await readDb.IdempotencyRecords.AsNoTracking().FirstOrDefaultAsync(r => r.Id == storageId);
 
             stored.Should().NotBeNull("a key that was answered once is a key with a stored answer");
             stored!.ResponseBody.Should().Be(winnerBody,

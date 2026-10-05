@@ -9,7 +9,7 @@
   - `Authorization`: `Bearer <jwt_token>` (Required for authenticated routes)
   - `X-Tenant-ID`: `<guid>` (Required for public endpoints when not authenticated)
   - `X-Correlation-ID`: `<string>` (Optional client tracing identifier)
-  - `Idempotency-Key`: `<guid_or_string>` (Recommended for all state-changing `POST`/`PUT` operations) — replayed for 24 hours (`RetentionPolicy.IdempotencyWindow`) after the response it stored; the same key reused with a **different** payload inside that window is a `409`, and after it the key is just a new key. A replay is marked with the `X-Idempotent-Replay: true` response header.
+  - `Idempotency-Key`: `<guid_or_string>` (Recommended for all state-changing `POST`/`PUT` operations) — replayed for 24 hours (`RetentionPolicy.IdempotencyWindow`) after the response it stored; the same key reused with a **different** payload inside that window is a `409`, and after it the key is just a new key. A replay is marked with the `X-Idempotent-Replay: true` response header. The key is matched **byte for byte**: `KEY-02-PROBE` and `key-02-probe` are two keys, not one sent twice, so only a retry with the identical string may expect a replay (`KEY-02`, `docs/DATABASE.md` §3.4).
 
 ### 1.1 The Error Envelope
 
