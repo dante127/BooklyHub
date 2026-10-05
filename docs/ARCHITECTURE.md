@@ -83,7 +83,7 @@ Errors are never returned as raw text or stack traces. The `ExceptionHandlingMid
 - `UnauthorizedAccessException` ➔ `401 Unauthorized`.
 
 ### 4.2 Correlation & Observability
-Every request receives or preserves an `X-Correlation-ID` header. This correlation ID is pushed to Serilog's `LogContext`, ensuring that all logs emitted across handlers, EF Core queries, and background processors share the same traceable ID.
+Every request is answered under an `X-Correlation-ID` the server vouches for: a supplied value is preserved only when it is 1–64 characters of `A-Z a-z 0-9 . _ -`, and anything else is replaced by a freshly generated id (`SEC-13`). This correlation ID is pushed to Serilog's `LogContext`, ensuring that all logs emitted across handlers, EF Core queries, and background processors share the same traceable ID — which is also why the value cannot be the caller's verbatim text: the output template interpolates it into every line.
 
 ### 4.3 Idempotency Middleware
 All `POST` and `PUT` endpoints accept an optional or required `Idempotency-Key` header:

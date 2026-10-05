@@ -184,3 +184,48 @@ Three things this deliberately does not do, each named because it is a cost rath
 What the facts prove is bounded by where they listen. `CollectingLogger` hangs on the `ILogger<T>` seam, and that placement is measured rather than assumed: `UseSerilog()` replaces the container's `ILoggerFactory` with Serilog's own, which never enumerates the registered `ILoggerProvider` set — a provider registered the obvious way was listed by `GetServices<ILoggerProvider>()` and received nothing. So these are facts about the application's own lines. A framework category is outside them, and the only thing standing between one and a sink is `Serilog:MinimumLevel:Override:Microsoft = Warning` in `appsettings.json` — a configuration line, not a guarantee this repository tests.
 
 `IntegrationTests/Security/LogPrivacyTests.cs`: `TheCollector_MustSeeALineTheHostWrites` (the non-vacuity guard every absence below leans on), `ADispatch_MustLeaveItsChannelAndItsSizeAndNoneOfTheCustomer`, `AWrongPassword_MustLeaveItsCauseAndItsAccountInTheLog`, `AnUnknownAddress_MustBeRefusedByNameOfNothingItDoesNotHave`, `AnInactiveAccount_MustNotReadLikeAWrongPasswordToTheLog`, `ALockedOutAccount_MustSayLockedOutWhenThePasswordItWasGivenIsRight`, `ARefusedPasswordChange_MustNameTheDoorThatRefusedIt`.
+
+### 3.5 What the Server Will Take as a Correlation Id (`SEC-13`)
+
+`X-Correlation-Id` used to be whatever the client typed into it. The middleware read the header, wrote it to the
+response, and pushed it into Serilog's `LogContext` — and the output template interpolates that property **raw**,
+inside brackets: `[HH:mm:ss LVL] [{CorrelationId}] {Message:lj} {Exception}` (`Program.cs:21`). So one caller string
+reached three places the server does not own: a response header, the `correlationId` field of every problem body
+(`Middlewares.cs`, `Program.cs`), and a span of every log line its request produced. Nothing bounded it and nothing
+filtered it, which means a caller could put a few kilobytes of its own prose into the record an operator reads, in a
+shape that imitates the template's own structure — `] [99:59:59 ERR] auth:login success for admin [` is a log line a
+caller wrote, wearing the server's timestamp.
+
+The rule now: the id the server uses is **either byte-for-byte what the caller sent, or one the server made**. A
+supplied value is kept when it is 1..64 characters of `[A-Za-z0-9._-]`; anything else is replaced with a fresh
+`Guid.NewGuid().ToString("N")`. `CorrelationIdMiddleware.Resolve` is the only place that decides, and the header, the
+body and the log property all read from its answer, so they cannot disagree.
+
+**Replacing rather than cleaning up is the decision, and it is tested as one.** Stripping the unsafe characters and
+truncating to the cap would have satisfied every "is it boring now" check and still produced a third string: the
+caller searching its own logs for `req-9` and finding `req9`, an operator unable to tell a served id from a mangled
+one, and two different caller values folding into one identifier — which is the opposite of what a correlation id is
+for. `AssertServerMadeId` in the facts is the assertion that separates the two designs: a refused value must come
+back as the server's own format, not as an edit of the caller's.
+
+Two things the change deliberately does not claim:
+
+- **It is not about the database.** `AuditLogs.CorrelationId` is `nvarchar(100)` (`OperationalConfigurations.cs:458`),
+  and 64 fits inside it — but nothing writes that table. `AuditLog` has no writer anywhere in `src`, and
+  `RetentionSweepBackgroundService`'s own remarks call it "dead schema", so no value was ever persisted. There was no
+  truncation failure to fix here, and a fact about one would have been a fact about a table this server does not fill.
+- **It is not a transport bound.** Kestrel's own header limit already caps what arrives, far above 64. What this rule
+  bounds is how much attacker-authored text the application chooses to splice into its own records and hand back.
+
+The log half is asserted at the two places a caller can read (header and body), not in the log itself:
+`LogContext.PushProperty` is Serilog's enrichment, while the test host's collector (`CollectingLogger`, §3.4) sits on
+the `ILogger<T>` seam, so a fact reading the log scope would pass with the middleware unchanged. That is the same
+dead-seam measurement §3.4 records, applied here to keep the claim honest.
+
+`IntegrationTests/Security/CorrelationIdBoundaryTests.cs` (9 facts): `ASafeCorrelationIdFromTheClient_MustComeBackUnchangedInBothPlaces`
+(the rule must not become "always generate", or the header stops being a handle), `ACorrelationIdExactlyAtTheLengthCap_MustBeKept`,
+`ACorrelationIdOneOverTheLengthCap_MustBeReplacedInBothPlaces`, `ACorrelationIdCarryingUnsafeCharacters_MustBeReplacedNotPassedThrough`,
+`ACorrelationIdOfNothingButUnsafeCharacters_MustStillYieldAUsableId` (the empty-bracket case a strip-design leaves),
+`ANewlineBearingCorrelationId_MustNotReachTheEchoedId`, `ACorrelationIdWithATrailingNewline_MustBeReplaced` (the fact that
+makes the pattern's `\z` anchor load-bearing — `$` would accept it), `ANoCorrelationIdSent_MustStillGetOneTheServerMade`,
+`TwoReplacementsInARow_MustNotCollide`.

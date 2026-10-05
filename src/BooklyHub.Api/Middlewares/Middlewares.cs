@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using BooklyHub.Domain.Exceptions;
 using FluentValidation;
 using Microsoft.AspNetCore.Mvc;
@@ -11,6 +12,14 @@ namespace BooklyHub.Api.Middlewares;
 public class CorrelationIdMiddleware
 {
     public const string CorrelationIdHeader = "X-Correlation-Id";
+
+    /// <summary>
+    /// SEC-13: this value is echoed on the response, reflected in every problem body, and spliced raw into the log line
+    /// by Serilog's output template, so it is only safe as far as it is boring. A caller that labels its own request
+    /// gets that label back; a caller that sends something else gets a server-made id, not a censored version of its own.
+    /// </summary>
+    private static readonly Regex SuppliedId = new(@"\A[A-Za-z0-9._-]{1,64}\z", RegexOptions.Compiled);
+
     private readonly RequestDelegate _next;
 
     public CorrelationIdMiddleware(RequestDelegate next)
@@ -18,10 +27,25 @@ public class CorrelationIdMiddleware
         _next = next;
     }
 
+    /// <summary>
+    /// The id this request will be logged and answered under. Replaces rather than strips: stripping unsafe characters
+    /// can fold two different caller ids into one string, which is the opposite of what a correlation id is for, and a
+    /// value that is nothing but unsafe characters strips to an empty bracket. Nothing is padded or trimmed either —
+    /// the echoed id is either exactly what the caller sent or exactly a server-made one, never a third string that
+    /// neither side recognises.
+    /// </summary>
+    public static string Resolve(string? supplied)
+    {
+        // \z, not $: $ matches just before a trailing newline, so a value ending in one would pass a rule whose whole
+        // point is that the id cannot reshape the text it is embedded in.
+        return supplied is not null && SuppliedId.IsMatch(supplied)
+            ? supplied
+            : Guid.NewGuid().ToString("N");
+    }
+
     public async Task InvokeAsync(HttpContext context)
     {
-        var correlationId = context.Request.Headers[CorrelationIdHeader].FirstOrDefault() 
-                            ?? Guid.NewGuid().ToString("N");
+        var correlationId = Resolve(context.Request.Headers[CorrelationIdHeader].FirstOrDefault());
 
         context.Response.Headers[CorrelationIdHeader] = correlationId;
 
