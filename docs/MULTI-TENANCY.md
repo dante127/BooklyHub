@@ -37,7 +37,16 @@ The `TenantResolutionMiddleware` runs at the front of the HTTP pipeline and esta
 
 1. **Authenticated Users**: The middleware inspects the JWT claims for `tenant_id`. For authenticated staff or customers, the JWT claim is the **cryptographic source of truth** and cannot be spoofed by custom request headers.
 2. **Public / Anonymous Endpoints**: For public endpoints (e.g. guest booking portals or availability checks), the tenant is resolved via the `X-Tenant-ID` request header or subdomain routing.
-3. **Tenant Existence & Status Check**: The middleware confirms that the resolved `TenantId` exists in the database and `IsActive == true`. If invalid or inactive, the request is rejected with `400 Bad Request` or `403 Forbidden`.
+3. **Tenant Existence & Status Check**: There is none in this middleware. It makes no database call, and the global
+   query filter only adds `!IsDeleted` (`ApplicationDbContext.cs:83-129`), never `IsActive`. What actually happens
+   is measured in `InactiveTenantReadPathsTests`: the one read path that asks whether the tenant is active is the
+   availability service (`AvailabilityService.cs:405-414`), and it does not refuse the request — it answers a
+   normal `200` with `isOpen: false` and an empty `slots` array, because its own rule set already has a
+   "not bookable" shape. Every other anonymous read (`/api/v1/staff`, `/api/v1/services`, `/api/v1/reviews`) filters
+   on the **row's** `IsActive` and answers a switched-off tenant's rows unchanged. An invalid or inactive tenant is
+   therefore never met with `400` or `403` on these routes. That is the current contract, not the intent: closing
+   the gap needs a product decision about whether a tenant id is secret, which is tracked as `SEC-03` in
+   `docs/AUDIT-STATUS.md`.
 
 ---
 

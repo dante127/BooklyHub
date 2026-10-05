@@ -45,12 +45,26 @@ GROUP BY [Status];
 
 ---
 
-## 3. High-Throughput Pagination (`PaginatedList<T>`)
+## 3. Pagination (`Paging` and `PaginatedList<T>`)
 
-All list endpoints enforce standardized pagination:
-- **Maximum Page Size**: Capped at `50` to prevent memory exhaustion attacks.
-- **SQL Server Dialect**: Translated to native `OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY`.
-- **Parallel Optimization**: Count query and paginated item query execute with minimal overhead.
+Measured at `c67480f`, because this section previously claimed "all list endpoints enforce standardized pagination"
+with a page size "capped at `50`", and neither was true:
+
+- **Four routes are paged, and all four go through one rule.** `GET /api/v1/customers`, `GET /api/v1/reviews`,
+  `GET /api/v1/appointments` and `GET /api/v1/payments/outstanding-visits` normalize through
+  `Paging.NormalizePage` / `NormalizePageSize` / `Offset`. The ceiling is **100** with a default of **20**, not 50
+  (`Paging.cs:5-6`), and an out-of-range ask falls back to the default rather than to the ceiling.
+- **Two list routes are not paged at all.** The anonymous catalog reads answer a bare array with no `page`,
+  `pageSize` or `Take` (`CatalogControllers.cs:27-55`, `:72-109`), so their size is bounded only by how many rows a
+  tenant has. That is `PERF-04`'s open residue, not a clamp waiting for a different number.
+- **The offset is computed before it is handed to SQL.** `(page - 1) * pageSize` in `int` wraps negative for a large
+  `page` and reaches the server as `OFFSET -40`, which faults; `Paging.Offset` multiplies in `long` and saturates at
+  `int.MaxValue` instead (`PAG-01`).
+- **Two envelopes coexist.** `PaginatedList<T>` carries `items, pageNumber, pageSize, totalCount, totalPages,
+  hasNextPage, hasPreviousPage`; the flat shape carries `total, page, pageSize, items`. A client reading the applied
+  page has to try `pageNumber` then `page`.
+- **Translation and overhead.** Both envelopes still land on native `OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY`,
+  and the count query and the item query run as two separate round trips.
 
 ---
 
