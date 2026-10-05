@@ -79,8 +79,8 @@ public class SearchAppointmentsQueryHandler : IRequestHandler<SearchAppointments
 
     public async Task<PaginatedList<AppointmentDto>> Handle(SearchAppointmentsQuery request, CancellationToken cancellationToken)
     {
-        var page = request.Page < 1 ? 1 : request.Page;
-        var pageSize = request.PageSize is < 1 or > 100 ? 20 : request.PageSize;
+        var page = Paging.NormalizePage(request.Page);
+        var pageSize = Paging.NormalizePageSize(request.PageSize);
 
         var query = _db.Appointments
             .AsNoTracking()
@@ -131,7 +131,7 @@ public class SearchAppointmentsQueryHandler : IRequestHandler<SearchAppointments
         var items = await query
             .OrderBy(a => a.StartAtUtc)
             .ThenBy(a => a.Id)
-            .Skip((page - 1) * pageSize)
+            .Skip(Paging.Offset(page, pageSize))
             .Take(pageSize)
             .Select(a => new AppointmentDto(
                 a.Id,

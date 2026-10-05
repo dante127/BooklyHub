@@ -1,4 +1,5 @@
 using BooklyHub.Application.Common.Interfaces;
+using BooklyHub.Application.Common.Models;
 using BooklyHub.Application.Security;
 using BooklyHub.Domain.Entities.Customers;
 using BooklyHub.Domain.Entities.Services;
@@ -126,9 +127,12 @@ public class CustomersController : ControllerBase
 
     [HttpGet]
     [HasPermission(Permissions.Customers.Read)]
-    public async Task<ActionResult> Search([FromQuery] string? search, [FromQuery] int page = 1, [FromQuery] int pageSize = 20, CancellationToken cancellationToken = default)
+    public async Task<ActionResult> Search([FromQuery] string? search, [FromQuery(Name = "page")] int requestedPage = 1, [FromQuery(Name = "pageSize")] int requestedPageSize = 20, CancellationToken cancellationToken = default)
     {
         var tenantId = TenantGuard.RequireId(_tenantContext);
+
+        var page = Paging.NormalizePage(requestedPage);
+        var size = Paging.NormalizePageSize(requestedPageSize);
 
         var query = _db.Customers
             .AsNoTracking()
@@ -143,8 +147,8 @@ public class CustomersController : ControllerBase
         var customers = await query
             .OrderBy(c => c.LastName)
             .ThenBy(c => c.FirstName)
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
+            .Skip(Paging.Offset(page, size))
+            .Take(size)
             .Select(c => new
             {
                 c.Id,
@@ -158,7 +162,7 @@ public class CustomersController : ControllerBase
             })
             .ToListAsync(cancellationToken);
 
-        return Ok(new { total, page, pageSize, items = customers });
+        return Ok(new { total, page, pageSize = size, items = customers });
     }
 
     [HttpPost]

@@ -52,8 +52,8 @@ public class GetOutstandingVisitsQueryHandler : IRequestHandler<GetOutstandingVi
         GetOutstandingVisitsQuery request,
         CancellationToken cancellationToken)
     {
-        var page = request.Page < 1 ? 1 : request.Page;
-        var pageSize = request.PageSize is < 1 or > 100 ? 20 : request.PageSize;
+        var page = Paging.NormalizePage(request.Page);
+        var pageSize = Paging.NormalizePageSize(request.PageSize);
 
         // The same window the sweep closes on, so the two surfaces cannot disagree about when a visit became
         // overdue. No lookback bound: the sweep needs one because it writes, a queue needs none because a
@@ -72,7 +72,7 @@ public class GetOutstandingVisitsQueryHandler : IRequestHandler<GetOutstandingVi
         var rows = await query
             .OrderBy(a => a.EndAtUtc)
             .ThenBy(a => a.Id)
-            .Skip((page - 1) * pageSize)
+            .Skip(Paging.Offset(page, pageSize))
             .Take(pageSize)
             .Select(a => new
             {

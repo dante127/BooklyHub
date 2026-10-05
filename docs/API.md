@@ -311,7 +311,8 @@ occurrence; on this endpoint its only visible effect is the empty list.
 The schedule reader: one paged list, filtered by location, staff, customer and status.
 
 **Query parameters:** `locationId`, `staffId`, `customerId`, `status`, `fromUtc`, `toUtc`, `page` (default 1),
-`pageSize` (default 20, clamped to 1..100). There is no `nowUtc` parameter, for the same reason the collection
+`pageSize` (default 20, bounded by the one `Paging` rule §8 describes — a page below 1 is page 1, a size outside
+1..100 is 20). There is no `nowUtc` parameter, for the same reason the collection
 queue has none: the window is decided by the server clock, so a caller cannot pull a not-yet-due booking into
 the page by lying about the time.
 
@@ -590,8 +591,8 @@ The collection queue: visits the clinic is past its window on and still owes mon
 chases payment is the desk that needs this list. This is the first endpoint in the codebase gated on
 `payments.read`; the permission existed in the role map with no surface behind it.
 
-**Query parameters:** `page` (default 1) and `pageSize` (default 20, clamped to 1..100 exactly as the
-appointment search clamps it). There is no `nowUtc` parameter: the window comes from the server clock, so a
+**Query parameters:** `page` (default 1) and `pageSize` (default 20, bounded by the same `Paging` rule as the
+appointment search). There is no `nowUtc` parameter: the window comes from the server clock, so a
 caller cannot pull a not-yet-overdue booking into the queue by lying about the time.
 
 **What is in the queue** — a row has to satisfy all four:
@@ -867,12 +868,15 @@ review lists answer `{ total, page, pageSize, items }` — the same idea under d
 that reads `totalCount` off this response reads a field that is not there. Recorded rather than renamed: two shapes
 is a wart, and changing a live field name from a documentation commit is worse than writing the wart down.
 
-**`page` and `pageSize` are not clamped, and a bad one is a `500` (open, `PAG-01`).** The appointment search clamps
-its page size to 1..100; this route passes both values straight into `Skip((page - 1) * pageSize).Take(pageSize)`.
-Measured on the wire: `?page=0` and `?pageSize=-5` each answer `500` with the contact-support text, and
-`?pageSize=100000` is honoured exactly as asked. So a client mistake is reported as a server fault, and a page size is
-a way to ask this table for the whole book. `GET /api/v1/reviews` carries the same expression and gave the same
-answer (`?page=0` measured `500`), which is why `PAG-01` is one rule for both list routes and not two bugs.
+**`page` and `pageSize` are bounded by one rule (`Paging`, `PAG-01` closed).** `?page=0` used to answer `500` with
+the contact-support text, `?pageSize=-5` answered `500`, and `?pageSize=100000` was honoured exactly as asked — a
+page size that was also a way to ask this table for the whole book. The appointment search and the collection queue
+clamped both values but still computed `(page - 1) * pageSize` as an `int`, so `?page=2147483647` overflowed to a
+negative offset and answered `500` on **all four** paged routes. One rule now covers all of it: a page below 1 is
+page 1, a size outside 1..100 is the default 20, and the offset is multiplied in `long` and capped at
+`int.MaxValue`, so a page past the end of the book is an empty page instead of a server fault. The `page` and
+`pageSize` this response echoes are the values that were **applied**, which is what makes `?page=0` and `?page=1`
+answer alike rather than looking alike.
 
 ### `POST /api/v1/customers`
 Adds a row to the book.
@@ -964,8 +968,8 @@ one (§8):
 }
 ```
 Only rows with `IsPublished` are listed, and the projection carries `response` — the tenant's reply — but never the
-`customerId`: a public review wall does not name the patient. `PAG-01` covers this route's paging too, measured
-above.
+`customerId`: a public review wall does not name the patient. This route's paging is bounded by the same `Paging`
+rule §8 describes, and answered `500` for `?page=0` before it (`PAG-01`).
 
 ### `POST /api/v1/reviews`
 Submits a review for a visit that happened.

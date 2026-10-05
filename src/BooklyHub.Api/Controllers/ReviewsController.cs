@@ -1,4 +1,5 @@
 using BooklyHub.Application.Common.Interfaces;
+using BooklyHub.Application.Common.Models;
 using BooklyHub.Application.Reviews.Commands;
 using BooklyHub.Application.Security;
 using BooklyHub.Infrastructure.Security;
@@ -46,8 +47,8 @@ public class ReviewsController : ControllerBase
     public async Task<ActionResult> GetReviews(
         [FromQuery] Guid? staffId,
         [FromQuery] Guid? serviceId,
-        [FromQuery] int page = 1,
-        [FromQuery] int pageSize = 20,
+        [FromQuery(Name = "page")] int requestedPage = 1,
+        [FromQuery(Name = "pageSize")] int requestedPageSize = 20,
         CancellationToken cancellationToken = default)
     {
         var tenantId = TenantGuard.RequireId(_tenantContext);
@@ -59,11 +60,14 @@ public class ReviewsController : ControllerBase
         if (staffId.HasValue) query = query.Where(r => r.StaffId == staffId.Value);
         if (serviceId.HasValue) query = query.Where(r => r.ServiceId == serviceId.Value);
 
+        var page = Paging.NormalizePage(requestedPage);
+        var size = Paging.NormalizePageSize(requestedPageSize);
+
         var total = await query.CountAsync(cancellationToken);
         var reviews = await query
             .OrderByDescending(r => r.CreatedAtUtc)
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
+            .Skip(Paging.Offset(page, size))
+            .Take(size)
             .Select(r => new
             {
                 r.Id,
@@ -78,6 +82,6 @@ public class ReviewsController : ControllerBase
             })
             .ToListAsync(cancellationToken);
 
-        return Ok(new { total, page, pageSize, items = reviews });
+        return Ok(new { total, page, pageSize = size, items = reviews });
     }
 }
