@@ -78,6 +78,17 @@ public class AuthController : ControllerBase
         instance: HttpContext.Request.Path.Value);
 
     /// <summary>
+    /// The row the presented credential names, plus that row's successor link exactly as it was stored. The second
+    /// half is the reason this is not just a <see cref="RefreshToken"/>: <c>SEC-05d</c> — upgrading a legacy row
+    /// rewrites its plaintext link into a digest, and a digest is the one value the burn walk cannot point with at a
+    /// row that never saw the upgrade.
+    /// </summary>
+    private sealed record Presentation(RefreshToken? Record, string? ReplacedByTokenAsStored)
+    {
+        public static readonly Presentation None = new(null, null);
+    }
+
+    /// <summary>
     /// SEC-05: the column stores a digest of the credential, so the presented string is digested before it is
     /// compared and a read of the table authorizes nothing. The second read is the transition, not a permanent
     /// compatibility branch: rows written before this change carry the wire string itself, and each one is
@@ -93,7 +104,7 @@ public class AuthController : ControllerBase
     /// are <c>SQL_Latin1_General_CP1_CI_AS</c>, and SQL Server's <c>=</c> ignores trailing space too, so a
     /// case-flipped or space-padded copy of a legacy credential used to redeem it).
     /// </summary>
-    private async Task<RefreshToken?> FindPresentedTokenAsync(string presented, CancellationToken cancellationToken)
+    private async Task<Presentation> FindPresentationAsync(string presented, CancellationToken cancellationToken)
     {
         async Task<RefreshToken?> ByStoredValue(string stored) => await _db.RefreshTokens
             .Include(rt => rt.User)
@@ -103,20 +114,22 @@ public class AuthController : ControllerBase
             .FirstOrDefaultAsync(rt => rt.Token == stored, cancellationToken);
 
         var record = await ByStoredValue(_protector.Protect(presented));
-        if (record != null) return record;
+        if (record != null) return new Presentation(record, record.ReplacedByToken);
 
         record = await ByStoredValue(presented);
         if (record == null || _protector.IsProtected(record.Token) || !string.Equals(record.Token, presented, StringComparison.Ordinal))
-            return null;
+            return Presentation.None;
 
+        var linkAsStored = record.ReplacedByToken;
         record.Token = _protector.Protect(presented);
 
         // A row old enough to hold a plaintext credential holds a plaintext successor link too; leaving that
-        // behind would keep the next session's credential recoverable from this row.
-        if (record.ReplacedByToken != null)
-            record.ReplacedByToken = _protector.Protect(record.ReplacedByToken);
+        // behind would keep the next session's credential recoverable from this row. The caller is handed the value
+        // from before this line, because once it is a digest there is no reading it back into a pointer.
+        if (linkAsStored != null)
+            record.ReplacedByToken = _protector.Protect(linkAsStored);
 
-        return record;
+        return new Presentation(record, linkAsStored);
     }
 
     /// <summary>
@@ -128,25 +141,42 @@ public class AuthController : ControllerBase
     /// on the case the finding is about. A row's original <c>RevokedAtUtc</c> is left alone — overwriting it would
     /// destroy the record of when the honest client spent it.
     ///
+    /// <c>SEC-05d</c>: the walk starts from the link <em>as the row recorded it</em>, handed over by the read, not
+    /// from the entity's current value. Redeeming a legacy row upgrades what it holds, and the upgrade turns a
+    /// plaintext link into a digest — which is the right thing for the row and the wrong thing for a pointer, since
+    /// the successor may be a row no client has presented since the release and therefore still plaintext. Measured
+    /// with the entity's post-upgrade value: the replay was refused, the walk found nothing, and the thief's next
+    /// credential stayed live.
+    ///
     /// One link is one redemption, and a redemption hands out roughly <c>Jwt:ExpirationMinutes</c> of access, so
     /// seven days of one honest client is on the order of 168 links; the bound is not a policy threshold, it is
     /// the guard against a cycle the data cannot form — a link points at a row created after it, and the digest
     /// column is unique-indexed.
     /// </summary>
-    private async Task BurnChainAsync(RefreshToken spent, CancellationToken cancellationToken)
+    private async Task BurnChainAsync(RefreshToken spent, string startingLink, CancellationToken cancellationToken)
     {
         const int MaxChainLinks = 500;
 
         var revoked = 0;
-        var next = spent.ReplacedByToken;
+        var next = startingLink;
 
         // Counted in steps, not in revocations: the run behind a replayed link is mostly already-revoked rows, and
         // a bound that only fires on newly revoked ones would let an exhausted chain be walked without limit.
         for (var steps = 0; next != null && steps < MaxChainLinks; steps++)
         {
             var link = next;
+
+            // A link is only as current as the row that wrote it, and the two halves of a chain can cross a release
+            // in opposite directions: a plaintext link may name a row that has since been upgraded to a digest, and
+            // a digest link may name one that has not. Resolve both, because a walk that guesses one form burns only
+            // the half of the deploy it guessed at. An already-digest link needs no second form — the raw value it
+            // was made from is not held anywhere.
+            var forms = _protector.IsProtected(link)
+                ? new[] { link }
+                : new[] { link, _protector.Protect(link) };
+
             var row = await _db.RefreshTokens
-                .FirstOrDefaultAsync(rt => rt.Token == link, cancellationToken);
+                .FirstOrDefaultAsync(rt => forms.Contains(rt.Token), cancellationToken);
 
             if (row == null) break;
 
@@ -340,7 +370,8 @@ public class AuthController : ControllerBase
     [EnableRateLimiting("auth")]
     public async Task<ActionResult<AuthResponse>> RefreshToken([FromBody] RefreshTokenRequest request, CancellationToken cancellationToken)
     {
-        var tokenRecord = await FindPresentedTokenAsync(request.RefreshToken, cancellationToken);
+        var presentation = await FindPresentationAsync(request.RefreshToken, cancellationToken);
+        var tokenRecord = presentation.Record;
 
         // Four reasons, one answer: never issued, expired, revoked, or the account behind it is no longer
         // allowed to sign in. `IsActive` was a login-only rule, so deactivating a user was a delay of up to the
@@ -354,8 +385,8 @@ public class AuthController : ControllerBase
             // give, and a refusal alone throws it away — the thief keeps the rest of the chain and the owner sees
             // nothing. Burn the chain first, then refuse in exactly the same words as any other refusal, so the
             // signal stays in the data and not in the response.
-            if (tokenRecord is { IsRevoked: true, ReplacedByToken: not null })
-                await BurnChainAsync(tokenRecord, cancellationToken);
+            if (tokenRecord is { IsRevoked: true } && presentation.ReplacedByTokenAsStored != null)
+                await BurnChainAsync(tokenRecord, presentation.ReplacedByTokenAsStored, cancellationToken);
 
             return Refusal("Invalid or expired refresh token.");
         }
@@ -415,7 +446,7 @@ public class AuthController : ControllerBase
     [EnableRateLimiting("auth")]
     public async Task<IActionResult> Logout([FromBody] LogoutRequest request, CancellationToken cancellationToken)
     {
-        var tokenRecord = await FindPresentedTokenAsync(request.RefreshToken, cancellationToken);
+        var tokenRecord = (await FindPresentationAsync(request.RefreshToken, cancellationToken)).Record;
 
         if (tokenRecord is { IsRevoked: false })
             tokenRecord.RevokedAtUtc = _clock.UtcNow;

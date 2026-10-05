@@ -22,6 +22,18 @@ internal static class CredentialRows
     /// <summary>Writes a row in the shape the code produced before SEC-05a: the credential itself, no digest.</summary>
     public static async Task SeedRowAsync(BooklyHubWebApplicationFactory factory, Guid userId, string storedToken)
     {
+        await SeedRowAsync(factory, userId, storedToken, null, null);
+    }
+
+    /// <summary>
+    /// A row that crossed the release, in the shape the old code wrote it: the credential as the string that was
+    /// issued, and — for a row an old rotation spent — a successor link that is also a plaintext credential.
+    /// <c>SEC-05d</c> is about what the burn walk does with that link.
+    /// </summary>
+    public static async Task SeedRowAsync(
+        BooklyHubWebApplicationFactory factory, Guid userId, string storedToken,
+        string? replacedByStoredToken, DateTime? revokedAtUtc)
+    {
         using var scope = factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
 
@@ -30,11 +42,54 @@ internal static class CredentialRows
             Id = Guid.NewGuid(),
             UserId = userId,
             Token = storedToken,
+            ReplacedByToken = replacedByStoredToken,
+            RevokedAtUtc = revokedAtUtc,
             ExpiresAtUtc = factory.Clock.UtcNow.AddDays(7),
-            CreatedAtUtc = factory.Clock.UtcNow
+            CreatedAtUtc = factory.Clock.UtcNow.AddDays(-1)
         });
 
         await db.SaveChangesAsync();
+    }
+
+    /// <summary>An account with no session: the rows under test are seeded, not logged in, so the wire cost is the replay alone.</summary>
+    public static async Task<Guid> SeedUserAsync(BooklyHubWebApplicationFactory factory, string email)
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+        var userId = Guid.NewGuid();
+        db.Users.Add(new User
+        {
+            Id = userId,
+            Email = email,
+            PasswordHash = "not-used-by-this-path",
+            FirstName = "Legacy",
+            LastName = "Chain",
+            TenantId = null
+        });
+        await db.SaveChangesAsync();
+
+        return userId;
+    }
+
+    /// <summary>A run of spent rows and one live tip, every value stored as plaintext.</summary>
+    public static async Task<string[]> SeedLegacyChainAsync(
+        BooklyHubWebApplicationFactory factory, Guid userId, int links)
+    {
+        var raws = Enumerable.Range(0, links)
+            .Select(_ => $"legacy-{Guid.NewGuid():N}")
+            .ToArray();
+
+        var spentAt = factory.Clock.UtcNow.AddHours(-2);
+        for (var i = 0; i < links; i++)
+        {
+            var isTip = i == links - 1;
+            await SeedRowAsync(factory, userId, raws[i],
+                isTip ? null : raws[i + 1],
+                isTip ? null : spentAt.AddMinutes(i));
+        }
+
+        return raws;
     }
 
     public static async Task<List<RefreshToken>> ForAsync(BooklyHubWebApplicationFactory factory, Guid userId)
