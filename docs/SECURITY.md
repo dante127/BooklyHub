@@ -152,3 +152,35 @@ A third producer had to be fixed where it stood, because no middleware reaches i
 The same condition in the controllers — refusing without throwing — was the other half of `ENV-01`, and it is now closed too. Ten guards checked for a missing tenant context: seven returned `BadRequest(new { message = … })`, and three threw a `BadHttpRequestException` that the boundary had never mapped, so they answered `500` with the contact-support text to a request that named no tenant. All ten now go through one guard that throws `BadHttpRequestException(…, 400)`, one mapping arm turns that into the standard problem document, and the reason the `500`s happened at all is that the mapping table is a list of types rather than a range of statuses — an unmapped exception is a server fault by default, which is the wrong default for a type whose name says the client was wrong. `BadHttpRequestException` is mapped from the status it carries, not to a fixed one, because the framework also raises it for a too-large body (`413`); the title comes from `ReasonPhrases`, so the two refusals do not share a name they did not earn.
 
 One consequence of the same measurement is **not** fixed: a mapped `4xx` that the boundary produces from `NotFoundException`, `ValidationException` or a business-rule violation is still logged at `ERROR` with a stack trace, the same as a genuine server fault. Downgrading it is a decision about what the alerting threshold means, not about the envelope, and it is tracked as `LOG-01`. `BadHttpRequestException` is the only refusal type downgraded to `WARNING`, precisely because it is the only one that carries its own status and so can be told apart without a list.
+
+### 3.4 What a Log Line Carries (`SEC-09`)
+
+Two halves, one rule: a line may carry what this server knows about an event and not the customer's own words.
+
+**An outbound dispatch.** The three simulated senders in `NotificationAndCacheServices.cs` used to write their payload at `Information` — the address and subject line of an appointment email, a phone number and the sentence *"Your appointment is confirmed for …"*. `Information` is the level every environment runs at, so a dispatch left a copy of a patient's schedule in whatever sink an operator points the console at. A dispatch still has to leave a trace, because for these senders the line is the only evidence one was asked for and `OutboundProviderPolicy` refuses them in Production on exactly that description. What stays is the channel and the size of the payload:
+
+```
+[EMAIL DISPATCHED] subject 74 char(s), body 90 char(s)
+[SMS DISPATCHED] message 67 char(s)
+[PUSH DISPATCHED] recipient 753ec034-fb01-4b25-8f13-c04565d62f3c, title 61 char(s)
+```
+
+A recipient **id** stays, because it is a key this server minted and an id is what every other line here carries. An address does not, because it is the customer's.
+
+**A refusal that takes a password.** The four causes a sign-in is refused for — `unknown-account`, `bad-password`, `inactive-account`, `locked-out` — answer one sentence on the wire (`SEC-04(c)`), and until now they answered one sentence in the data too: three of the four wrote no row and no line, so *"why was this person turned away"* could not be reconstructed from anything the server keeps. Each now writes one `WARNING`:
+
+```
+Refused at auth:login: locked-out for user 708a5df1-901a-4c50-8ba5-0025f6a1b522. Correlation-Id c8a816fe…
+```
+
+The cause is decided by one classifier (`RefusalReason`) shared by both doors that take a password; the door is named with the same string `RecordFailedLoginAsync` writes into `LastModifiedBy`, so a streak that grew across the two doors is still traceable to each. A cause in the *response* is the oracle this section's whole budget went to closing, and the facts pin that it stayed out.
+
+Three things this deliberately does not do, each named because it is a cost rather than an oversight:
+
+- **The address a refused caller typed is not kept.** An operator can count `unknown-account` refusals and cannot list which addresses they name. That is the intended direction: the address is the caller's claim about an account, and writing it down makes the log a list of every address anyone has ever typed into the box. The guessing run it would have revealed is the rate limiter's to answer (§3.1), not the log's.
+- **A dispatch by the appointment notification handlers leaves no record of its recipient anywhere.** Those paths write no `NotificationRecords` row, so before this change the log line was the only trace of who the confirmation went to — and it was a trace of the wrong kind, one that travelled to every sink. The reminder sweep is the path that does keep a row (`AppointmentReminderBackgroundService` writes `Recipient`, `Subject`, `Body`); the fix for the other two is that same durable record, which is a feature decision and not a redaction.
+- **Nothing was demoted to `Debug`.** There is no `LogDebug` call in `src` and no host that runs at that level, so a demotion would have kept the address in the file while letting the code claim it had been removed. Nor is it hashed: an email address or a phone number has too little entropy for a digest to be anything but the same value with a fingerprint on it.
+
+What the facts prove is bounded by where they listen. `CollectingLogger` hangs on the `ILogger<T>` seam, and that placement is measured rather than assumed: `UseSerilog()` replaces the container's `ILoggerFactory` with Serilog's own, which never enumerates the registered `ILoggerProvider` set — a provider registered the obvious way was listed by `GetServices<ILoggerProvider>()` and received nothing. So these are facts about the application's own lines. A framework category is outside them, and the only thing standing between one and a sink is `Serilog:MinimumLevel:Override:Microsoft = Warning` in `appsettings.json` — a configuration line, not a guarantee this repository tests.
+
+`IntegrationTests/Security/LogPrivacyTests.cs`: `TheCollector_MustSeeALineTheHostWrites` (the non-vacuity guard every absence below leans on), `ADispatch_MustLeaveItsChannelAndItsSizeAndNoneOfTheCustomer`, `AWrongPassword_MustLeaveItsCauseAndItsAccountInTheLog`, `AnUnknownAddress_MustBeRefusedByNameOfNothingItDoesNotHave`, `AnInactiveAccount_MustNotReadLikeAWrongPasswordToTheLog`, `ALockedOutAccount_MustSayLockedOutWhenThePasswordItWasGivenIsRight`, `ARefusedPasswordChange_MustNameTheDoorThatRefusedIt`.

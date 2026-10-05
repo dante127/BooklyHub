@@ -11,6 +11,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace BooklyHub.IntegrationTests.Infrastructure;
@@ -34,6 +35,13 @@ public class BooklyHubWebApplicationFactory : WebApplicationFactory<Program>, IA
     /// survive.
     /// </summary>
     public TestClock Clock { get; } = new();
+
+    /// <summary>
+    /// What the host logged while this fixture lived. SEC-09: the two claims that finding is about — a dispatch
+    /// that carries no customer address, a refusal that names which of its four causes it was — are claims about
+    /// the log, and a response body cannot answer either of them.
+    /// </summary>
+    public CollectingLogger Logs { get; } = new();
 
     /// <summary>
     /// Last-mile service overrides (recording email senders and the like), applied after the test host has
@@ -118,6 +126,13 @@ public class BooklyHubWebApplicationFactory : WebApplicationFactory<Program>, IA
             });
 
             services.Replace(ServiceDescriptor.Singleton<BooklyHub.Application.Common.Interfaces.IClock>(Clock));
+
+            // Registered last so it is the ILogger<> the container hands out, and registered as an open generic
+            // rather than as an ILoggerProvider because the provider is not a seam this host writes through:
+            // UseSerilog() replaces ILoggerFactory with Serilog's own, which never enumerates the registered
+            // providers. See CollectingLogger for the measurement.
+            services.AddSingleton(Logs);
+            services.AddSingleton(typeof(ILogger<>), typeof(CollectingLogger<>));
 
             ConfigureTestServices(services);
         });

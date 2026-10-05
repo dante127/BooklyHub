@@ -18,7 +18,7 @@ which this remediation does not do from a bug queue.
 | SEC-01 — committed signing key, config fallbacks, wrong prod env names | Critical | **fixed** (code) | `d767c25`; `DependencyInjection.cs:17-23` throws on an empty connection string, `JwtSigningSettings.cs:35-44` on an empty secret; compose now sets `Jwt__Secret` (`docker-compose.yml:45,64`) which is the key the code reads (`JwtSigningSettings.cs:8`) | rotating the key that is still in git history is an **operator** action (tracked as `SEC-02`) |
 | SEC-03 — anonymous `?tenantId=` names the tenant on public reads | High | **live, narrower than claimed** | `TenantResolutionMiddleware.cs:57-68` resolves header/query and makes **no database call**; the only tenant-level `IsActive` read on any request path is `AvailabilityService.cs:405-414`, which answers an **empty day**, not a refusal | needs a product decision (is a tenant GUID a secret?); behaviour pinned by `InactiveTenantReadPathsTests` and recorded in `MULTI-TENANCY.md` §2 |
 | SEC-06 — permissions frozen in 60-min claims; "policy provider matches anything" | High | **first half live, second half stale** | claims baked at `AuthServices.cs:48-51`, life 60 min (`appsettings.json:10`), already open in `SECURITY.md` §; `PermissionAuthorization.cs:19-35` is fail-closed — it succeeds only on `PlatformAdmin` or a matching `permission` claim, and `PermissionPolicyProvider.cs:25-31` never returns a permissive policy | revocation (`SEC-05c`, `ACT-01`) already bounds the frozen-claims window; nothing further to repair |
-| SEC-09 — PII at `Information`; refused sign-ins unlogged | Medium | **live** | `NotificationAndCacheServices.cs:87` (email + subject), `:103` (phone + message body), `:119`; the refusal path `AuthController.cs:279-288` only writes the lockout counter (`:337`) and logs nothing | one small increment: redact or demote, and emit one structured auth-failure event |
+| SEC-09 — PII at `Information`; refused sign-ins unlogged | Medium | **fixed** | the three dispatch lines carry only lengths and the server's own recipient id (`NotificationAndCacheServices.cs`, pinned by `OutboundDispatchLogTests`); every refusal on the two doors that take a password emits `Refused at {source}: {reason} for user {id}. Correlation-Id {cid}` at `Warning` (`AuthController.cs` `RefusalReason`/`LogRefusal`, pinned by `RefusedSignInLogTests`, `LockedOutSignInLogTests`, `RefusedPasswordChangeLogTests`) | the cause is logged, never sent — the body stays the single `InvalidCredentials` envelope. Refused **refresh** calls still log nothing, and the appointment handlers' dispatches now leave no recipient record anywhere (`SECURITY.md` §3.4) |
 | SEC-11 — `LIKE` wildcards not escaped in search | Medium | **live, minor** | `CatalogControllers.cs:143` `.Contains(search)` reaches SQL as `LIKE '%…%'` with `%`/`_` intact; the route is authenticated (`:129`) and tenant-scoped (`:132`) | escape `%`/`_` or document wildcard search as a feature; not injection — the audit's "no SQLi" positive still holds (no `FromSql` on user input) |
 | SEC-12 — no CORS policy, no HSTS, HTTPS redirect inert in Docker | Medium | **confirmed absent; the framing is overstated** | no `AddCors`/`UseCors` anywhere in `src` (pipeline `Program.cs:199-236`); no `UseHsts`; `Dockerfile:26` binds `http://+:8080` with `EXPOSE 8081` unused and no `UseForwardedHeaders` | **deployment-dependent** for the TLS half. Absent CORS is fail-closed for browsers, so this is a missing stated policy, not an open door |
 | SEC-13 — `AllowedHosts":"*"`, correlation ID taken verbatim | Low | **live** | `appsettings.json:29`; `Middlewares.cs:23-28` accepts a client `X-Correlation-Id` with no length or character filtering, echoes it on the response (`:26`) and pushes it into the log scope (`:28`) | bound and sanitize the value, or generate it server-side only |
@@ -54,15 +54,19 @@ Recording these because each one was stated as fact at some point, and the tree 
 4. **`SEC-06`'s "dynamic policy provider matches anything"** does not describe `PermissionAuthorization.cs:19-35`.
 5. **`QUAL-02`'s "20-arg, constructed 4×"** does not describe any DTO in the tree, in this revision or in the import.
 6. **`DB-01`'s "filter not present in the migration snapshot"** confuses EF query filters with schema.
+7. **"A test can read the host's log through a registered `ILoggerProvider`" is false here.** `Program.cs:24`
+   calls `UseSerilog()`, which replaces the container's factory with `SerilogLoggerFactory` — it holds no
+   `_providers` and never enumerates the registered ones, so such a collector stays empty forever and every
+   privacy fact written against it passes by finding nothing. `SEC-09`'s collector sits on the `ILogger<>` seam
+   instead; the measurement is recorded in `CollectingLogger`'s remarks and `SECURITY.md` §3.4.
 
 ## 3. What is genuinely live, in the order the next work should take it
 
-1. `SEC-09` — PII at `Information`, refused sign-ins not logged. Small, self-contained, no product question.
-2. `BL-05` (`Kind` half) — reject an offset-bearing or unspecified-`Kind` start at the boundary. Small.
-3. `SEC-13` / `SEC-11` — sanitize the correlation ID; decide whether `search` wildcards are a feature.
-4. `PERF-04` residue + `CAL-01` — bound the candidate-staff list and the slot grid, decide the two catalog reads,
+1. `BL-05` (`Kind` half) — reject an offset-bearing or unspecified-`Kind` start at the boundary. Small.
+2. `SEC-13` / `SEC-11` — sanitize the correlation ID; decide whether `search` wildcards are a feature.
+3. `PERF-04` residue + `CAL-01` — bound the candidate-staff list and the slot grid, decide the two catalog reads,
    and give the calendars a way to be populated; `PERF-05`'s annual-holiday column.
-5. `QUAL-04` residue — three payment stamps onto `IClock`.
-6. Product decisions, not to be taken from this queue: `SEC-03`'s tenant gate, `BL-08`'s authorship and moderation,
+4. `QUAL-04` residue — three payment stamps onto `IClock`.
+5. Product decisions, not to be taken from this queue: `SEC-03`'s tenant gate, `BL-08`'s authorship and moderation,
    `DB-02`'s recurring-series definition, `QUAL-05`'s module split.
-7. Operator action only: `SEC-02` — rotate the secret committed before `d767c25`.
+6. Operator action only: `SEC-02` — rotate the secret committed before `d767c25`.

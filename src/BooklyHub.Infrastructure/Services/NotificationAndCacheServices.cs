@@ -84,7 +84,13 @@ public class SimulatedEmailSender : IEmailSender
 
     public Task SendEmailAsync(string to, string subject, string htmlBody, CancellationToken cancellationToken = default)
     {
-        _logger.LogInformation("[EMAIL DISPATCHED] To: {To}, Subject: {Subject}", to, subject);
+        // SEC-09: this line carried the customer's address and the subject of their appointment mail at
+        // Information, which is the level every environment runs at, into whatever sink the console points at. A
+        // dispatch still has to leave a trace — for these senders the trace is the only evidence one was asked
+        // for — so the fact and the size of the payload stay and the recipient goes. Nothing is demoted to Debug
+        // instead: there is no LogDebug anywhere in src and no host that runs at that level, so demotion would
+        // keep the address in the file while letting the code claim it had been redacted.
+        _logger.LogInformation("[EMAIL DISPATCHED] subject {SubjectLength} char(s), body {BodyLength} char(s)", subject.Length, htmlBody.Length);
         return Task.CompletedTask;
     }
 }
@@ -100,7 +106,9 @@ public class SimulatedSmsSender : ISmsSender
 
     public Task SendSmsAsync(string phoneNumber, string message, CancellationToken cancellationToken = default)
     {
-        _logger.LogInformation("[SMS DISPATCHED] To: {Phone}, Message: {Message}", phoneNumber, message);
+        // SEC-09: the number was the address of a phone and the message was "your appointment is confirmed for
+        // <when>" — a person's schedule, written next to their number, in a log an operator forwards to a vendor.
+        _logger.LogInformation("[SMS DISPATCHED] message {MessageLength} char(s)", message.Length);
         return Task.CompletedTask;
     }
 }
@@ -116,7 +124,10 @@ public class SimulatedPushNotificationSender : IPushNotificationSender
 
     public Task SendPushAsync(string recipientId, string title, string message, CancellationToken cancellationToken = default)
     {
-        _logger.LogInformation("[PUSH DISPATCHED] Recipient: {Recipient}, Title: {Title}", recipientId, title);
+        // SEC-09: the recipient stays, because it is this server's own id and an id is what every other line in
+        // this build carries (`AuthController` logs the same kind of value for a capped session). The title does
+        // not: it is built from the patient's name and the service they booked.
+        _logger.LogInformation("[PUSH DISPATCHED] recipient {Recipient}, title {TitleLength} char(s)", recipientId, title.Length);
         return Task.CompletedTask;
     }
 }

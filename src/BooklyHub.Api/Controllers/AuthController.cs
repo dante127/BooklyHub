@@ -78,6 +78,49 @@ public class AuthController : ControllerBase
         instance: HttpContext.Request.Path.Value);
 
     /// <summary>
+    /// Which of the causes the refusal above collapses this is, named for the log. SEC-09: the response is one
+    /// answer to four questions on purpose, and until now so was the data — a wrong password left a streak
+    /// behind and every other cause left nothing at all, so "why was this person turned away" could not be
+    /// answered from the database either.
+    ///
+    /// The three causes that need a row are decided in the order the guard tested them in, so a wrong password on
+    /// a locked-out account reads as <c>bad-password</c>: that request is stopped by its own mistake before the
+    /// deadline is what decides it, and it advances the streak accordingly. The fourth, an address with no row, is
+    /// <see cref="UnknownAccount"/> at the call site — it is the one cause with no account to name.
+    /// </summary>
+    private static string? RefusalReason(User user, bool passwordMatches, DateTime nowUtc)
+    {
+        if (!passwordMatches) return "bad-password";
+        if (!user.IsActive) return "inactive-account";
+        if (LoginLockoutPolicy.IsLockedOut(user.LockoutUntilUtc, nowUtc)) return "locked-out";
+        return null;
+    }
+
+    /// <summary>
+    /// The cause a caller who presents an address this server has no row for is refused for. Also what a
+    /// change-password credential whose user row has gone is refused for, which is not a euphemism: there is no
+    /// account here to answer for that credential.
+    /// </summary>
+    private const string UnknownAccount = "unknown-account";
+
+    /// <summary>
+    /// The one line a refusal leaves. It carries the cause the response deliberately withholds and the id of the
+    /// account it happened to, and not the address: a refusal's address is the caller's claim about an account,
+    /// and the only party that ever reads it back is the log, which is shared. What that costs is written down in
+    /// <c>SECURITY.md</c> §3.4 rather than discovered by whoever needs it.
+    ///
+    /// <c>source</c> is the same string <see cref="RecordFailedLoginAsync"/> writes into <c>LastModifiedBy</c>, so
+    /// the two doors that take a password name the door they came in.
+    /// </summary>
+    private void LogRefusal(string reason, Guid? userId, string source) =>
+        _logger.LogWarning(
+            "Refused at {Source}: {Reason} for user {UserId}. Correlation-Id {CorrelationId}",
+            source,
+            reason,
+            userId?.ToString() ?? "(no row)",
+            HttpContext.Response.Headers[CorrelationIdMiddleware.CorrelationIdHeader]);
+
+    /// <summary>
     /// The row the presented credential names, plus that row's successor link exactly as it was stored. The second
     /// half is the reason this is not just a <see cref="RefreshToken"/>: <c>SEC-05d</c> — upgrading a legacy row
     /// rewrites its plaintext link into a digest, and a digest is the one value the burn walk cannot point with at a
@@ -275,14 +318,21 @@ public class AuthController : ControllerBase
 
         // One answer for four reasons: no such user, wrong password, inactive account, account inside its lockout
         // window (`SEC-04(b)`). A 423 or a distinct detail would announce that this address exists *and* that
-        // somebody is being kept out of it — the oracle the rest of SEC-04 was spent closing.
-        if (user == null
-            || !passwordMatches
-            || !user.IsActive
-            || LoginLockoutPolicy.IsLockedOut(user.LockoutUntilUtc, nowUtc))
+        // somebody is being kept out of it — the oracle the rest of SEC-04 was spent closing. SEC-09: the reason is
+        // still withheld, and still decided once — it now goes to the log as well.
+        if (user == null)
         {
-            if (user != null && !passwordMatches)
+            LogRefusal(UnknownAccount, null, "auth:login");
+            return Refusal(InvalidCredentials);
+        }
+
+        var refusal = RefusalReason(user, passwordMatches, nowUtc);
+        if (refusal != null)
+        {
+            if (!passwordMatches)
                 await RecordFailedLoginAsync(user, nowUtc, "auth:login", cancellationToken);
+
+            LogRefusal(refusal, user.Id, "auth:login");
 
             return Refusal(InvalidCredentials);
         }
@@ -504,13 +554,21 @@ public class AuthController : ControllerBase
             && !string.IsNullOrEmpty(request.CurrentPassword)
             && _passwordHasher.VerifyPassword(request.CurrentPassword, user.PasswordHash);
 
-        if (user == null
-            || !currentMatches
-            || !user.IsActive
-            || LoginLockoutPolicy.IsLockedOut(user.LockoutUntilUtc, nowUtc))
+        if (user == null)
         {
-            if (user != null && !currentMatches)
+            // A still-valid access token whose row has stopped existing is the same cause the login box names
+            // unknown-account, and there is no row here to advance a streak on.
+            LogRefusal(UnknownAccount, null, "auth:change-password");
+            return Refusal(InvalidCredentials);
+        }
+
+        var refusal = RefusalReason(user, currentMatches, nowUtc);
+        if (refusal != null)
+        {
+            if (!currentMatches)
                 await RecordFailedLoginAsync(user, nowUtc, "auth:change-password", cancellationToken);
+
+            LogRefusal(refusal, user.Id, "auth:change-password");
 
             return Refusal(InvalidCredentials);
         }
