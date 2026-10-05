@@ -107,6 +107,14 @@ Authenticates a user and returns an access token with a rotating refresh token.
 
 The sample above is stale in one way worth naming: the action returns `AuthResponse(accessToken, refreshToken, expiresAtUtc, user)` — a nested `user` object — not these flat `userId`/`tenantId`/`fullName` keys. Tracked as `DOC-03`; the endpoint below is described from the code, not from this block.
 
+**`expiresAtUtc` is read back off the token, not recomputed** (`EXP-01`). Login and refresh both answer with the expiry
+the minted access token already carries, so the field and the credential cannot disagree: changing
+`Jwt:ExpirationMinutes` moves both together, and a client that trusts the number is trusting the same value a
+validator will enforce. Before this, both actions recomputed it as *now plus 60 minutes* — a hardcoded lifetime that
+ignored the setting entirely — so a tenant configured to 15 minutes was told its token lived an hour, and the answer
+drifted further with every request that arrived after the token's own instant. The cost is one extra token parse per
+auth response, and the two are now literally the same read rather than two copies of one rule.
+
 **Five wrong passwords close the door on the account, not on the address** (`SEC-04(b)`). After five failed sign-ins
 for one address inside fifteen minutes, that account refuses even the *correct* password for fifteen minutes, whoever
 knocks and from whichever address. The 10-per-minute tier could not be this defence: a threshold above ten permits is

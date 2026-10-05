@@ -286,7 +286,11 @@ public class AuthController : ControllerBase
         await BoundLiveSessionsAsync(user.Id, refreshToken.Id, nowUtc, cancellationToken);
 
         var userDto = new UserDto(user.Id, user.Email, user.FirstName, user.LastName, user.TenantId, roles, permissions);
-        return Ok(new AuthResponse(accessToken, refreshTokenString, _clock.UtcNow.AddMinutes(60), userDto));
+
+        // EXP-01: read back off the credential instead of recomputing a lifetime this file used to hardcode as 60,
+        // so the answer is the minute the verifier will enforce rather than a copy of a config value.
+        return Ok(new AuthResponse(accessToken, refreshTokenString,
+            _tokenGenerator.GetAccessTokenExpiryUtc(accessToken), userDto));
     }
 
     /// <summary>
@@ -382,7 +386,11 @@ public class AuthController : ControllerBase
         await _db.SaveChangesAsync(cancellationToken);
 
         var userDto = new UserDto(user.Id, user.Email, user.FirstName, user.LastName, user.TenantId, roles, permissions);
-        return Ok(new AuthResponse(newAccessToken, newRefreshToken, _clock.UtcNow.AddMinutes(60), userDto));
+
+        // EXP-01: same on the rotation path, where the drift mattered most - a refresh hands out a fresh access
+        // token, so a client that trusts this number over the credential it was given is trusting the older copy.
+        return Ok(new AuthResponse(newAccessToken, newRefreshToken,
+            _tokenGenerator.GetAccessTokenExpiryUtc(newAccessToken), userDto));
     }
 
     /// <summary>

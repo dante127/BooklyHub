@@ -5,6 +5,15 @@ namespace BooklyHub.Application.Security;
 public interface IJwtTokenGenerator
 {
     string GenerateAccessToken(User user, IReadOnlyList<string> roles, IReadOnlyList<string> permissions);
+
+    /// <summary>
+    /// The instant <see cref="GenerateAccessToken"/> told the verifier that credential stops working, read back
+    /// out of it rather than recomputed. EXP-01: a caller that answers "it is valid for N minutes" from its own
+    /// copy of N reports a lifetime the token does not have whenever the configured value, or the clock the two
+    /// sides read, differ. Parsing is cheap and this is the only form that cannot drift.
+    /// </summary>
+    DateTime GetAccessTokenExpiryUtc(string accessToken);
+
     string GenerateRefreshToken();
 }
 

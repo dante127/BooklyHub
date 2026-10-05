@@ -60,6 +60,14 @@ public class JwtTokenGenerator : IJwtTokenGenerator
         return new JwtSecurityTokenHandler().WriteToken(token);
     }
 
+    public DateTime GetAccessTokenExpiryUtc(string accessToken)
+    {
+        // Not recomputed from a second copy of the configured lifetime: the instant written into the credential is
+        // the instant a verifier enforces, so it is the only answer the caller may give. exp is whole seconds and
+        // this reads that claim, so the two cannot disagree even when their sides read different clocks.
+        return new JwtSecurityTokenHandler().ReadJwtToken(accessToken).ValidTo;
+    }
+
     public string GenerateRefreshToken()
     {
         var randomBytes = new byte[64];
