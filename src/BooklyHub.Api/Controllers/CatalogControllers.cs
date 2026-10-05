@@ -183,6 +183,18 @@ public class CustomersController : ControllerBase
         _db.Customers.Add(customer);
         await _db.SaveChangesAsync(cancellationToken);
 
-        return CreatedAtAction(nameof(Search), new { id = customer.Id }, customer);
+        // LOC-01: `Search` takes no `id`, so the old route values went out as a query string on a route that
+        // ignores it, and the body was the aggregate. These are the eight fields the list route projects.
+        return CreatedAtAction(nameof(Search), routeValues: null, new
+        {
+            customer.Id,
+            customer.FirstName,
+            customer.LastName,
+            customer.Email,
+            customer.PhoneNumber,
+            customer.TotalBookings,
+            customer.TotalSpent,
+            customer.IsBlocked
+        });
     }
 }

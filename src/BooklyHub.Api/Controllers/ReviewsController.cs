@@ -39,7 +39,10 @@ public class ReviewsController : ControllerBase
         var tenantId = GetRequiredTenantId();
         var command = new SubmitReviewCommand(tenantId, request.AppointmentId, request.Rating, request.Comment);
         var result = await _sender.Send(command, cancellationToken);
-        return CreatedAtAction(nameof(GetReviews), new { appointmentId = result.AppointmentId }, result);
+
+        // LOC-01: `appointmentId` is not a parameter this route reads, so it left as a query string on a URL that
+        // answers the whole wall regardless.
+        return CreatedAtAction(nameof(GetReviews), routeValues: null, result);
     }
 
     [HttpGet]

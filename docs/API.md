@@ -898,42 +898,36 @@ body: `The Email field is required.`, `The LastName field is required.`, `The Fi
 row is a second `CustomerId`. Written down rather than fixed from here — a client that deduplicates by email is
 doing work the server does not do.
 
-**Response (201 Created)** — the whole `Customer` entity, serialized raw:
+**Response (201 Created)** — measured on `POST /api/v1/customers`:
 ```json
 {
-  "tenantId": "416a5c42-9686-4a3c-bd62-e793dfdad7b7",
+  "id": "e7986fdd-b14f-470c-a230-55ba1a2d5032",
   "firstName": "Ziad",
   "lastName": "Haddad",
   "email": "ziad@probe.test",
   "phoneNumber": "+963999",
-  "notes": null,
-  "isBlocked": false,
   "totalBookings": 0,
   "totalSpent": 0,
-  "fullName": "Ziad Haddad",
-  "customerNotes": [],
-  "createdAtUtc": "2026-10-05T08:35:56.1837378Z",
-  "createdBy": "51ca245f-a256-42ce-875c-0843ef6dac3d",
-  "lastModifiedAtUtc": null,
-  "lastModifiedBy": null,
-  "isDeleted": false,
-  "deletedAtUtc": null,
-  "deletedBy": null,
-  "id": "fd3f3ee4-60cb-4ab2-8d06-6ea137e17d86",
-  "domainEvents": []
+  "isBlocked": false
 }
 ```
-Three things a client should not have to lean on are visible in that body, and they are the reason it has no DTO:
-`domainEvents` is the domain's in-memory outbox, `isDeleted`/`deletedAtUtc`/`deletedBy` are soft-delete plumbing, and
-`customerNotes` is a navigation collection caught while it is still empty. The list route above projects eight
-fields; this one returns the entity. Named as part of `LOC-01` instead of being quietly reshaped: the shape is what
-it is today, and a client that reads `id` and stops there is fine.
+Those are the eight fields the list route projects, so the row does not look two ways depending on which door the
+client came in through. Until `LOC-01` this body was the `Customer` aggregate serialized raw, which put
+`domainEvents` (the domain's in-memory outbox), `isDeleted`/`deletedAtUtc`/`deletedBy` (soft-delete plumbing) and an
+unloaded `customerNotes` collection in front of a caller and invited them to be read as contract.
 
-**`Location`.** Measured: `http://localhost/api/v1/customers?id=fd3f3ee4-…`. The `201` points at
-`GET /api/v1/customers` with the new id as a query parameter, and that route has no `id` parameter — so following
-the `Location` returns page 1 of the whole book, not the customer just created. `CreatedAtAction(nameof(Search),
-new { id = … })` is the line that does it, and the URI is a leftover of that choice (`LOC-01`, same finding as the
-raw entity above).
+**Consequence, stated because it is a loss.** `notes`, `fullName`, `tenantId` and `createdAtUtc` are no longer in the
+create response, and they are in no response this server gives: there is no `GET` by customer id. A client that needs
+`notes` cannot read it back. That is parity with the list route rather than a new restriction — the list never
+projected them either — and it is why the fix went to the projection instead of to a new read endpoint: adding one is
+a feature decision, not a repair of this body.
+
+**`Location`.** Measured: `http://localhost/api/v1/customers` — the collection, with no query string. The `201` used
+to be `http://localhost/api/v1/customers?id=fd3f3ee4-…`: `CreatedAtAction(nameof(Search), new { id = … })` emitted a
+route value `Search` does not take, so it left as a query string on a route whose parameters are `search`, `page` and
+`pageSize`, and following it returned page 1 of the whole book instead of the customer just created. The id is
+reachable because it is in the body. `CreatedResourceShapeTests` follows the header the `201` hands out and fails if
+the row it created is not in the answer.
 
 ---
 
@@ -1007,9 +1001,11 @@ this", and the answer it trusts is the `appointmentId` in the body.
   "createdAtUtc": "2026-10-05T09:12:00Z"
 }
 ```
-Its `Location` header is `/api/v1/reviews?appointmentId=…` — the same `CreatedAtAction` shape as `LOC-01`, with the
-same consequence: that route filters by `staffId` and `serviceId`, not by appointment, so following it returns the
-tenant's published wall instead of the review just written.
+Its `Location` header is `/api/v1/reviews` — the collection, with no query string. Until `LOC-01` it was
+`/api/v1/reviews?appointmentId=…`, the same `CreatedAtAction` shape as the customers `201`, with the same
+consequence: that route filters by `staffId` and `serviceId`, not by appointment, so following the link returned the
+tenant's published wall instead of pointing at the review just written. The wall is still what the link reaches —
+there is no by-id review read — but it now reaches it honestly, and the review's own `id` is in the body above.
 
 **Refusals:** `404` when no appointment of that id is in the tenant (measured:
 `Appointment with ID … was not found.`); `422 AppointmentNotCompleted` — reviews exist only for visits that reached
