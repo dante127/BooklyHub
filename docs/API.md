@@ -94,18 +94,26 @@ Authenticates a user and returns an access token with a rotating refresh token.
 **Response (200 OK):**
 ```json
 {
-  "userId": "d7a4697f-bc3a-4a69-8bc3-3b1451f28b43",
-  "tenantId": "e1f13b64-897c-473d-9d78-b11c2ad4cb59",
-  "email": "dr.smith@apexdental.com",
-  "fullName": "Dr. Sarah Smith",
-  "roles": ["Staff", "TenantAdmin"],
   "accessToken": "eyJhbGciOiJIUzI1NiIsIn...",
   "refreshToken": "4f5c9e2b-7c51-4e76-88cf-9a9be8525b6a",
-  "expiresAtUtc": "2026-09-23T11:15:00Z"
+  "expiresAtUtc": "2026-10-25T11:15:00Z",
+  "user": {
+    "id": "d7a4697f-bc3a-4a69-8bc3-3b1451f28b43",
+    "email": "dr.smith@apexdental.com",
+    "firstName": "Sarah",
+    "lastName": "Smith",
+    "tenantId": "e1f13b64-897c-473d-9d78-b11c2ad4cb59",
+    "roles": ["Staff", "TenantAdmin"],
+    "permissions": ["appointments.read", "appointments.update"]
+  }
 }
 ```
 
-The sample above is stale in one way worth naming: the action returns `AuthResponse(accessToken, refreshToken, expiresAtUtc, user)` — a nested `user` object — not these flat `userId`/`tenantId`/`fullName` keys. Tracked as `DOC-03`; the endpoint below is described from the code, not from this block.
+The identity is one nested `user` object, not a spread of top-level fields: the action returns
+`AuthResponse (accessToken, refreshToken, expiresAtUtc, user)` and `user` is
+`UserDto (id, email, firstName, lastName, tenantId, roles, permissions)`. `roles` and `permissions` are the resolved
+answer for that account, so a client learns what it may call from the sign-in instead of asking again. `tenantId` is
+the field that may be `null`: a platform admin belongs to no tenant and names one per request.
 
 **`expiresAtUtc` is read back off the token, not recomputed** (`EXP-01`). Login and refresh both answer with the expiry
 the minted access token already carries, so the field and the credential cannot disagree: changing
@@ -220,40 +228,50 @@ says nothing about it, so a client that wants its own session ended must sign in
 
 ## 3. Availability Engine
 
-### `GET /api/v1/availability/slots`
-Computes all available booking slots for a given service and date range.
+### `GET /api/v1/availability`
+Computes the bookable slots for one service on **one** date. `AllowAnonymous` — it is the public booking portal's
+read, which is also why it is the only endpoint that accepts `tenantId` as a query parameter.
 
 **Query Parameters:**
 - `locationId` (Guid, required)
 - `serviceId` (Guid, required)
-- `startDate` (DateOnly `yyyy-MM-dd`, required)
-- `endDate` (DateOnly `yyyy-MM-dd`, required)
-- `staffId` (Guid, optional)
+- `date` (DateOnly `yyyy-MM-dd`, required — one day, not a range)
+- `staffId` (Guid, optional — restricts the grid to one person)
+- `tenantId` (Guid, optional — read when the request carries no tenant context, i.e. the portal)
 
-**Response (200 OK):**
+**Response (200 OK):** one day, and the slots inside it carry everything a booking request has to send back.
+`isOpen` is `false` when the location or service is not bookable or the date is a holiday, and `true` with an empty
+`slots` when the day is open but nobody who can perform the service is on shift.
 ```json
-[
-  {
-    "date": "2026-10-25",
-    "slots": [
-      {
-        "startAtUtc": "2026-10-25T13:00:00Z",
-        "endAtUtc": "2026-10-25T13:30:00Z",
-        "staffId": "912389f4-1234-4567-8901-abcdef123456",
-        "staffName": "Dr. Sarah Smith",
-        "isAvailable": true
-      },
-      {
-        "startAtUtc": "2026-10-25T13:30:00Z",
-        "endAtUtc": "2026-10-25T14:00:00Z",
-        "staffId": "912389f4-1234-4567-8901-abcdef123456",
-        "staffName": "Dr. Sarah Smith",
-        "isAvailable": true
-      }
-    ]
-  }
-]
+{
+  "date": "2026-10-25",
+  "timeZoneId": "Asia/Damascus",
+  "isOpen": true,
+  "slots": [
+    {
+      "startAtUtc": "2026-10-25T13:00:00Z",
+      "endAtUtc": "2026-10-25T13:30:00Z",
+      "startAtLocal": "2026-10-25T16:00:00",
+      "endAtLocal": "2026-10-25T16:30:00",
+      "staffId": "912389f4-1234-4567-8901-abcdef123456",
+      "staffName": "Dr. Sarah Smith",
+      "serviceId": "3a5c1e9d-4b26-4c1f-9e7a-5d0f8b2c4a11",
+      "serviceName": "Cleaning",
+      "durationMinutes": 30,
+      "price": 60.00,
+      "currency": "SYP",
+      "availableResourceIds": ["7c1d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f"]
+    }
+  ]
+}
 ```
+
+A slot is a *candidate*, not a reservation: the grid is recomputed under the booking guard's lock when
+`POST /api/v1/appointments` runs, so a `200` here followed by a `409` is the normal race, not a contradiction. A
+slot the guard would refuse is **absent** from `slots` rather than annotated — the response carries no per-slot
+reason. `SlotUnavailableReason` (`Closed`, `StaffNotAvailable`, `OutsideBookingWindow`, `StaffBusy`,
+`ResourceUnavailable`) is what the guard answers with internally and what the recurring creation reports per skipped
+occurrence; on this endpoint its only visible effect is the empty list.
 
 ---
 
@@ -348,7 +366,7 @@ Atomically moves an appointment to a new slot while preserving the original appo
 }
 ```
 
-### `POST /api/v1/appointments/{id}/status`
+### `POST /api/v1/appointments/{id}/transition`
 Transitions an appointment status according to the domain state machine.
 
 **Request Payload:**
