@@ -871,8 +871,14 @@ The customer book, paged.
 **Permission:** `customers.read` — measured on one server: the same call as `Staff`, which holds it, answers `200`;
 as `Accountant`, which does not, answers `403` in the §1.1 envelope.
 
-**Query parameters:** `search`, `page` (default 1), `pageSize` (default 20). `search` is a `CONTAINS` match on first
-name, last name or email; ordering is `LastName` then `FirstName`.
+**Query parameters:** `search`, `page` (default 1), `pageSize` (default 20). `search` is a literal substring match
+on first name, last name or email; ordering is `LastName` then `FirstName`. Literal is the measured word, not a
+hedge: the term arrives in SQL as `LIKE @search_contains ESCAPE N'\'` with `%`, `_`, `[` and the escape character
+itself already prefixed, so `?search=%` finds the one customer whose name contains a percent sign and not the whole
+book, and `?search=a_a` finds nothing rather than `Ana`. A term longer than **256 characters** — the widest of the
+three columns, so a substring that long cannot exist in any row — is answered as an empty page without asking the
+database. That bound is not politeness: measured before it, 3,999 characters made the `LIKE` pattern SQL Server
+builds exceed its 4,000-character ceiling and the route answered `500`.
 
 **Response (200 OK):**
 ```json

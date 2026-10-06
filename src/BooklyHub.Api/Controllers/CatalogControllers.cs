@@ -125,6 +125,17 @@ public class CustomersController : ControllerBase
 
     public record CreateCustomerRequest(string FirstName, string LastName, string Email, string? PhoneNumber = null, string? Notes = null);
 
+    /// <summary>
+    /// The longest <c>search</c> term this route can find anything with. The three columns the term is matched
+    /// against hold at most 256 characters (first and last name are 100, email is 256), so a longer term is not
+    /// in any row no matter what it says — and sending it to the server anyway is not free: past 3,998 characters
+    /// the <c>LIKE</c> pattern it becomes runs into SQL Server's 4,000-character pattern limit and the route
+    /// answers 500. Measured on this host: 3,998 ok, 3,999 <c>String or binary data would be truncated</c>.
+    /// <c>SearchTermLengthTests</c> pins this number against the model's own column widths, because widening
+    /// email would move the boundary and the constant with it.
+    /// </summary>
+    public const int MaxSearchTermCharacters = 256;
+
     [HttpGet]
     [HasPermission(Permissions.Customers.Read)]
     public async Task<ActionResult> Search([FromQuery] string? search, [FromQuery(Name = "page")] int requestedPage = 1, [FromQuery(Name = "pageSize")] int requestedPageSize = 20, CancellationToken cancellationToken = default)
@@ -134,12 +145,22 @@ public class CustomersController : ControllerBase
         var page = Paging.NormalizePage(requestedPage);
         var size = Paging.NormalizePageSize(requestedPageSize);
 
+        // The binder turns a term of nothing into no term at all, so a length is only ever seen here on a string
+        // someone means to search for.
+        if (search is { Length: > MaxSearchTermCharacters })
+        {
+            return Ok(new { total = 0, page, pageSize = size, items = Array.Empty<object>() });
+        }
+
         var query = _db.Customers
             .AsNoTracking()
             .Where(c => c.TenantId == tenantId);
 
         if (!string.IsNullOrWhiteSpace(search))
         {
+            // Not escaped here, and that is measured rather than assumed: EF Core translates this to
+            // LIKE @p_contains ESCAPE N'\' with the caller's %, _ and [ already prefixed by the escape character,
+            // so the term is a literal substring and a caller cannot turn the box into a match-anything query.
             query = query.Where(c => c.FirstName.Contains(search) || c.LastName.Contains(search) || c.Email.Contains(search));
         }
 

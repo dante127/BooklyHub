@@ -273,3 +273,58 @@ What this deliberately does not claim:
 - **It does not change a host that declares nothing.** Such a deployment keeps the shared bucket behind its proxy — a stated consequence of an unset key now written in §3.1, rather than an absent API nobody could call. The shipped `docker-compose.yml` publishes `127.0.0.1:5000:8080` with nothing in front, so as shipped it needs neither key, and an operator who puts TLS termination in front of it has to name that proxy here as well as configuring it there.
 
 `IntegrationTests/Security/ForwardedHeadersRateLimitTests.cs` (7 facts): `TwoCallersBehindTheDeclaredProxy_MustNotShareASignInBudget`, `APrefixedChain_MustNotLetTheCallerChooseWhichAddressItIsBucketedUnder`, `AChainThatEndsWithTheDeclaredProxy_MustNotLetTheCallerReachPastIt`, `AForwardedAddressFromAnUndeclaredPeer_MustBuyTheBurstNothing`, `AConnectionFromLoopback_MustNotBeBelievedJustBecauseTheFrameworkSaysSo`, `AHostThatDeclinesToNameItsProxy_MustIgnoreTheHeaderEntirely`, `AConnectionWithNoAddress_MustNotBeTreatedAsAPeerThatWasNamed`. `UnitTests/Infrastructure/ForwardingSettingsTests.cs` (11 facts) covers the declaration half.
+
+### 3.7 What a Search Term Is Allowed to Mean (`SEC-11`)
+
+`GET /api/v1/customers?search=` is the only place in `src` where a caller's string reaches a SQL `LIKE`, and the
+audit said the wildcards in it arrive intact. Measured, they do not. The route contains no escaping code of its own,
+which is exactly why it needs facts: the property belongs to EF Core's translation, and a translation that changed
+would open a search box into a match-anything query without any line of this repository changing.
+
+The statement the server sends, read off the intercepted command for `search=%`:
+
+```
+[c].[FirstName] LIKE @search_contains ESCAPE N'\' OR [c].[LastName] LIKE @search_contains ESCAPE N'\'
+  OR [c].[Email] LIKE @search_contains0 ESCAPE N'\'
+-- @search_contains = N'%\%%'      (the caller's term, every special character prefixed, wrapped in the two wildcards)
+```
+
+| What a caller types | What the route answers | What an unescaped engine would have answered |
+|---|---|---|
+| `%` | the one row whose name contains a percent sign | every row in the tenant |
+| `a_a` | nothing | `Ana` |
+| `[AB]na` | nothing | `Ana` and `Bna` |
+| `\` | the row whose name contains a backslash | a `500`, because an unpaired escape character is a malformed pattern |
+| `' OR 1=1--` | nothing, and the text never appears in the statement | — (this half was never live; the parameter is a parameter) |
+
+The right-hand column is not a hypothetical: it is the same file with the framework's predicate replaced by
+`EF.Functions.Like(c.FirstName, "%" + search + "%")`, which is what `SEC-11` described, and all six wildcard facts
+fail on it. The control runs in a throwaway worktree so the tree that passes is the tree that ships.
+
+Two things the escaping does not protect, and one it never did:
+
+- **It does not bound the term.** Walking the length up until the route stopped answering found the defect the audit
+  missed: at **3,999 characters** the pattern SQL Server assembles goes past its 4,000-character ceiling and
+  `GET /api/v1/customers` answers `500` — the same class as `PAG-01`, a caller's value with no answer for it. Measured
+  at both ends: 3,998 ok, 3,999 `String or binary data would be truncated`, and a term of 2,100 wildcards — which
+  escapes to 2,103 — is still fine, so the ceiling is the pattern's length, not the term's. The rule now is
+  `CustomersController.MaxSearchTermCharacters`, and it is not a taste number: every column the predicate reads holds
+  at most 256 characters (name 100, email 256, measured from `sys.columns`), so a term longer than that cannot be a
+  substring of any row, and the empty page it gets is the only true answer available. Nothing that could match is
+  cut off — the fact searching for a full 256-character email finds it.
+- **It does not cross a tenant.** A wildcard that matched everything would still have matched everything inside the
+  caller's own tenant, so this section is not the isolation evidence `MULTI-TENANCY.md` §1 refers to; `AMatchAnythingSearch_MustNot
+  CrossIntoAnotherTenant` is here because a caller who could widen a search would want to know how far it widens.
+- **The blank term is the binder's rule, not this one's.** MVC hands a string parameter that is nothing but spaces
+  as `null`, so a wall of spaces is the whole book, which is what it was before. Recorded because a fact about that
+  behaviour passed for the wrong reason until a control tried to break it by moving the guard, not the binder.
+
+`IntegrationTests/Security/LikeWildcardSearchTests.cs` (13 facts): `LikeWildcardSearchTests` — `APercentInTheSearch
+Term_MustMatchAPercentAndNotTheWholeBook`, `AnUnderscoreInTheSearchTerm_MustNotStandInForOneCharacter`,
+`ABracketInTheSearchTerm_MustNotBecomeACharacterClass`, `ASecondWildcardCharacter_MustNotMakeTheEscapeRuleFaultOn
+ItsOwnCharacter`, `AQuotedInjectionInTheSearchTerm_MustBeAParameterAndNotSyntax`, `AMatchAnythingSearch_MustNot
+CrossIntoAnotherTenant`; `SearchTermLengthTests` — `ATermLongerThanAnyColumn_MustBeAnEmptyPageRatherThanA500` (3999,
+4000, 12000), `ATermInsideTheBound_MustStillFindTheRowThatFillsTheWidestColumn`, `ATermJustOverTheBound_MustNotBe
+TruncatedIntoSomethingThatMightMatch`, `ATermMadeOfNothing_MustStillBeTheWholeBookEvenAtFourThousandCharacters`, and
+`TheBound_MustBeSetByTheColumnsItIsComparedAgainstAndStayUnderThePatternCeiling`, which reads the column widths off
+the EF model so widening email moves the bound in a failing test rather than in a 500.
