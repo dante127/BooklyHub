@@ -101,9 +101,10 @@ How to reproduce the measurement, on the throwaway path only:
    decides whether the read grows with the location's history or with the tenant's booking horizon. Estimates are
    nearly identical for both — `SET STATISTICS IO` across four window shapes is what separates them.
 
-The `Appointments` result is in `DATABASE.md` §3.1. What remains open in the same family, deliberately unindexed
-because no volume was measured behind it: the appointment list's default page (`API.md`), the no-show sweep and the
-outstanding-visits queue (`DATABASE.md` §3.1), and the three aged-row deletes in the retention sweep (§5).
+The `Appointments` result is in `DATABASE.md` §3.1, and the same protocol applied to the holiday calendar read is §7.
+What remains open in the same family, deliberately unindexed because no volume was measured behind it: the appointment
+list's default page (`API.md`), the no-show sweep and the outstanding-visits queue (`DATABASE.md` §3.1), and the three
+aged-row deletes in the retention sweep (§5).
 
 ---
 
@@ -145,3 +146,51 @@ One correction travels with this table. The roster was first called "the multipl
 A caller cannot grow it — adding staff is tenant data, and `SlotIntervalMinutes` has no writer outside
 `DatabaseSeeder.cs:79,155,206`. What a caller can do is *point at* a tenant that has grown it and receive 683 KB of
 JSON from an `[AllowAnonymous]` route, which is the finding worth acting on and the one `AUDIT-STATUS.md` §3 keeps open.
+
+## 7. The Holiday Read Was Costed Before Its Index Was Touched
+
+`PERF-05` asked for `RecurringAnnually` in the holiday index's key. Replaying the guard's own statement against seeded
+volume said the key was fine and the *coverage* was not: the predicate has one equality (`TenantId`) and the OR supplies
+no seekable range, so what the read pays for is the two columns it needs after landing on the tenant's rows.
+`SET STATISTICS IO` on the statement `AvailabilityService.cs:468` sends, median of four passes after one warm-up, each
+distribution re-seeded and `UPDATE STATISTICS … WITH FULLSCAN`:
+
+| Tenant rows (recurring) | Table rows | `(TenantId, Date)` | + `INCLUDE (LocationId, RecurringAnnually)` | `(TenantId, RecurringAnnually, Date)` INCLUDE `(LocationId)` |
+| :--- | :--- | :--- | :--- | :--- |
+| 40 (10) | 40 | 3 | 2 | 2 |
+| 400 (100) | 400 | 9 | 5 | 5 |
+| 4,000 (1,000) | 4,000 | 77 | 31 | 31 |
+| 40 (10) | 200,040 | **3,045** | 3 | 3 |
+| 4,000 (1,000) | 204,000 | 3,317 | 33 | 33 |
+| 40,000 (10,000) | 240,000 | 4,439 | 294 | 294 |
+
+Two readings of that table matter. The uncovered column is not one plan but two: while the table is small the optimizer
+seeks on the tenant and pays a key lookup per row, and once the table is large it stops using the index at all and
+answers with a single clustered scan of every tenant's calendar — `ops=[Clustered Index Scan] idx=[[PK_Holidays]]`,
+3,045 pages to return 10 rows, on an `[AllowAnonymous]` route. The third column is why the fix is an `INCLUDE` and not a
+key reorder: the candidate that makes the OR seekable measured the same pages at every single row of that table, because
+the tenant's recurring holidays have to be returned whatever the index says, and they are not a prefix of anything.
+
+Three things this measurement nearly got wrong, recorded because §5's list was written to grow:
+
+1. `SET STATISTICS IO ON` in its own batch reports nothing. The statistics notices for a statement arrive on that
+   session's *next* round trip, so a replay that turns them on, runs the query, and reads the buffer afterwards saw
+   zero reads for a query that was reading hundreds. Put the `SET` and the statement in one batch, or keep the context's
+   connection open across both like `OccupancyIndexTests` does.
+2. `Scan count` did not discriminate: it read **1** with key lookups and **1** with a covered seek. The page count is
+   the number that moves.
+3. The first replay counted 40 rows returned for a tenant with 40 holiday rows, which was really 10 rows four times —
+   a row counter that accumulated across passes. A cost measurement whose row count is wrong is a cost measurement of
+   something else; the recurring share is what the read returns, and it returned exactly that once the counter was
+   reset per pass.
+
+A one-day availability request is not a one-day holiday read: `AvailabilityService.cs:108-113` loads the calendar for
+`{Date-1, Date, Date+1}` because a slot's buffers can reach over local midnight, so `@firstDate`/`@lastDate` arrive as a
+three-day window. That is the shape the index was costed against.
+
+And the limit on all of it, stated where it can be found and not where it is flattering: **no code in `src` writes a
+`Holiday` row** — `AvailabilityService.cs:468` is the only reader, and there is no command, route, or seeder that
+inserts one. Every deployed `Holidays` table is empty, so this index changes nothing until `CAL-01` gives the calendars
+a way to be populated. It was still worth the one migration: it is the narrowest shape §5 allows (same key, two narrow
+included columns, no new index), the read sits on the anonymous path, and the day a tenant's calendar stops being empty
+is not the day to discover that the guard reads the whole table per request.

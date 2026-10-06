@@ -168,7 +168,15 @@ public class OperationalConfigurations :
             .HasForeignKey(h => h.LocationId)
             .OnDelete(DeleteBehavior.Cascade);
 
-        builder.HasIndex(h => new { h.TenantId, h.Date });
+        // The booking guard's holiday read ORs a date range with RecurringAnnually, so no seek on (TenantId, Date)
+        // can answer it without LocationId and RecurringAnnually — and paying those as key lookups into a clustered
+        // index keyed on a random Guid is what makes the read expensive. Measured on the guard's own statement:
+        // 40,040 rows holding a 40-row tenant cost 124 logical reads uncovered and 4 covered; at 200,040 rows the
+        // optimizer dropped the index altogether and read the whole table in one clustered scan, 3,045 reads for the
+        // 10 rows it returned. See PERFORMANCE.md §7 and DATABASE.md §3.2, pinned by HolidayIndexTests.
+        builder.HasIndex(h => new { h.TenantId, h.Date })
+            .IncludeProperties(h => new { h.LocationId, h.RecurringAnnually })
+            .HasDatabaseName("IX_Holidays_TenantId_Date");
     }
 
     public void Configure(EntityTypeBuilder<AvailabilityException> builder)

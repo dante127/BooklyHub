@@ -111,6 +111,41 @@ seeded volume; 300 without the `INCLUDE` set, 306 with no index at all).
 | :--- | :--- | :--- |
 | `IX_WorkingHours_Tenant_Staff_DayOfWeek` | `(TenantId, StaffId, DayOfWeek)` | Resolving daily shift intervals. |
 | `IX_AvailabilityExceptions_Tenant_Staff_TimeRange` | `(TenantId, StaffId, StartDateTimeUtc, EndDateTimeUtc)` | Overriding holidays, vacations, and sick leaves. |
+| `IX_Holidays_TenantId_Date` | `(TenantId, Date)` INCLUDE `(LocationId, RecurringAnnually)` | The booking guard's calendar-close read. |
+
+The guard asks Holidays one question per availability answer:
+`TenantId = @t AND (LocationId IS NULL OR LocationId = @l) AND ((Date BETWEEN @from AND @to) OR RecurringAnnually = 1)`.
+The OR is the whole problem, and not the way `PERF-05` framed it. The finding read the missing
+`RecurringAnnually` as a missing key column; but the tenant is the only equality in the predicate, so a seek on
+`(TenantId, Date)` already lands on the tenant's whole calendar — what the OR forbids is *answering* it from the key,
+because `LocationId` and `RecurringAnnually` are neither seekable nor projected. Measured on the guard's own statement
+with `SET STATISTICS IO`, tenant of 40 rows in a table of 40,040: **124 logical reads** for the 10 rows it returns, the
+extra 120 being a key lookup per row into a clustered index keyed on a random Guid. At 200,040 rows the same
+uncovered read stops being a seek-plus-lookup at all — the optimizer abandons `IX_Holidays_TenantId_Date` and answers
+with **one clustered scan of every tenant's calendar: 3,045 reads for 10 rows**.
+
+Covering the two columns is what closes that, and it costs no new index: the key is unchanged, so the write tax is the
+narrowest one available — **4 reads** at 40,040 rows and **3** at 200,040.
+
+Rejected by the same replay: leading with `RecurringAnnually` —
+`(TenantId, RecurringAnnually, Date) INCLUDE (LocationId)`, which lets the OR open two seeks instead of one
+scan-and-filter — measured *identical* to the covering shape at every volume probed (2, 5, 31, 3, 33 and 294 reads for
+both, across the six distributions in `PERFORMANCE.md` §7). The read has to return the tenant's recurring rows whatever
+the index says, and they are not a prefix of anything, so a second key order buys no pages. One more column order for no
+measured page saved is not a fix; it was left out.
+
+One honest limit on all of the above: **nothing in `src` writes a `Holiday` row.** `AvailabilityService` reads the table
+and no command, controller, or seeder inserts into it, so every deployment today answers this read against an empty
+table, where scan and seek are indistinguishable. The 40,040-row pair is seeded by `HolidayIndexTests` itself; the
+200,040-row pair came from the same replay at a heavier fill, written down in `PERFORMANCE.md` §7. The index is what the
+read costs once `CAL-01` gives the calendars a way to be populated, and the read is on the anonymous availability path —
+a full-table scan per public request is not a cost worth discovering later.
+
+Pinned by `HolidayIndexTests`, which asserts the covered shape in `sys.index_columns`, drives the real guard over the
+real connection and asserts the read stays under a twentieth of the clustered index (4 pages of 465 at the seeded
+volume, 124 without the `INCLUDE` set), and closes a recurring annual holiday so the cheaper read is still the one
+that answers. Note that the `Scan count` was **1 on both sides** of the fix: with key lookups and with a covered seek,
+SQL Server reports a single scan of the table, so the page count is the only one of those two numbers that discriminates.
 
 ### 3.3 Transactional Outbox Filtered Index
 ```sql
