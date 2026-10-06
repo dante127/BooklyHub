@@ -6,6 +6,7 @@ using BooklyHub.Domain.Entities.Identity;
 using BooklyHub.Infrastructure.Data;
 using BooklyHub.IntegrationTests.Infrastructure;
 using FluentAssertions;
+using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -273,5 +274,239 @@ public class RefusedPasswordChangeLogTests : IClassFixture<BooklyHubWebApplicati
         line!.Message.Should().Contain("bad-password");
 
         _factory.Logs.Lines.Should().NotContain(l => l.Message.Contains(email, StringComparison.Ordinal));
+    }
+}
+
+/// <summary>
+/// <c>SEC-09</c>'s refresh residue, now closed: the sign-in door names its cause in the log and this door did not,
+/// and the one line it did write came from the burn — so a refused refresh left nothing behind unless the
+/// credential happened to be spent with a successor to walk. An expired credential, a switched-off account and a
+/// string nobody ever issued were invisible to the log as well as to the caller, which is the half of the finding
+/// the response cannot be blamed for: the body is one sentence on purpose.
+/// </summary>
+/// <remarks>
+/// The rows are seeded rather than earned by a sign-in, so each fact costs the auth tier the one POST it is about
+/// and the causes plus the oracle check fit inside a single ten-permit window. The credential is stored as the
+/// host's own digest, because a row written with the wire string would be read back by the legacy transition
+/// branch (<c>SEC-05a</c>) rather than by the path under test.
+/// </remarks>
+public class RefusedRefreshLogTests : IClassFixture<BooklyHubWebApplicationFactory>
+{
+    private const string AuthCategory = "BooklyHub.Api.Controllers.AuthController";
+    private const string RefusalText = "Invalid or expired refresh token.";
+
+    private readonly BooklyHubWebApplicationFactory _factory;
+
+    public RefusedRefreshLogTests(BooklyHubWebApplicationFactory factory) => _factory = factory;
+
+    private Task<Guid> SeedAccountAsync(string tag) =>
+        CredentialRows.SeedUserAsync(_factory, $"sec09.{tag}-{Guid.NewGuid():N}@example.test");
+
+    private async Task<string> IssueAsync(Guid userId)
+    {
+        var credential = $"sec09.refresh-{Guid.NewGuid():N}";
+        await CredentialRows.SeedRowAsync(_factory, userId, CredentialRows.Digest(_factory, credential));
+        return credential;
+    }
+
+    /// <summary>Every refresh refusal this fixture's host has logged, oldest first.</summary>
+    private IReadOnlyList<CollectingLogger.LogLine> RefreshRefusals() =>
+        _factory.Logs.Lines
+            .Where(l => l.Category == AuthCategory && l.Message.Contains("Refused at auth:refresh-token"))
+            .ToList();
+
+    /// <summary>
+    /// The refusal and its log line together, because either half alone proves nothing: a line with the wrong
+    /// cause is a wrong answer, and a right cause in a body the caller never reads is a claim about a log nobody
+    /// looks at.
+    /// </summary>
+    private async Task<string> RefuseAsync(string credential)
+    {
+        var response = await _factory.CreateClient()
+            .PostAsJsonAsync("/api/v1/auth/refresh-token", new { RefreshToken = credential });
+
+        var body = await response.Content.ReadAsStringAsync();
+
+        // A 429 would mean the tier answered before the guard did, and the line read below would be another
+        // request's.
+        response.StatusCode.Should().NotBe(HttpStatusCode.TooManyRequests, body);
+        response.StatusCode.Should().Be(HttpStatusCode.Unauthorized, body);
+        body.Should().Contain(RefusalText, "the response stays one sentence whatever the log learns to say");
+
+        // The collector is per fixture and the facts before this one each left a line, so the newest is this
+        // request's — facts in a class run in sequence, and a Single() would throw on the count instead of reading
+        // the wrong cause.
+        var line = RefreshRefusals().LastOrDefault();
+
+        line.Should().NotBeNull(
+            "a refusal that writes no line is the residue this change is about, not a passing test");
+        line!.Level.Should().Be(LogLevel.Warning, "a turned-away session is what an owner calls about");
+
+        return line.Message;
+    }
+
+    private async Task ChangeAccountAsync(Guid userId, bool? active = null, bool? deleted = null)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+        var user = await db.Users.IgnoreQueryFilters().FirstAsync(u => u.Id == userId);
+
+        if (active.HasValue) user.IsActive = active.Value;
+        if (deleted.HasValue) user.IsDeleted = deleted.Value;
+
+        await db.SaveChangesAsync();
+    }
+
+    private async Task AgeCredentialAsync(string credential)
+    {
+        var stored = CredentialRows.Digest(_factory, credential);
+
+        using var scope = _factory.Services.CreateScope();
+        await scope.ServiceProvider.GetRequiredService<ApplicationDbContext>()
+            .RefreshTokens
+            .Where(t => t.Token == stored)
+            .ExecuteUpdateAsync(s => s.SetProperty(
+                t => t.ExpiresAtUtc, _factory.Clock.UtcNow.AddDays(-1)));
+    }
+
+    [Fact]
+    public async Task ANeverIssuedCredential_MustBeRefusedAsNothingAndNamedAsNothing()
+    {
+        var credential = $"a-string-nothing-issued-{Guid.NewGuid():N}";
+
+        var message = await RefuseAsync(credential);
+
+        message.Should().Contain("unknown-credential").And.Contain("(no row)",
+            "this is the one cause with no account to name, and the line says so rather than inventing an id");
+
+        // The credential is what the caller sent, and it is the string that authorizes a session if it is ever
+        // issued. The log is shared and not a secret store, so the only thing kept about it is that there was none.
+        _factory.Logs.Lines.Should().NotContain(l => l.Message.Contains(credential, StringComparison.Ordinal),
+            "a refusal that recorded the presented credential would be a transcript of every guess anyone has made");
+    }
+
+    [Fact]
+    public async Task AnExpiredCredential_MustBeRefusedForItsOwnAgeAndNotItsAccount()
+    {
+        var userId = await SeedAccountAsync("expired");
+        var credential = await IssueAsync(userId);
+
+        await AgeCredentialAsync(credential);
+
+        var message = await RefuseAsync(credential);
+
+        message.Should().Contain("expired-credential").And.Contain(userId.ToString(),
+            "the credential ran out while its account stayed in good standing, and only the log says which ran out");
+        message.Should().NotContain(credential);
+    }
+
+    /// <summary>
+    /// The spent row here has no successor link, so the burn never runs and no other line is written. That is the
+    /// point: this exact refusal — a replayed credential with nothing behind it — was the one the log could not
+    /// see at all.
+    /// </summary>
+    [Fact]
+    public async Task ASpentCredential_MustBeRefusedForBeingSpent()
+    {
+        var userId = await SeedAccountAsync("spent");
+        var credential = $"sec09.spent-{Guid.NewGuid():N}";
+
+        await CredentialRows.SeedRowAsync(_factory, userId,
+            CredentialRows.Digest(_factory, credential), null, _factory.Clock.UtcNow.AddHours(-1));
+
+        var message = await RefuseAsync(credential);
+
+        message.Should().Contain("revoked-credential").And.Contain(userId.ToString());
+        message.Should().NotContain("expired-credential",
+            "a spent credential is often also old, and the cause with the security meaning is the spending");
+    }
+
+    [Fact]
+    public async Task ASwitchedOffAccount_MustNotReadLikeAnExpiredCredentialToTheLog()
+    {
+        var userId = await SeedAccountAsync("inactive");
+        var credential = await IssueAsync(userId);
+
+        // The credential is untouched: live, unspent, weeks from its date. Only the account's flag changed, which
+        // is ACT-01's rule and the reason this cannot be reported as the credential having run out.
+        await ChangeAccountAsync(userId, active: false);
+
+        var message = await RefuseAsync(credential);
+
+        message.Should().Contain("inactive-account").And.Contain(userId.ToString(),
+            "a deactivation is an administrator's decision, and the owner who asks when it took effect is answered from this line");
+    }
+
+    /// <summary>
+    /// There is no <c>deleted-account</c> cause, and this fact is the measurement that says so rather than a
+    /// reading of the guard: the credential row is still in the table and was never spent, but the guard's own read
+    /// carries the soft-delete filter on a required navigation, which arrives as an inner join and drops the
+    /// principal row. What the endpoint sees is a credential it never issued, and what the log says is what the
+    /// endpoint saw.
+    /// </summary>
+    [Fact]
+    public async Task ADeletedAccount_MustBeRefusedAsACredentialThatWasNeverIssued()
+    {
+        var userId = await SeedAccountAsync("deleted");
+        var credential = await IssueAsync(userId);
+
+        await ChangeAccountAsync(userId, deleted: true);
+
+        var message = await RefuseAsync(credential);
+
+        message.Should().Contain("unknown-credential").And.Contain("(no row)",
+            "the account is hidden by the same filter that hides the row it hangs from, and the line must not claim a cause the read cannot reach");
+
+        var stored = CredentialRows.Digest(_factory, credential);
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+            // The refusal is about the read, not the data: with the filters off, the credential is exactly where it
+            // was. A sweep that deleted it would make this fact pass for the wrong reason.
+            (await db.RefreshTokens.IgnoreQueryFilters().AnyAsync(t => t.Token == stored)).Should().BeTrue();
+        }
+    }
+
+    /// <summary>
+    /// The other half of the finding, in one fact: the log now says four things where the body says one, so the
+    /// added record cannot have become the oracle <c>SEC-04(c)</c> spent its budget closing. The two lines are read
+    /// from the count this fact took before it knocked, because the collector is per fixture and the facts above
+    /// left their own lines in it — a filter over the whole log would pass on someone else's cause.
+    /// </summary>
+    [Fact]
+    public async Task TwoDifferentCauses_MustAnswerTheCallerIdenticallyAndTheLogDifferently()
+    {
+        var userId = await SeedAccountAsync("oracle");
+        var credential = await IssueAsync(userId);
+        await AgeCredentialAsync(credential);
+
+        var refusalsBefore = RefreshRefusals().Count;
+
+        var stranger = await _factory.CreateClient()
+            .PostAsJsonAsync("/api/v1/auth/refresh-token", new { RefreshToken = $"no-row-{Guid.NewGuid():N}" });
+        var aged = await _factory.CreateClient()
+            .PostAsJsonAsync("/api/v1/auth/refresh-token", new { RefreshToken = credential });
+
+        stranger.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        aged.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+
+        var strangerProblem = await ProblemEnvelope.ReadAsync(stranger, StatusCodes.Status401Unauthorized);
+        var agedProblem = await ProblemEnvelope.ReadAsync(aged, StatusCodes.Status401Unauthorized);
+
+        // Whole bodies cannot be compared: traceId and correlationId are per-request by design, and status is a
+        // number the envelope reader does not read as text.
+        foreach (var field in new[] { "type", "title", "detail", "instance" })
+        {
+            ProblemEnvelope.Field(agedProblem, field).Should().Be(ProblemEnvelope.Field(strangerProblem, field),
+                $"a caller who could tell an expired credential from a never-issued one by its body would hold an oracle over {field}");
+        }
+
+        var causes = RefreshRefusals().Skip(refusalsBefore).Select(l => l.Message).ToList();
+
+        causes.Should().HaveCount(2, "two refusals are two events, and a cause read from an earlier fact's line is not evidence");
+        causes[0].Should().Contain("unknown-credential");
+        causes[1].Should().Contain("expired-credential");
     }
 }

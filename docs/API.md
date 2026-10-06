@@ -169,7 +169,7 @@ issued from the chain — those run out on their own (`Jwt:ExpirationMinutes`).
 { "refreshToken": "4f5c9e2b-7c51-4e76-88cf-9a9be8525b6a" }
 ```
 
-**`401` — one body for four reasons.** The refusal says `detail: "Invalid or expired refresh token."` whether the string was never issued, is past its 7 days, has already been rotated, or **the account behind it is no longer allowed to sign in** (`IsActive`). It is deliberately not a way to learn which of the four it was. The document is the standard envelope (see §1.1), and the endpoint sits in the same 10-per-minute authentication rate-limit tier as `/auth/login`.
+**`401` — one body for four reasons.** The refusal says `detail: "Invalid or expired refresh token."` whether the string was never issued, is past its 7 days, has already been rotated, or **the account behind it is no longer allowed to sign in** (`IsActive`). It is deliberately not a way to learn which of the four it was. Which one it *was* is in the server's log, one `WARNING` naming the cause and the account (`SECURITY.md` §3.4) — a soft-deleted account included, and logged as a credential that was never issued, because the guard's own filtered read cannot see the row at all. The document is the standard envelope (see §1.1), and the endpoint sits in the same 10-per-minute authentication rate-limit tier as `/auth/login`.
 
 A `401` here does **not** end the access token already in the caller's hands: it stays valid until it expires — 60 minutes at the shipped `Jwt:ExpirationMinutes`. `/auth/logout` below revokes refresh credentials, and neither it nor a deactivation reaches an access token that was already minted.
 

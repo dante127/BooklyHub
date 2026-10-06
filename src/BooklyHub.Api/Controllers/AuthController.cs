@@ -97,6 +97,38 @@ public class AuthController : ControllerBase
     }
 
     /// <summary>
+    /// <c>SEC-09</c>'s refresh residue: this door collapses four causes into one sentence and, until this change,
+    /// into one sentence and no record at all — a refused refresh wrote nothing unless <see cref="BurnChainAsync"/>
+    /// happened to fire, so an expired credential, a replayed one and a credential whose account was switched off
+    /// were indistinguishable to the log as well as to the caller.
+    ///
+    /// Ordered so the line names the thing that stopped this request: a credential both spent and past its date is
+    /// refused for being spent, because that is the cause with the security meaning. The closing line is the
+    /// refresh guard's own last disjunct — this is called only where that predicate has already refused, so a
+    /// record still standing here has nowhere left to be but an account that is not allowed to sign in.
+    ///
+    /// There is no cause for a soft-deleted account, and that is measured rather than reasoned: the guard's read
+    /// includes <c>User</c>, which carries the soft-delete filter on a required navigation, so the filter arrives as
+    /// an inner join and the credential row comes back as nothing at all. A deleted account is therefore refused
+    /// and logged as one this server never issued — <c>RefusedRefreshLogTests</c> pins it, because the alternative
+    /// is a comment here claiming the row reaches <c>User == null</c>.
+    /// </summary>
+    private static string RefreshRefusalCause(RefreshToken? record, DateTime nowUtc)
+    {
+        if (record == null) return UnknownCredential;
+        if (record.IsRevoked) return "revoked-credential";
+        if (record.IsExpired(nowUtc)) return "expired-credential";
+        return "inactive-account";
+    }
+
+    /// <summary>
+    /// The cause a caller who presents a credential this server has no row for is refused for, and the refresh
+    /// door's twin of <see cref="UnknownAccount"/>: the one cause with no account to name, so its line says so
+    /// rather than inventing an id.
+    /// </summary>
+    private const string UnknownCredential = "unknown-credential";
+
+    /// <summary>
     /// The cause a caller who presents an address this server has no row for is refused for. Also what a
     /// change-password credential whose user row has gone is refused for, which is not a euphemism: there is no
     /// account here to answer for that credential.
@@ -425,10 +457,12 @@ public class AuthController : ControllerBase
 
         // Four reasons, one answer: never issued, expired, revoked, or the account behind it is no longer
         // allowed to sign in. `IsActive` was a login-only rule, so deactivating a user was a delay of up to the
-        // refresh token's seven days rather than a stop. No `IsDeleted` test here on purpose: `User` carries the
-        // soft-delete query filter, so a deleted account already arrives as `tokenRecord.User == null`.
+        // refresh token's seven days rather than a stop. No `IsDeleted` test here on purpose — and what the read
+        // does with a deleted account is not `User == null` but no row at all, because the included `User` carries
+        // the soft-delete filter on a required navigation: measured, and pinned by `RefusedRefreshLogTests`.
+        var nowUtc = _clock.UtcNow;
         if (tokenRecord == null
-            || !tokenRecord.IsActive(_clock.UtcNow)
+            || !tokenRecord.IsActive(nowUtc)
             || tokenRecord.User is not { IsActive: true })
         {
             // SEC-05b: a credential that was already spent being offered again is the one signal this table can
@@ -437,6 +471,11 @@ public class AuthController : ControllerBase
             // signal stays in the data and not in the response.
             if (tokenRecord is { IsRevoked: true } && presentation.ReplacedByTokenAsStored != null)
                 await BurnChainAsync(tokenRecord, presentation.ReplacedByTokenAsStored, cancellationToken);
+
+            // The cause goes to the log and not to the body, which is the whole shape of SEC-09: a body that said
+            // which of these it was is the oracle SEC-04(c) was closed to avoid. The credential string is written
+            // nowhere — it authorizes a session, and a log is not a secret store.
+            LogRefusal(RefreshRefusalCause(tokenRecord, nowUtc), tokenRecord?.UserId, "auth:refresh-token");
 
             return Refusal("Invalid or expired refresh token.");
         }
