@@ -104,3 +104,37 @@ How to reproduce the measurement, on the throwaway path only:
 The `Appointments` result is in `DATABASE.md` §3.1. What remains open in the same family, deliberately unindexed
 because no volume was measured behind it: the appointment list's default page (`API.md`), the no-show sweep and the
 outstanding-visits queue (`DATABASE.md` §3.1), and the three aged-row deletes in the retention sweep (§5).
+
+---
+
+## 6. The Availability Loop's Dead Work Was Measured Before Anyone Optimized It
+
+`PERF-04` left a residue described as "the slot grid walks 1440 starts per staff per day, and almost all of them are
+dead work". Both halves were checked against the running host, and the conclusion is that the sentence describes a
+cost worth nothing and an input no caller can send.
+
+Method, on a throwaway tenant in the fixture's own database, one staff member with a 08:00–18:00 shift and a 30-minute
+service, `GET /api/v1/availability` over HTTP (the tenant must be resolved the way a request resolves it — calling the
+service in-process answers `NotBookable` and measures nothing), 11 samples with the first discarded, median reported:
+
+| grid step | starts/staff/day | empty day | day with 8 bookings |
+|---|---|---|---|
+| 15 min (the default, `TenantSetting.DefaultSlotIntervalMinutes`) | 96 | 6.9 ms | 6.3 ms |
+| 5 min | 288 | 6.9 ms | 9.1 ms |
+| 1 min (the floor `AvailabilityService.cs:451` allows) | 1440 | 8.4 ms | 10.5 ms |
+
+Fifteen times the grid buys 1.5 ms on an empty day and 4.2 ms on a busy one, so the starts the shift check rejects —
+the "dead work" — are not what the request costs. The candidate-staff roster is: 1 staff → 8.1 ms / 6.7 KB,
+10 staff → 10.3 ms / 111 KB, 50 staff → 19.9 ms / 683 KB, all at the default step. That is linear in the roster on
+both axes, which is why the open half of `PERF-04` is a bound on the response and not a faster loop.
+
+So the shift-window prefilter over `CandidateStartsUtc` is **not** written. It would have to intersect the grid with
+each staff member's buffered windows in UTC — DST-correctly, because the grid is anchored on local midnight and the
+windows are instants — to save a few milliseconds that only appear at a grid density nobody can request. The rule
+§5 states for indexes is applied to CPU here instead: measure the size of the saving before paying in complexity, and
+write down the refusal when the saving is not there.
+
+One correction travels with this table. The roster was first called "the multiplier any anonymous caller can grow".
+A caller cannot grow it — adding staff is tenant data, and `SlotIntervalMinutes` has no writer outside
+`DatabaseSeeder.cs:79,155,206`. What a caller can do is *point at* a tenant that has grown it and receive 683 KB of
+JSON from an `[AllowAnonymous]` route, which is the finding worth acting on and the one `AUDIT-STATUS.md` §3 keeps open.
