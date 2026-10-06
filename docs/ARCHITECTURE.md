@@ -92,3 +92,21 @@ All `POST` and `PUT` endpoints accept an optional or required `Idempotency-Key` 
 - Network re-transmissions receive the exact previous result immediately without executing redundant database writes or payment transactions.
 - The key is scoped by tenant (`<tenantId:N>:<key>`, or a `global` bucket for a request with no tenant), and the stored `RequestHash` is compared on replay: the same key with a different payload is refused with `409`, not silently served the old answer.
 - The record lives for `RetentionPolicy.IdempotencyWindow` (24 h), which is one constant shared with the retention sweep rather than a number written twice — the middleware mints the deadline and the sweep deletes past it, so a key cannot be replayable and collectable at the same time. Both ends are pinned by one test that stores a key through the wire and sweeps it inside and outside the window. See `SECURITY.md` §1.3.
+
+### 4.4 One Time Source Per Layer
+
+`QUAL-04` began as "two competing time sources" and its residue was three ledger stamps reading the machine clock
+inside handlers that otherwise read `IClock`. The rule the fix leaves behind is split by layer, and each half is
+checked where it can be checked:
+
+- **Application** reads `IClock` and nothing else. No file under `src/BooklyHub.Application` may name
+  `DateTime.UtcNow` — `PaymentStampClockTests.TheApplicationLayer_MustNotReachForTheWallClock` scans the shipped
+  source for that name, so a fourth stamp fails a test instead of shipping. A handler that writes two rows takes one
+  clock read for both, which is why a refund and its ledger entry name the same instant.
+- **Domain** must not know `IClock`, so entities keep `= DateTime.UtcNow` field defaults. Those defaults are not the
+  answer for an `IAuditableEntity`: `ApplicationDbContext.SaveChangesAsync` overwrites `CreatedAtUtc` (and
+  `LastModifiedAtUtc` on a modified row) with its own `IClock` read, which is why a charge's row and its ledger entry
+  agree. `PaymentTransaction` and `Refund` are not auditable, so their stamps belong to the handler that writes them.
+- **Infrastructure** keeps exactly one deliberate wall-clock read: the JWT `expires` claim in
+  `Security/AuthServices.cs`, because a token has to agree with the clock its verifier really runs, not with the
+  application's.

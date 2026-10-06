@@ -126,6 +126,8 @@ public class ProcessPaymentCommandHandler : IRequestHandler<ProcessPaymentComman
                 throw new BusinessRuleValidationException("PaymentFailed", result.ErrorMessage ?? "Payment processing failed.");
             }
 
+            var nowUtc = _clock.UtcNow;
+
             var payment = new Payment
             {
                 Id = Guid.NewGuid(),
@@ -150,7 +152,7 @@ public class ProcessPaymentCommandHandler : IRequestHandler<ProcessPaymentComman
                 Type = PaymentTransactionType.Charge,
                 Status = result.Status,
                 ProviderTransactionId = result.TransactionId,
-                TimestampUtc = DateTime.UtcNow
+                TimestampUtc = nowUtc
             });
 
             _db.Payments.Add(payment);
@@ -199,11 +201,13 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
 {
     private readonly IApplicationDbContext _db;
     private readonly IPaymentProvider _paymentProvider;
+    private readonly IClock _clock;
 
-    public RefundPaymentCommandHandler(IApplicationDbContext db, IPaymentProvider paymentProvider)
+    public RefundPaymentCommandHandler(IApplicationDbContext db, IPaymentProvider paymentProvider, IClock clock)
     {
         _db = db;
         _paymentProvider = paymentProvider;
+        _clock = clock;
     }
 
     public async Task<bool> Handle(RefundPaymentCommand request, CancellationToken cancellationToken)
@@ -254,6 +258,8 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
                 throw new BusinessRuleValidationException("RefundFailed", result.ErrorMessage ?? "Refund processing failed.");
             }
 
+            var nowUtc = _clock.UtcNow;
+
             var refund = new Refund
             {
                 Id = Guid.NewGuid(),
@@ -262,7 +268,7 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
                 Reason = request.Reason,
                 Status = PaymentStatus.Refunded,
                 ProviderRefundId = result.RefundId,
-                CreatedAtUtc = DateTime.UtcNow
+                CreatedAtUtc = nowUtc
             };
 
             // Same registration rule as the charge path: children are added through the set.
@@ -275,7 +281,7 @@ public class RefundPaymentCommandHandler : IRequestHandler<RefundPaymentCommand,
                 Type = PaymentTransactionType.Refund,
                 Status = PaymentStatus.Refunded,
                 ProviderTransactionId = result.RefundId,
-                TimestampUtc = DateTime.UtcNow
+                TimestampUtc = nowUtc
             });
 
             payment.Status = remaining - request.Amount <= 0m
