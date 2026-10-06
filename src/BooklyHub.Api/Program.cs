@@ -7,7 +7,9 @@ using BooklyHub.Infrastructure;
 using BooklyHub.Infrastructure.Data;
 using BooklyHub.Infrastructure.Data.Seeding;
 using BooklyHub.Infrastructure.MultiTenancy;
+using BooklyHub.Infrastructure.Security;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi;
 using Serilog;
@@ -197,6 +199,74 @@ if (args.Contains("--migrate-only") || builder.Configuration.GetValue<bool>("Aut
 }
 
 // Middleware Pipeline
+
+// Everything below judges a caller by httpContext.Connection.RemoteIpAddress, and behind a TLS-terminating
+// proxy that address is the proxy's: every visitor then shares the global 100/min and the auth 10/min buckets,
+// so one anonymous caller locks the sign-in door for the whole deployment. The header the proxy writes carries
+// the real caller, and reading it is only safe for a peer the operator has named — any caller can write this
+// header, so an unnamed trust is an identity an attacker chooses. Nothing declared therefore means no header
+// read, which leaves a host that has not described its topology with today's behaviour rather than a guess at
+// it. First in the pipeline because the request log, the redirect and both limiters all read the address.
+var forwarding = ForwardingSettings.FromConfiguration(builder.Configuration);
+if (forwarding.IsConfigured)
+{
+    var forwardedHeaders = new ForwardedHeadersOptions
+    {
+        ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto,
+
+        // One hop, which is the topology this deployment family has. It is not the thing that stops a caller
+        // rotating its identity with a longer chain: measured on this runtime, a two-entry chain resolves to its
+        // rightmost entry whether the limit is set or not, so the prefix defence is the declared-peer check and
+        // the facts below name it as such. The limit says the chain this host will read is one proxy deep.
+        ForwardLimit = 1
+    };
+
+    // Measured: this constructor arrives with loopback already in its trust lists, so a host that names its
+    // remote proxy still believes an X-Forwarded-For that arrives from the same machine — a sidecar, a second
+    // container on the host network, any local process. Emptying both spellings of the list is what makes the
+    // operator's declaration the whole declaration; the framework keeps an obsolete and a typed property for the
+    // same idea and only measuring which one it reads would be a guess, so both go.
+    // LoopbackProxyRateLimitTests is the fact that says this is load-bearing: with these three lines removed, a
+    // request arriving from 127.0.0.1 through a host that declared 192.0.2.1 had its address rewritten.
+    forwardedHeaders.KnownProxies.Clear();
+#pragma warning disable ASPDEPR005 // The obsolete list is the one the runtime populated by default, so it is the
+                                   // one that has to go; the typed property alone would leave the trust in place.
+    forwardedHeaders.KnownNetworks.Clear();
+#pragma warning restore ASPDEPR005
+    forwardedHeaders.KnownIPNetworks.Clear();
+
+    foreach (var proxy in forwarding.KnownProxies)
+    {
+        forwardedHeaders.KnownProxies.Add(proxy);
+    }
+
+    foreach (var network in forwarding.KnownNetworks)
+    {
+        // KnownIPNetworks, not KnownNetworks: the property that takes ASP.NET's own IPNetwork type is obsolete
+        // on this runtime, and System.Net.IPNetwork is the one that will still be there.
+        forwardedHeaders.KnownIPNetworks.Add(network);
+    }
+
+    // Measured on this runtime: a connection that carries no address gets the header applied whatever the trust
+    // list says, because there is no peer to compare against and the framework reads that as permission rather
+    // than as a refusal. A socket from Kestrel always has an address; a unix-socket listener does not, and a
+    // deployment fronted over one would otherwise let any local process name its own client identity. No address
+    // means no peer to check, and no peer to check means no trust, so the headers go before the middleware sees
+    // them. AddresslessConnectionRateLimitTests is the fact that pins this.
+    app.Use((context, next) =>
+    {
+        if (context.Connection.RemoteIpAddress is null)
+        {
+            context.Request.Headers.Remove("X-Forwarded-For");
+            context.Request.Headers.Remove("X-Forwarded-Proto");
+        }
+
+        return next(context);
+    });
+
+    app.UseForwardedHeaders(forwardedHeaders);
+}
+
 app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 

@@ -52,6 +52,16 @@ public class BooklyHubWebApplicationFactory : WebApplicationFactory<Program>, IA
     {
     }
 
+    /// <summary>
+    /// Configuration a derived fixture adds for its own facts, merged into the same in-memory source that
+    /// carries the test connection string and signing key. Needed because some host behaviour is decided by
+    /// configuration before the pipeline is built — <c>Forwarding:KnownProxies</c> registers a middleware or
+    /// does not — and a service override cannot reach a decision the pipeline already made.
+    /// </summary>
+    protected virtual void ConfigureTestConfiguration(IDictionary<string, string?> configuration)
+    {
+    }
+
     public BooklyHubWebApplicationFactory()
     {
         var injected =
@@ -84,6 +94,9 @@ public class BooklyHubWebApplicationFactory : WebApplicationFactory<Program>, IA
                 ["Jwt:Secret"] = "BooklyHub_IntegrationTest_Only_SigningKey_NotForProduction_256bit!",
                 ["AutoMigrateAndSeed"] = "false"
             };
+
+            ConfigureTestConfiguration(testConfig);
+
             config.AddInMemoryCollection(testConfig);
         });
 
