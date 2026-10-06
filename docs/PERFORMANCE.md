@@ -134,6 +134,13 @@ windows are instants — to save a few milliseconds that only appear at a grid d
 §5 states for indexes is applied to CPU here instead: measure the size of the saving before paying in complexity, and
 write down the refusal when the saving is not there.
 
+What the roster multiplies is rows and bytes, not round trips. An availability day costs **11 statements** whoever is
+on it — the booking context, the candidate roster, the five calendar families and the resource inventory, each read
+once and parameterised by the whole candidate list rather than by one staff member.
+One staff member and eight issue the same eleven, and `AvailabilityBatchingTests` holds that line — its control adds
+one read per candidate staff inside the loop and moves the eight-staff day from 11 statements to 18, which is the
+shape `PERF-02` was written about and the reason the fix was never left implicit.
+
 One correction travels with this table. The roster was first called "the multiplier any anonymous caller can grow".
 A caller cannot grow it — adding staff is tenant data, and `SlotIntervalMinutes` has no writer outside
 `DatabaseSeeder.cs:79,155,206`. What a caller can do is *point at* a tenant that has grown it and receive 683 KB of
