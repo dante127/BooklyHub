@@ -207,6 +207,40 @@ Recording these because each one was stated as fact at some point, and the tree 
     port unset. And `docs/API.md` §10 now states which of these the test host cannot reach: the redirect and the
     filter are decided before `builder.Build()`, so no fixture can flip them and their evidence is live, not unit.
 
+17. **Writing the handover document turned into an audit of `README.md`, and the front page was the least measured
+    file in the repository.** `DEP-04` is a documentation change, so there is no failing test to quote as its control;
+    instead every number it now prints was re-run or re-read for this commit, and four claims refused to survive that.
+    - **The test counts were two orders of magnitude stale.** The front page said "23 tests" for the unit suite and
+      "6 tests" for the integration suite. Measured on `503696a`: **290 unit facts (~3 s) and 346 integration facts
+      (~33 s against LocalDB)**, both `Failed: 0`. Nobody had updated those figures since the first commit, which is
+      how a README ends up advertising a fraction of the evidence that exists.
+    - **The demo-data table described a database the seeder does not write.** It promised Apex 2 locations, 3
+      dentists and 6 services with 3 treatment rooms and 2 X-ray machines, Luxe 4 stylists and 5 services and 4
+      chairs, Pulse 3 trainers and 4 programs and 2 studios and 2 squat racks. `DatabaseSeeder.cs:95-263` writes, per
+      tenant, **one** location and **one** staff member: Apex 3 services + 2 resource groups holding 3 resources +
+      2 customers + 1 appointment with 1 review; Luxe 2 services + 1 group with 2 chairs + 1 customer; Pulse 2
+      services, no resource groups, 1 customer. Total: 3 tenants, 3 locations, 3 staff, 7 services, 5 resources, 4
+      customers. A client who reads the old table and counts the rows on arrival finds two thirds of the clinic
+      missing, so the table now states what the block writes and calls it a demonstration of the data model rather
+      than a data set.
+    - **`Webhook Replay Protection` named a feature that does not exist.** `grep -rli webhook src --include=*.cs`
+      returns **no source file** (the only hits under `src` are two build-output copies of `Microsoft.OpenApi.dll`,
+      which is a reminder that a grep without `--include` in this tree answers from `bin/`) — the idempotency
+      middleware is real, the webhook is not, and the phrase had been riding in the heading next to it. Same class
+      one line further down: the front page said the dashboard runs "≤ 4 pure SQL set-based queries" while
+      `NPlusOneQueryTests.cs:173` asserts **≤ 5**, and the comment above it explains the fifth is the
+      stale-executions counter `P6-2` added. The README had been overtaken by its own tests.
+    - **The quickstart's only UI instruction 404s on the deployment it documents.** "Open http://localhost:5000/swagger"
+      — `5000` is the port *compose* publishes, and compose runs `ASPNETCORE_ENVIRONMENT=Production`, where Swagger is
+      not mapped at all (`Program.cs:306` gates it on Development). The local `http` launch profile is `5089`. Both
+      facts are now stated where the operator meets them, with `docs/API.md` named as the contract for a deployed
+      instance — that file is the one with a test behind it (`DocumentedApiShapeTests`).
+    Two smaller ones, both about pointing a reader at something that is not there: the badge and the clone URL addressed
+    `github.com/BooklyHub/BooklyHub` while `git remote -v` says the origin is `github.com/dante127/BooklyHub`, so the CI
+    badge could only ever render a repository that does not exist; and the header declared MIT while the tree had no
+    `LICENSE` file — a declared license with no text is not a grant, and a client handover cannot ship one.
+
+
 ## 3. What is genuinely live, in the order the next work should take it
 
 1. `PERF-04` residue — the availability day is the one anonymous response with no bound on it, and its size grows
@@ -235,3 +269,11 @@ Recording these because each one was stated as fact at some point, and the tree 
 5. Product decisions, not to be taken from this queue: `SEC-03`'s tenant gate, `BL-08`'s authorship and moderation,
    `DB-02`'s recurring-series definition, `QUAL-05`'s module split.
 6. Operator action only: `SEC-02` — rotate the secret committed before `d767c25`.
+7. `DEP-05` — nothing has ever run this tree's own deployment surface end to end. `.github/workflows/ci.yml` restores,
+   builds in Release and runs both suites against a SQL Server container; it never builds the image, never renders
+   `docker-compose.yml`, and never starts the stack, so the `Dockerfile` and compose file `DEP-03` fixed have only
+   been exercised from a workstation. The README's CI badge now points at the real origin, but a badge reports what
+   GitHub says about a workflow, and no machine here has read that: the honest status of the front page's "✅ measured"
+   column is *measured locally, CI run not yet observed*. The remaining evidence is one Actions run and one
+   `docker compose up` on a clean machine, followed by the smoke checklist in `docs/DEPLOYMENT.md` §7 including the step
+   it currently marks unrecorded (sign in, read the catalog, book an appointment).
