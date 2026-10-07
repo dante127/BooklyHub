@@ -49,6 +49,7 @@ services:
       - Notifications__Provider=${NOTIFICATIONS_PROVIDER:-None}
       - Seed__AdminEmail=${SEED_ADMIN_EMAIL:?SEED_ADMIN_EMAIL must be set}
       - Seed__AdminPassword=${SEED_ADMIN_PASSWORD:?SEED_ADMIN_PASSWORD must be set}
+      - Seed__DemoTenants=${SEED_DEMO_TENANTS:-false}
     depends_on:
       sqlserver:
         condition: service_healthy
@@ -69,8 +70,35 @@ services:
       - Jwt__ExpirationMinutes=60
       - Payments__Provider=${PAYMENTS_PROVIDER:-None}
       - Notifications__Provider=${NOTIFICATIONS_PROVIDER:-None}
+      # How this host may be reached. Both default to "no declaration", which is the state the code was in
+      # before either key was read: plain HTTP served on every Host value. Naming them is what puts a real
+      # domain and a real TLS terminator into the deployment; docs/DEPLOYMENT.md says what each costs.
+      - AllowedHosts=${ALLOWED_HOSTS:-*}
+      - HttpsRedirection__Port=${HTTPS_REDIRECT_PORT:-}
+      # The address of the proxy that writes X-Forwarded-For, if there is one. Without it every caller shares
+      # one rate-limit bucket, because the host then judges a request by the container address it arrived from.
+      - Forwarding__KnownProxies=${FORWARDING_KNOWN_PROXIES:-}
+      # Only read by the healthcheck below, and only needed when the derivation there cannot pick a name.
+      - HEALTH_PROBE_HOST=${HEALTH_PROBE_HOST:-}
     ports:
       - "127.0.0.1:5000:8080"
+    healthcheck:
+      # The probe asks a real HTTP question, so it has to arrive wearing a Host this deployment admits. Naming
+      # ALLOWED_HOSTS populates the host filter, and curl's default Host is the address the container reaches
+      # itself by — `127.0.0.1:8080` — which is not one of the names. Measured: with ALLOWED_HOSTS=bookly.example
+      # the probe got 400, the service never reported healthy, and an orchestrator obeying `service_healthy`
+      # would restart a working instance forever. So the probe speaks as the first name the operator gave.
+      # The derivation has to survive every spelling ServingSurface accepts, because each one otherwise marks a
+      # working container unhealthy (all measured against this stack): `a.test, b.test` needs the comma cut as
+      # well as the ';' one; a padded entry needs the spaces gone; a bare `*` is not a Host at all — sending it
+      # answered 400 even with no filter installed — and `*.a.test` matches a subdomain but not the suffix, so it
+      # becomes `probe.a.test`. Empty or unset falls back to `localhost`, which any unfiltered host answers.
+      # HEALTH_PROBE_HOST overrides the whole derivation for a deployment whose probe name is its own business.
+      test: ["CMD-SHELL", 'p=$${HEALTH_PROBE_HOST:-}; h=$${p:-$$(printf "%s" "$${AllowedHosts}" | tr -d " " | cut -d";" -f1 | cut -d"," -f1)}; case "$$h" in \*.*) h=probe.$${h#\*.};; \*) h=localhost;; esac; curl -fsS -H "Host: $${h:-localhost}" http://127.0.0.1:8080/health/live']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     depends_on:
       migrator:
         condition: service_completed_successfully

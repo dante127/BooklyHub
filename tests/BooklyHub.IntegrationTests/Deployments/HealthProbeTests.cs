@@ -62,7 +62,7 @@ public sealed class HealthProbeTests : IAsyncLifetime
 
         public byte[]? Get(string key) => throw new InvalidOperationException("redis is down");
 
-        public Task<byte[]?> GetAsync(string key, CancellationToken token = default) => Fail<byte[]>();
+        public Task<byte[]?> GetAsync(string key, CancellationToken token = default) => Fail<byte[]?>();
 
         public void Set(string key, byte[] value, DistributedCacheEntryOptions options)
             => throw new InvalidOperationException("redis is down");

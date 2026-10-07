@@ -1088,3 +1088,42 @@ that something is wrong and nothing about what. So each route names the checks i
 probe body carries a check's `description` or exception text: the failure message of the database check is written
 by the SQL client and names the server and catalog the deployment talks to, and these routes are anonymous; the check
 *name* and its status are what a caller outside the tenant is allowed to learn (§1.1, `SEC-09`).
+
+### 10.1 Serving settings that change what every route answers
+
+Three keys are read out of configuration **before** `builder.Build()`, which means they decide whether a middleware
+is in the pipeline at all rather than what it does per request: `AllowedHosts`, `HttpsRedirection:Port` (or the
+host's own `ASPNETCORE_HTTPS_PORT`), and `Forwarding:KnownProxies` (`SECURITY.md` §3.6). Being pre-`Build()` reads,
+they are the settings a `WebApplicationFactory` cannot override — `ConfigureTestConfiguration` lands after them — so
+the evidence below is a live host started with those environment variables, run twice: against this build and against
+`5ae2e74` (the control, in a detached worktree). `/health/live` is the probe URL; `200` means "reached the route",
+`400` means the host filter refused before routing, and every row below answers `307` instead of `200` when a redirect
+port is also named.
+
+| `AllowedHosts` | this build | `5ae2e74` |
+|---|---|---|
+| unset, or `*` | no filter; `a.test` `200`, `evil.test` `200` | same |
+| `a.test` | `a.test` `200`, `evil.test` `400` | same — **the host installs the filter and binds this key by itself** |
+| `a.test;b.test` | both `200`, foreign `400` | same |
+| `a.test, b.test` | both `200`, foreign `400` | **`400` to all three, including the two it names** |
+| `*.a.test` | `x.a.test` `200`, `a.test` `400`, foreign `400` | same |
+| `a test` / `*a.test` / `a.test*` | **refuses to start**, naming the entry and the key | starts, and answers `400` to everything (`"a test"`) or to the host the wildcard was meant to admit (`*a.test`) |
+| `a.test; *` | **refuses to start** — the two declarations contradict each other | starts; `a.test` `200`, foreign `400`, i.e. the `*` never fires |
+| `AllowedHosts__0=a.test AllowedHosts__1=b.test` | no narrowing, foreign `200` | same — the indexed spelling is read by neither, so the delimited string is the one to write |
+
+Two consequences a client deployment has to plan around, both measured against the running compose stack:
+
+- **`HTTPS_REDIRECT_PORT` redirects the health routes too.** With it set to `8443`, `GET /health/live` for an
+  admitted Host answers `307` (`Content-Length: 0`) and a foreign Host still answers `400`, because host filtering
+  runs first. An orchestrator that requires `2xx` must probe the HTTPS side or leave the port unset; leaving it
+  unset is not a downgrade — it is the state this image was built in, and the right one when TLS terminates in front
+  of the container.
+- **Naming `AllowedHosts` without telling the probe a name makes a healthy container look dead.** The compose probe
+  asks `http://127.0.0.1:8080/health/live`, whose default `Host` is that address, so a filter that admits only real
+  domain names answers it `400` and `service_healthy` never satisfies. The probe now derives the first name from the
+  same key (and derives `probe.<suffix>` from a `*.suffix` declaration, `localhost` from `*`) — a bare `*` sent as a
+  `Host` answered `400` even with no filter installed, which is why there is a derivation rather than a fixed header.
+  `HEALTH_PROBE_HOST` overrides it. See `docs/DEPLOYMENT.md` §3.
+
+`ServingSurfaceTests` (32 facts) pins the reading side — what counts as declared, what is refused, and why `*` alone
+means "no narrowing" while `*` beside a name means "refuse". The matrix above is the half a unit test cannot reach.

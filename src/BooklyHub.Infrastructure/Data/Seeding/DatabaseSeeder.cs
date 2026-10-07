@@ -21,7 +21,12 @@ public static class DatabaseSeeder
 {
     public static async Task SeedAsync(ApplicationDbContext db, IPasswordHasher hasher, IClock clock, IConfiguration configuration, ILogger logger)
     {
-        if (await db.Tenants.IgnoreQueryFilters().AnyAsync())
+        // The sentinel is the first thing this method writes unconditionally, not a tenant. Judging "already
+        // seeded" by the tenant table was safe only while every seeded database contained demo tenants: with
+        // the demo half now opt-in, a reference-only first run left the next run to re-insert the same roles
+        // and permissions onto the keys the first one wrote (measured against the old sentinel: "Violation of
+        // PRIMARY KEY constraint 'PK_Permissions'", duplicate key "appointments.cancel").
+        if (await db.Permissions.IgnoreQueryFilters().AnyAsync())
         {
             logger.LogInformation("Database already seeded. Skipping initial seeding.");
             return;
@@ -29,8 +34,10 @@ public static class DatabaseSeeder
 
         var adminEmail = RequireConfiguration(configuration, "Seed:AdminEmail");
         var adminPassword = RequireConfiguration(configuration, "Seed:AdminPassword");
+        var demoTenants = configuration.GetValue<bool>("Seed:DemoTenants");
 
-        logger.LogInformation("Starting database seeding for 3 realistic tenants...");
+        logger.LogInformation("Seeding roles, permissions and the platform administrator ({Mode})...",
+            demoTenants ? "with demo tenants" : "no demo tenants");
 
         // Seed Roles & Permissions
         var permissions = Permissions.All.Select(p => new Permission(p, p.Split('.')[0], p)).ToList();
@@ -71,6 +78,18 @@ public static class DatabaseSeeder
         };
         platformAdminUser.UserRoles.Add(new UserRole { UserId = platformAdminUser.Id, RoleId = platformAdminRole.Id });
         db.Users.Add(platformAdminUser);
+
+        if (!demoTenants)
+        {
+            // A client's first run gets an empty product and one administrator. The block below is a scripted
+            // demo — three clinics, their staff, and invented patients with names, emails and appointments —
+            // and it belongs in a development database, not in the production tenant table nobody can delete
+            // from (there is no tenant delete route, and `SEC-03`'s onboarding gap means these would be the
+            // only tenants this server has ever had).
+            await db.SaveChangesAsync();
+            logger.LogInformation("Seeded reference data and the platform administrator; no demo tenants created.");
+            return;
+        }
 
         // ==========================================
         // TENANT 1: Apex Dental Clinic (Healthcare)

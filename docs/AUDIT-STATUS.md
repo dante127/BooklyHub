@@ -7,8 +7,10 @@ leaves a reader unable to tell whether `BL-05` is a bug still in the tree or a s
 weeks ago. This file answers that, per ID, with the evidence pointed at a file and a line.
 
 Everything here was measured at `c67480f`; the line references and the availability timings below were re-checked
-against the tree at `21bebf7`, after the `BL-05` and `SEC-13` fixes landed, and the `PERF-05` row was re-measured at
-`009254b` before it was closed. A verdict of **live** means the described
+against the tree at `21bebf7`, after the `BL-05` and `SEC-13` fixes landed, the `PERF-05` row was re-measured at
+`009254b` before it was closed, and the `DEP-*` rows were measured against `5ae2e74` as their control — every
+negative control behind a verdict in this file ran in a detached `git worktree` at a named SHA, never by reverting
+the fixed tree. A verdict of **live** means the described
 behaviour is reachable in the
 current code; **fixed** names the commit; **stale** means the audit's description does not match the code (and often
 never did); **product decision** means closing it means inventing behaviour the repository has no opinion about,
@@ -23,8 +25,8 @@ which this remediation does not do from a bug queue.
 | SEC-06 — permissions frozen in 60-min claims; "policy provider matches anything" | High | **first half live, second half stale** | claims baked at `AuthServices.cs:48-51`, life 60 min (`appsettings.json:10`), already open in `SECURITY.md` §; `PermissionAuthorization.cs:19-35` is fail-closed — it succeeds only on `PlatformAdmin` or a matching `permission` claim, and `PermissionPolicyProvider.cs:25-31` never returns a permissive policy | revocation (`SEC-05c`, `ACT-01`) already bounds the frozen-claims window; nothing further to repair |
 | SEC-09 — PII at `Information`; refused sign-ins unlogged | Medium | **fixed** | the three dispatch lines carry only lengths and the server's own recipient id (`NotificationAndCacheServices.cs`, pinned by `OutboundDispatchLogTests`); every refusal on the two doors that take a password emits `Refused at {source}: {reason} for user {id}. Correlation-Id {cid}` at `Warning` (`AuthController.cs` `RefusalReason`/`LogRefusal`, pinned by `RefusedSignInLogTests`, `LockedOutSignInLogTests`, `RefusedPasswordChangeLogTests`), and so does every refused refresh (`RefreshRefusalCause`, same line, source `auth:refresh-token`, pinned by `RefusedRefreshLogTests`) | the cause is logged, never sent — the body stays the single `Invalid or expired refresh token.` for all four causes (`unknown-credential`, `revoked-credential`, `expired-credential`, `inactive-account`), and the credential string is written nowhere. Two measured notes travel with the refresh half: a **soft-deleted** account is logged as `unknown-credential`, not as its own cause, because the filtered include drops the credential row before the guard sees it (§2.11); and the appointment handlers' dispatches still leave no recipient record anywhere (`SECURITY.md` §3.4) |
 | SEC-11 — `LIKE` wildcards not escaped in search | Medium | **stale as claimed; closed on the defect the claim missed** | `.Contains(search)` (`CatalogControllers.cs:143`) does **not** reach SQL with `%`/`_` intact: EF Core 10 sends `LIKE @search_contains ESCAPE N'\'` with `%`, `_`, `[` and `\` prefixed before the term leaves the process. Measured on the real route — `?search=%` returns the one row whose name holds a percent sign, not the tenant's book; `a_a` misses `Ana`; `[AB]na` matches nothing; `\` finds the backslash row instead of faulting; `' OR 1=1--` is a parameter. Pinned by `LikeWildcardSearchTests` (6 facts), whose control replaces the predicate with a hand-built unescaped `EF.Functions.Like(c.FirstName, "%" + search + "%")` and fails **all six** | What the length walk found instead: from **3,999 characters** the pattern passes SQL Server's 4,000-character ceiling and the route answers `500`. Bounded by `MaxSearchTermCharacters = 256` — the widest column the predicate reads (`sys.columns`: name 100, email 256), so a longer term cannot be a substring of anything and the empty page is the only true answer. 7 more facts (`SearchTermLengthTests`), one of which reads the column widths off the EF model so a widening moves the bound in a failing test; `SECURITY.md` §3.7 |
-| SEC-12 — no CORS policy, no HSTS, HTTPS redirect inert in Docker | Medium | **forwarded-headers half fixed; CORS and HSTS live** | `UseForwardedHeaders` is now in the pipeline, registered only when the operator names a proxy or a network (`ForwardingSettings.cs`, `Program.cs` first-in-pipeline), reading `Forwarding:KnownProxies` / `Forwarding:KnownNetworks`, with the framework's inherited loopback trust withdrawn and the chain bounded — so behind a declared TLS-terminating proxy the rate-limit buckets are per real caller again instead of one shared bucket per deployment (`SECURITY.md` §3.6). Still absent: no `AddCors`/`UseCors` anywhere in `src` (pipeline `Program.cs`), no `UseHsts`, and `Dockerfile:26` binds `http://+:8080` with `EXPOSE 8081` unused | **deployment-dependent** for the TLS half. Absent CORS is fail-closed for browsers, so this is a missing stated policy, not an open door; the two remaining halves need a stated policy from the operator, not code |
-| SEC-13 — `AllowedHosts":"*"`, correlation ID taken verbatim | Low | **correlation ID fixed; `AllowedHosts` live** | `CorrelationIdMiddleware.Resolve` keeps a supplied id only when it matches `\A[A-Za-z0-9._-]{1,64}\z` and otherwise answers under a server-made GUID — the header, the problem body's `correlationId` and Serilog's `LogContext` property all read that one answer, so the caller's text can no longer be echoed at it or spliced raw into the output template (`Program.cs:21`), and the replace-not-strip choice is pinned by its own assertion (`CorrelationIdBoundaryTests`, 9 facts; `SECURITY.md` §3.5) | `AllowedHosts": "*"` (`appsettings.json:29`) is a deployment setting, not a code defect — narrowing it is an operator choice about which hosts serve this app. Also corrected here: the 100-char `AuditLogs.CorrelationId` column was never at risk, because nothing writes that table |
+| SEC-12 — no CORS policy, no HSTS, HTTPS redirect inert in Docker | Medium | **forwarded-headers and Docker-redirect halves fixed; CORS and HSTS live** | `UseForwardedHeaders` is now in the pipeline, registered only when the operator names a proxy or a network (`ForwardingSettings.cs`, `Program.cs` first-in-pipeline), reading `Forwarding:KnownProxies` / `Forwarding:KnownNetworks`, with the framework's inherited loopback trust withdrawn and the chain bounded — so behind a declared TLS-terminating proxy the rate-limit buckets are per real caller again instead of one shared bucket per deployment (`SECURITY.md` §3.6). The Docker half closed with `DEP-03`: `Dockerfile:32` exposes the one port the process binds (it said `8081` while `ASPNETCORE_URLS` said `8080`), and `HTTPS_REDIRECT_PORT` puts the redirect in the pipeline with the port a TLS terminator actually answers on — left unset it stays out rather than spending every plain request failing to work a port out. Still absent: no `AddCors`/`UseCors` anywhere in `src` (pipeline `Program.cs`) and no `UseHsts` | **deployment-dependent** for the two that remain. Absent CORS is fail-closed for browsers, so this is a missing stated policy, not an open door; both need the operator's deployment story, not a patch |
+| SEC-13 — `AllowedHosts":"*"`, correlation ID taken verbatim | Low | **both halves closed; the second on a different defect than claimed** | `CorrelationIdMiddleware.Resolve` keeps a supplied id only when it matches `\A[A-Za-z0-9._-]{1,64}\z` and otherwise answers under a server-made GUID — the header, the problem body's `correlationId` and Serilog's `LogContext` property all read that one answer, so the caller's text can no longer be echoed at it or spliced raw into the output template (`Program.cs:21`), and the replace-not-strip choice is pinned by its own assertion (`CorrelationIdBoundaryTests`, 9 facts; `SECURITY.md` §3.5) | **The claimed residue was measured and is not true.** `DEP-03` ran `5ae2e74`, which has no host-filtering code, and `AllowedHosts=a.test` answered 400 to `Host: evil.test`: minimal hosting installs the middleware and binds the key itself, so `AllowedHosts` was never dead config and `UseHostFiltering()` was never missing. What was live is the *spelling*: the host splits the key on `';'` and trims nothing, so a comma list, a space inside an entry, or `*a.test` makes the site answer 400 to every Host **including the names on the list**, and `a.test; *` quietly drops the wildcard. `ServingSurface` reads and validates the key now (32 facts, `docs/DEPLOYMENT.md` §3 for the live matrix), and `appsettings.json:29` keeps `"*"` because widening a deployment's admitted hosts from a repository default is an operator's call, not a commit's. Also corrected here: the 100-char `AuditLogs.CorrelationId` column was never at risk, because nothing writes that table |
 | API-08 — anonymous review wall exposes staff/service names | Low | **live by design** | `ReviewsController.cs:48-49` `[AllowAnonymous]`, tenant from header/query, `IsPublished` rows only (`:61`) | already documented as the public half; the stronger disclosure is `GET /api/v1/staff`, which answers `Email` and `PhoneNumber` (`CatalogControllers.cs:94-95`) |
 | BL-01 — booking guard ignores working hours, business hours, holidays, leave | High | **fixed** | `52aff50` put preview and guard behind one rule set; all four calendars are read in `AvailabilityService.cs:468` (Holidays), `:500` (WorkingHours), `:509` (BusinessHours), `:517` (AvailabilityExceptions) and consumed by `Classify` (`:340-386`) | the real residual is **`CAL-01`** (coined here): only `WorkingHours` is ever seeded (`DatabaseSeeder.cs:126-129`), and Holidays / BusinessHours / AvailabilityExceptions have **no route and no seed**, so the guard enforces a calendar nobody can currently maintain |
 | BL-02 — resource conflict ignores location scope and buffers | High | **fixed** | `62beadb` (location-wide allocator) + `f404dc3` (the index the occupancy read needed); occupancy loads by tenant+location (`AvailabilityService.cs:487-491`), the guard returns the resource ids it verified and the commands persist exactly those (`BookAppointmentCommand.cs:219,245-253`) | buffers applying to staff but not rooms is a documented choice (`SCHEDULING-CONCURRENCY.md` §3.2) |
@@ -155,6 +157,56 @@ Recording these because each one was stated as fact at some point, and the tree 
     cache call failing (`ACacheThatFailsEveryCall_…`). Rule: a gate has to be measured against a dependency that is
     actually down, and a control that passes when the thing it guards is deleted is guarding the test, not the code.
 
+16. **"The Docker stack has never started" was four defects, and closing them killed a claim this file had
+    inherited.** `DEP-03` began as "make the compose deployment usable by a client" and ended with the first image
+    this repository ever produced.
+    - **The image had never built.** The runtime stage's `adduser` does not exist in
+      `mcr.microsoft.com/dotnet/aspnet:10.0` (Ubuntu 24.04.5; measured on the pulled base: `command -v adduser` finds
+      nothing, `command -v useradd` finds it), so the layer ended with exit 127 and every statement anyone had made
+      about running this stack was about a stack that could not exist. It is now `useradd --uid 10001 --user-group`,
+      the container runs as uid 10001, and `EXPOSE` names the one port the process binds (`8080`; `8081` advertised a
+      listener nothing had opened).
+    - **Nothing had ever executed `DatabaseSeeder`.** `BooklyHubWebApplicationFactory` sets `AutoMigrateAndSeed=false`,
+      so 341 integration facts migrated a schema and walked past the seeding path. The first five facts to call it
+      (`ProductionSeedTests`) found a seeder whose only product was a scripted demo: three invented clinics, their
+      staff, and patients with names and emails — written unconditionally into the tenant table of a client's
+      production database, where no route can delete them. `Seed:DemoTenants` now opts that half in, default off, and
+      the "already seeded" sentinel moved from `db.Tenants` to `db.Permissions`, which is the first row set the method
+      writes unconditionally. Two controls, in a throwaway worktree: these same five facts against `5ae2e74` fail 3 of
+      5, each with *found 3* tenants; and with only the sentinel line reverted — the opt-in kept — the second run
+      throws `Violation of PRIMARY KEY constraint 'PK_Permissions'. The duplicate key value is
+      (appointments.cancel)`. That second control is the reason the sentinel is a fix and not a tidying: an operator
+      who flips `SEED_DEMO_TENANTS` after the first run gets a stack trace from a one-shot migrator container, and
+      `depends_on: service_completed_successfully` holds the API down behind it.
+    - **`SEC-13`'s residue was wrong about which half was live.** The claim was `UseHostFiltering()` had never been
+      called, so `AllowedHosts` was dead config. Measured against `5ae2e74`, which contains no host-filtering code at
+      all: `AllowedHosts=a.test` answered **400** to `Host: evil.test`. Minimal hosting installs the middleware and
+      binds the key by itself; calling `UseHostFiltering()` here would only have added a second copy of it to every
+      request. What was actually live is the set of spellings an operator can write that silently destroy the defence,
+      because the host splits the key on `';'` alone and never trims: `"a.test, b.test"` — the natural way to write a
+      list in a shell — became **one** unmatchable pattern and answered **400 to every Host, including the two it
+      named**; `"a test"` and `"*a.test"` did the same; and `"a.test; *"` answered 200 for `a.test` and 400 for
+      everything else, so the `*` never fires and a deployment that says "admit every host" while naming one gets the
+      narrower answer. `ServingSurface` (`src/BooklyHub.Infrastructure/Security/ServingSurface.cs`) now reads the key
+      — splits on `';'` and `','`, trims, treats `*` as "no narrowing", passes `*.suffix` through untouched — and
+      refuses at startup the entries the matcher cannot honour, in the same direction `ForwardingSettings` already
+      failed. 32 facts (`ServingSurfaceTests`) pin the reading; the live matrix under this file's usual rule (a
+      pre-`Build()` read is beyond `ConfigureTestConfiguration`, §2.14) is `docs/DEPLOYMENT.md` §3, run against both
+      trees.
+    - **Naming the hosts made the container look dead.** The healthcheck curled `http://127.0.0.1:8080/health/live`,
+      whose default `Host` is that address — not one of the names — so it got 400, the service never reported healthy,
+      and an orchestrator honouring `service_healthy` restarts a working instance forever. The probe now asks as the
+      first name the operator gave, and it has to survive every spelling `ServingSurface` accepts, because each one
+      otherwise marks a healthy container unhealthy (all measured against the running stack): a comma list needs the
+      comma cut as well as the `;` one; a bare `*` is not a `Host` at all — sending it answered **400 even with no
+      filter installed** — and `*.a.test` admits a subdomain but not the suffix, so the probe asks
+      `probe.a.test`. `HEALTH_PROBE_HOST` overrides the whole derivation.
+    Two costs travel with the fix rather than hiding under it. `HTTPS_REDIRECT_PORT` set means **every** plain-HTTP
+    request is redirected, `/health/live` included (measured `307` for an admitted Host, `400` for a foreign one,
+    because host filtering runs first) — an orchestrator that demands `2xx` has to probe the HTTPS side or leave the
+    port unset. And `docs/API.md` §10 now states which of these the test host cannot reach: the redirect and the
+    filter are decided before `builder.Build()`, so no fixture can flip them and their evidence is live, not unit.
+
 ## 3. What is genuinely live, in the order the next work should take it
 
 1. `PERF-04` residue — the availability day is the one anonymous response with no bound on it, and its size grows
@@ -168,15 +220,18 @@ Recording these because each one was stated as fact at some point, and the tree 
    stronger than "no route and no seed" for Holidays, which has **no writer in `src` at all**, so every deployed
    calendar table is empty and the guard's close-check is dead code until this is decided.
 3. Onboarding, which `DEP-01`'s walk exposed and no finding ID owns: **the only writer of a `Tenant` row in `src` is
-   `DatabaseSeeder.cs:78,154,205`**, and there is no tenant route (`api/v1/tenants` does not exist). So the way to put
-   the first customer's clinic into a fresh production database is to seed three demo businesses — Apex Dental, Luxe
-   Salon, Pulse Fitness, in `America/New_York`, `America/Chicago`, `America/Los_Angeles` — and edit them by hand. That
-   is `SEC-03`'s tenant gate wearing a deployment hat: whoever decides who may create a tenant decides how a client
-   gets one.
+   `DatabaseSeeder.cs`**, and there is no tenant route (`api/v1/tenants` does not exist). `DEP-03` made the demo block
+   opt-in (`Seed:DemoTenants`, default off) because a client's production tenant table must not arrive pre-filled,
+   which sharpens rather than closes this: the default first run now leaves **zero** tenants, so the way to put the
+   first customer's clinic into a fresh production database is still `INSERT` by hand — with the demo half as the only
+   alternative, and it writes Apex Dental, Luxe Salon and Pulse Fitness (`America/New_York`, `America/Chicago`,
+   `America/Los_Angeles`) plus their invented staff and patients. That is `SEC-03`'s tenant gate wearing a deployment
+   hat: whoever decides who may create a tenant decides how a client gets one.
 4. The two halves of `SEC-12` that this file has never been able to close from code — a stated **CORS policy** (which
    origins, if any, may send credentialed requests to this API) and **HSTS**. Absent CORS is fail-closed for browsers
    and the absence is a missing statement rather than an open door; both need the operator's deployment story, not a
-   patch. `AllowedHosts": "*"` (`SEC-13`'s residue) is the same class.
+   patch. (`DEP-03`'s host-header work settles the third thing this list used to call "the same class": the key was
+   never dead, only unspellable — see §1 `SEC-13` and §2.16.)
 5. Product decisions, not to be taken from this queue: `SEC-03`'s tenant gate, `BL-08`'s authorship and moderation,
    `DB-02`'s recurring-series definition, `QUAL-05`'s module split.
 6. Operator action only: `SEC-02` — rotate the secret committed before `d767c25`.

@@ -8,6 +8,7 @@ using BooklyHub.Infrastructure.Data;
 using BooklyHub.Infrastructure.Data.Seeding;
 using BooklyHub.Infrastructure.MultiTenancy;
 using BooklyHub.Infrastructure.Security;
+using Microsoft.AspNetCore.HostFiltering;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi;
@@ -132,6 +133,33 @@ builder.Services.AddRateLimiter(options =>
         return ValueTask.CompletedTask;
     };
 });
+
+// Two deployment decisions the pipeline below installs or skips. They are made here because their options
+// are service registrations, and the container is frozen by the time the pipeline is written. The reading
+// itself — what counts as declared, and what gets the host refused — is ServingSurface, which the unit
+// suite covers; what is left here is only the wiring, and the measured reason each middleware is optional.
+var servingSurface = ServingSurface.FromConfiguration(builder.Configuration);
+
+// A redirect needs a target this process can name. UseHttpsRedirection() with no port configured works it
+// out per request from the server's own bindings, finds none in a container that binds http://+:8080 and
+// holds no certificate, and writes "Failed to determine the https port for redirect" for every plain
+// request it then serves anyway (measured). So it runs only when the operator names the port worth
+// redirecting to, which is also the only port that is right behind a TLS-terminating proxy.
+if (servingSurface.HttpsPort is { } httpsRedirectPort)
+{
+    builder.Services.Configure<Microsoft.AspNetCore.HttpsPolicy.HttpsRedirectionOptions>(
+        options => options.HttpsPort = httpsRedirectPort);
+}
+
+// The host's own host filter, narrowed to the names the operator gave. "*" or nothing leaves it admitting every
+// Host, which is the state a deployment with no declaration is in.
+if (servingSurface.AllowedHosts.Count > 0)
+{
+    builder.Services.Configure<HostFilteringOptions>(options =>
+    {
+        options.AllowedHosts = [.. servingSurface.AllowedHosts];
+    });
+}
 
 // Health Checks. Only the database is a readiness condition: every request path reads it, so an instance
 // that cannot reach it must be taken out of rotation. Nothing else is tagged, which is a measured choice
@@ -285,7 +313,18 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseSerilogRequestLogging();
-app.UseHttpsRedirection();
+
+if (servingSurface.HttpsPort is not null)
+{
+    app.UseHttpsRedirection();
+}
+
+// Host filtering is not installed here. Measured on a build of this file with no host-filtering line at all,
+// AllowedHosts=bookly.example answered 400 to Host: evil.example — minimal hosting puts this middleware in by
+// itself and binds the same key by itself, so calling UseHostFiltering() here would only have added a second copy
+// of it to every request. What the deployment was missing is the reading above: the host splits that key on ';'
+// alone, so a comma list answers 400 to every Host including the two names it spells (measured), and an entry it
+// cannot match fails silently at request time instead of at startup.
 
 app.UseRouting();
 
