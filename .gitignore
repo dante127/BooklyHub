@@ -42,3 +42,12 @@ TestResults/
 # bin/ and obj/ (measured: a 306.93 MB context in 15.7 s, against 54.97 kB from this tree with the file).
 # The final image was unaffected (the runtime stage copies only the publish output), so this is build hygiene
 # and reproducibility, not a leak — but no two machines were building the same context.
+
+## Local secrets
+# The handover tells an operator to `cp .env.example .env` and fill it with MSSQL_SA_PASSWORD, JWT_SECRET and
+# the seeding administrator's password. Without this rule that file is untracked-but-not-ignored, one
+# `git add -A` away from being a second SEC-02. `.env.example` stays tracked — it is the template, and it holds
+# no values.
+.env
+.env.*
+!.env.example
