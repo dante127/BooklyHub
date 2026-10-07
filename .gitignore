@@ -37,4 +37,8 @@ TestResults/
 *.coveragexml
 
 ## Docker
-.dockerignore
+# `.dockerignore` is deliberately NOT listed here. It was, which made the file that decides the build
+# context untracked — so it does not exist in a clone, and a clone's `COPY . .` carried the operator's own
+# bin/ and obj/ (measured: a 306.93 MB context in 15.7 s, against 54.97 kB from this tree with the file).
+# The final image was unaffected (the runtime stage copies only the publish output), so this is build hygiene
+# and reproducibility, not a leak — but no two machines were building the same context.
