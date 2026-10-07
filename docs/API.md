@@ -1051,3 +1051,40 @@ there is no by-id review read — but it now reaches it honestly, and the review
 review on the same appointment. `Review.Create` sets both `IsVerified` and `IsPublished` to `true`, so a review this
 call accepts is on the public wall immediately: there is no moderation step to wait for, and no route to unpublish it
 again — the `response` column is writable only through the domain, and nothing here reaches it.
+
+## 10. Operational routes
+
+Three unauthenticated routes, rate-limited in their own partition (§1.1). All three answer the same JSON shape —
+`status`, `totalDurationMs`, and `checks[]` of `name` / `status` / `durationMs` — and differ only in which checks they
+run. Measured on a healthy host:
+
+| Route | Checks run | Body | Status |
+|---|---|---|---|
+| `GET /health` | every registered check | `{"status":"Healthy","totalDurationMs":11.2,"checks":[{"name":"Database","status":"Healthy","durationMs":6.6}]}` | `200` |
+| `GET /health/live` | none | `{"status":"Healthy","totalDurationMs":0.1,"checks":[]}` | `200` |
+| `GET /health/ready` | only checks tagged `ready` | the same one check, `0.9 ms` | `200` |
+
+The gate is the database and nothing else, because it is the only dependency a request cannot complete without.
+Against a database the server cannot open (`/health/ready` measured in 1.3 ms, `/health` in 68 ms because it pays
+the connection attempt): `Database: Unhealthy`, both routes `503`, while `/health/live` stays `200` — a working
+process is not restarted because a dependency moved. `Degraded` answers `200` on `/health`: it is the status an
+operator reads, and reporting a degrading-but-serving instance as an error is how a load balancer ends up with
+nothing to route to.
+
+The cache deliberately has no check. A Production host refuses to start without `ConnectionStrings:Redis`
+(`DependencyInjection.cs:52-56`, and the README settings table), but a Redis that dies later changes no answer any
+client receives: the only runtime consumer
+is the idempotency store, which holds a *copy* of a row whose authority is `IdempotencyRecords` in SQL, so a replay
+is still the same payment (`ACacheThatFailsEveryCall_MustStillServeRequestsAndReplayTheChargeFromTheDatabase`). A
+probe would also be unbounded: measured against an endpoint nobody listens on, the client's first command threw
+`RedisConnectionException` after **5,981 ms**, and passing a 2-second `CancellationToken` made it *slower* — 7,114 ms
+— because the cancellation is not honoured while the connection is still being established. A health route that
+takes seven seconds is a route the orchestrator times out and a route an operator stops reading. What a cache
+failure does leave behind is a `Warning` in the log for every swallowed call (`Failed to get cache key {Key}`).
+
+The body is written by this build, not by the framework default: with `ResponseWriter` left at `null` every one of
+these routes answers its status code with **no body at all** (measured — an empty `200`), which tells an operator
+that something is wrong and nothing about what. So each route names the checks it ran and how long each took. No
+probe body carries a check's `description` or exception text: the failure message of the database check is written
+by the SQL client and names the server and catalog the deployment talks to, and these routes are anonymous; the check
+*name* and its status are what a caller outside the tenant is allowed to learn (§1.1, `SEC-09`).

@@ -136,6 +136,25 @@ Recording these because each one was stated as fact at some point, and the tree 
     `AddInfrastructure` — and leaves the deployment group green. Those five facts test what the providers *do*, and
     the only place the config-to-binding rule can be tested is registration time.
 
+15. **`/health/ready` was written as the readiness gate and its own predicate made it the full health route.**
+    `Predicate = check => check.Tags.Contains("ready") || true` is not a filter, and nothing had ever been tagged
+    `ready`, so the three routes differed only in which line of `Program.cs` mapped them. Measured against the real
+    host before the fix: all three answered the same 7-byte `Healthy`, and with a database the server cannot open
+    `/health/ready` answered `503` for a dependency it was never supposed to be asking about. `DEP-02` tags the
+    `Database` check, makes the predicate mean what it says, and answers the routes with the checks each ran —
+    `{"status":"Healthy","checks":[{"name":"Database","status":"Healthy","durationMs":0.9}]}` on `/health/ready`,
+    an empty `checks` array on `/health/live`, `200`/`503`/`200` respectively with the database unreachable
+    (`docs/API.md` §10). Three claims died in the measuring. The framework's default health body on this runtime is
+    **no body at all** (`ResponseWriter = null` answers an empty `200`), so a fact that only asserts "the body does
+    not contain the connection coordinates" passes on a host that says nothing; the fact now requires the names and
+    then requires the coordinates to be absent, and adding a `description` field to the writer fails it. Redis was
+    not made a check, because it cannot be probed inside a probe budget: against an endpoint nobody listens on, the
+    client's first command threw after **5,981 ms**, and a 2-second `CancellationToken` made it *later* (**7,114 ms**)
+    rather than sooner, because cancellation is not honoured while the connection is still being established — while
+    the cache's only runtime consumer, the idempotency store, is a copy of a SQL row and replays correctly with every
+    cache call failing (`ACacheThatFailsEveryCall_…`). Rule: a gate has to be measured against a dependency that is
+    actually down, and a control that passes when the thing it guards is deleted is guarding the test, not the code.
+
 ## 3. What is genuinely live, in the order the next work should take it
 
 1. `PERF-04` residue — the availability day is the one anonymous response with no bound on it, and its size grows

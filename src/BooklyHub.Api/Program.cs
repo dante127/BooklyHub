@@ -8,7 +8,6 @@ using BooklyHub.Infrastructure.Data;
 using BooklyHub.Infrastructure.Data.Seeding;
 using BooklyHub.Infrastructure.MultiTenancy;
 using BooklyHub.Infrastructure.Security;
-using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi;
@@ -134,9 +133,11 @@ builder.Services.AddRateLimiter(options =>
     };
 });
 
-// Health Checks
+// Health Checks. Only the database is a readiness condition: every request path reads it, so an instance
+// that cannot reach it must be taken out of rotation. Nothing else is tagged, which is a measured choice
+// rather than an omission — see docs/DEPLOYMENT.md for why the cache is not a probe target.
 builder.Services.AddHealthChecks()
-    .AddDbContextCheck<ApplicationDbContext>("Database");
+    .AddDbContextCheck<ApplicationDbContext>("Database", tags: new[] { BooklyHub.Api.Health.HealthEndpoints.ReadinessTag });
 
 // Swagger / OpenAPI with JWT Security Definition
 builder.Services.AddEndpointsApiExplorer();
@@ -299,9 +300,9 @@ app.UseMiddleware<IdempotencyMiddleware>();
 app.MapControllers();
 
 // Health check endpoints
-app.MapHealthChecks("/health", new HealthCheckOptions { Predicate = _ => true });
-app.MapHealthChecks("/health/live", new HealthCheckOptions { Predicate = _ => false });
-app.MapHealthChecks("/health/ready", new HealthCheckOptions { Predicate = check => check.Tags.Contains("ready") || true });
+app.MapHealthChecks("/health", BooklyHub.Api.Health.HealthEndpoints.All);
+app.MapHealthChecks("/health/live", BooklyHub.Api.Health.HealthEndpoints.Liveness);
+app.MapHealthChecks("/health/ready", BooklyHub.Api.Health.HealthEndpoints.Readiness);
 
 app.Run();
 
