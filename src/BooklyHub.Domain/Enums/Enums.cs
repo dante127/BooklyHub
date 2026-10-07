@@ -27,7 +27,13 @@ public enum PaymentStatus
 public enum PaymentProviderType
 {
     Simulated = 1,
-    Stripe = 2
+    Stripe = 2,
+
+    /// <summary>
+    /// This deployment has no gateway, so no row may ever carry it: the provider that answers with it refuses
+    /// every charge before the ledger is written.
+    /// </summary>
+    None = 3
 }
 
 public enum PaymentTransactionType

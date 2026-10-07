@@ -59,7 +59,7 @@ graph TD
         OutboxWorker[Outbox Background Worker]
         ReminderWorker[Reminder Background Worker]
         NoShowWorker[No-Show Closure Sweep]
-        PaymentGateway[Simulated Provider — no gateway implemented]
+        PaymentGateway[Payment / notification providers — None by default, no gateway implemented]
     end
 
     subgraph Data Stores
@@ -116,8 +116,8 @@ graph TD
    | `ConnectionStrings__Redis` | Distributed cache; required in Production |
    | `Jwt__Secret` | HMAC signing key, at least 32 bytes |
    | `Jwt__Issuer`, `Jwt__Audience` | Must match the tokens you mint |
-   | `Payments__Provider` | Which implementation charges payments. `Simulated` is the only one in this build, and Production refuses it: the simulator answers `Paid` with a synthetic `txn_sim_*` id |
-   | `Notifications__Provider` | Which implementation delivers email/SMS/push. `Simulated` is the only one in this build, and Production refuses it: the senders log `[... DISPATCHED]` and return success |
+   | `Payments__Provider` | Which implementation charges payments. `None` charges nothing and answers every charge as refused; `Simulated` is the only other value and Production refuses it, because the simulator answers `Paid` with a synthetic `txn_sim_*` id |
+   | `Notifications__Provider` | Which implementation delivers email/SMS/push. `None` sends nothing and fails every send with its reason; `Simulated` is the only other value and Production refuses it, because the senders log `[... DISPATCHED]` and return success |
    | `AutoMigrateAndSeed` | `true` migrates and seeds on startup; prefer `dotnet run --project src/BooklyHub.Api -- --migrate-only` |
 
 4. **Access Swagger UI**:
@@ -139,11 +139,13 @@ those variables, and SQL Server, Redis and the API port are published on `127.0.
 demo seeding happen in a one-shot `migrator` container (`--migrate-only`) that must exit successfully before the
 API starts; the API container itself never migrates or seeds.
 
-Both containers run with `ASPNETCORE_ENVIRONMENT=Production`, and Production refuses the only payment and
-notification implementations in this build (`Payments__Provider` / `Notifications__Provider` = `Simulated`),
-so `docker-compose up` exits at startup instead of recording charges no gateway captured and reminders nobody
-sent. To evaluate this profile anyway, set `ASPNETCORE_ENVIRONMENT=Staging` for the `migrator` and `api`
-services; a real deployment has to implement and select a gateway and delivery providers first.
+Both containers run with `ASPNETCORE_ENVIRONMENT=Production`, and Production names its outbound providers
+rather than inheriting them. Compose passes `None` for both, which is the selection that starts: charges are
+refused with a reason, sends fail with a reason, and nothing is written that did not happen — a clinic taking
+payment on arrival runs this build as it stands. `Simulated` is refused there (the payment simulator answers
+`Paid` with a synthetic `txn_sim_*` id and the senders log `[... DISPATCHED]` and return success), so the only
+way to run it is a non-Production environment name. A deployment that needs card payments or patient messages
+implements the provider interfaces and names them in `PAYMENTS_PROVIDER` / `NOTIFICATIONS_PROVIDER`.
 
 ---
 

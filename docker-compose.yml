@@ -45,6 +45,8 @@ services:
       - Jwt__Secret=${JWT_SECRET:?JWT_SECRET must be set to a unique value of at least 32 bytes}
       - Jwt__Issuer=BooklyHub
       - Jwt__Audience=BooklyHubClients
+      - Payments__Provider=${PAYMENTS_PROVIDER:-None}
+      - Notifications__Provider=${NOTIFICATIONS_PROVIDER:-None}
       - Seed__AdminEmail=${SEED_ADMIN_EMAIL:?SEED_ADMIN_EMAIL must be set}
       - Seed__AdminPassword=${SEED_ADMIN_PASSWORD:?SEED_ADMIN_PASSWORD must be set}
     depends_on:
@@ -65,6 +67,8 @@ services:
       - Jwt__Issuer=BooklyHub
       - Jwt__Audience=BooklyHubClients
       - Jwt__ExpirationMinutes=60
+      - Payments__Provider=${PAYMENTS_PROVIDER:-None}
+      - Notifications__Provider=${NOTIFICATIONS_PROVIDER:-None}
     ports:
       - "127.0.0.1:5000:8080"
     depends_on:

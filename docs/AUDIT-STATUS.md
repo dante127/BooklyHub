@@ -114,6 +114,27 @@ Recording these because each one was stated as fact at some point, and the tree 
     load-bearing was dead code. The rule is now the length alone, and the fact says out loud that it pins the binder's
     behaviour, not the guard's. Rule: a control has to be aimed at the thing the fact claims to test; a fact that
     survives every mutation of its own subject is describing somebody else's code.
+14. **"Production refuses the stand-in providers" was written as a guard, and what it actually left behind was a
+    host that cannot start.** `OutboundProviderPolicy` admitted one name, `Simulated`, and refused it in Production,
+    so between those two rules there was no value a Production host could name. Measured on this host:
+    `ASPNETCORE_ENVIRONMENT=Production` aborts in `AddInfrastructure` on the missing `ConnectionStrings:Redis`, and
+    with a Redis string supplied it aborts on both provider keys — and naming `Simulated` there is also refused — so
+    the `migrator` and `api` services in `docker-compose.yml`, which both declare Production, have never come up
+    anywhere. `DEP-01` adds the second selection, `None`, whose bindings refuse instead of inventing: a charge
+    answers `422 PaymentFailed` naming its own configuration key and writes no ledger row, and a send throws, which
+    leaves the reminder unrecorded and the outbox message unprocessed with its reason in `Error`.
+    Writing that fact down corrected a second claim in the same pass: `ConfigureTestConfiguration` cannot reach a
+    value the container reads while it is being registered. `AddInfrastructure` runs before `builder.Build()`, and
+    `WebApplicationFactory`'s in-memory configuration source does not exist until it does — the first version of
+    `NoOutboundProviderDeploymentTests` set both keys to `None` and then charged `txn_sim_f33c…` as `Paid`, because
+    the host had already bound the simulator from `appsettings.Development.json`. Rule: a configuration hook reaches
+    the reads that happen after it, not the ones that happened before, and a test host that pretends otherwise proves
+    the opposite of what it says. Two controls say what the two halves of this fix are each worth: putting the
+    fixture's override back on `ConfigureTestConfiguration` fails 4 of the 5 deployment facts and the boot fact
+    reports a host whose configuration answers `None` while its payment provider is the simulator, while reverting
+    only the `DependencyInjection` ternaries fails exactly one fact — `SelectingNone_MustBind…`, which runs the real
+    `AddInfrastructure` — and leaves the deployment group green. Those five facts test what the providers *do*, and
+    the only place the config-to-binding rule can be tested is registration time.
 
 ## 3. What is genuinely live, in the order the next work should take it
 
@@ -127,6 +148,12 @@ Recording these because each one was stated as fact at some point, and the tree 
    seed, so enforcing them means maintaining them by hand in the database. Measured while closing `PERF-05`: the case is
    stronger than "no route and no seed" for Holidays, which has **no writer in `src` at all**, so every deployed
    calendar table is empty and the guard's close-check is dead code until this is decided.
+3. Onboarding, which `DEP-01`'s walk exposed and no finding ID owns: **the only writer of a `Tenant` row in `src` is
+   `DatabaseSeeder.cs:78,154,205`**, and there is no tenant route (`api/v1/tenants` does not exist). So the way to put
+   the first customer's clinic into a fresh production database is to seed three demo businesses — Apex Dental, Luxe
+   Salon, Pulse Fitness, in `America/New_York`, `America/Chicago`, `America/Los_Angeles` — and edit them by hand. That
+   is `SEC-03`'s tenant gate wearing a deployment hat: whoever decides who may create a tenant decides how a client
+   gets one.
 4. The two halves of `SEC-12` that this file has never been able to close from code — a stated **CORS policy** (which
    origins, if any, may send credentialed requests to this API) and **HSTS**. Absent CORS is fail-closed for browsers
    and the absence is a missing statement rather than an open door; both need the operator's deployment story, not a
