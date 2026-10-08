@@ -147,6 +147,32 @@ A caller cannot grow it — adding staff is tenant data, and `SlotIntervalMinute
 `DatabaseSeeder.cs:79,155,206`. What a caller can do is *point at* a tenant that has grown it and receive 683 KB of
 JSON from an `[AllowAnonymous]` route, which is the finding worth acting on and the one `AUDIT-STATUS.md` §3 keeps open.
 
+### The bound `PERF-04` closed with, and the byte price of a slot
+
+The open half is now closed on the body rather than on the loop: `AvailabilityLimits.MaxSlotsPerDay = 500`, applied
+after the sort, so a longer day keeps its **earliest** slots and answers `slotsTruncated: true` (`docs/API.md` §3
+says what a portal does with that). The number is priced in bytes, because bytes are what this section measured —
+same fixture, same pinned clock, one minute of grid as the worst case a caller cannot ask for:
+
+| day | slots | bytes unbounded (control) | bytes at the ceiling |
+|---|---|---|---|
+| 51 staff, 30-min grid, 08:00–18:00 | 1,020 → 500 | 384,627 | **188,586** |
+| 1 staff, 1-min grid, 08:00–18:00 | 571 → 500 | 215,354 | **188,586** |
+| 8 staff, 30-min grid, 08:00–18:00 | 160 | 60,407 | 60,407 (no cut) |
+
+Two readings. A slot in this shape costs about **377 bytes** (188,586 over 500), which puts §6's 683 KB day at roughly
+2,000 slots — 50 staff × 40 starts on a 15-minute grid — so 500 is a quarter of the heaviest day ever measured here
+and about twenty-five staff-days of an ordinary clinic. And the cut is the same 188,586 bytes whatever made the day
+long, which is the property the finding asked for: the bound is on the response, not on the roster or on the grid.
+
+`AvailabilityPayloadBoundTests` holds all three rows, and its control is the same fixture with `truncated` forced
+false — the two dense facts then fail at 1,020 and 571 slots, while "a day under the ceiling loses nothing" passes on
+both sides, which is why that third fact is there: it is the assertion that the bound is not silently cutting
+clinics. The roster cap was considered and refused on this section's own millisecond numbers, and the grid floor
+(clamping `SlotIntervalMinutes` upward) was refused for the same reason — the ceiling already bounds what anyone
+receives, and clamping the step would change a tenant's own calendar arithmetic to protect a response that is now
+bounded anyway.
+
 ## 7. The Holiday Read Was Costed Before Its Index Was Touched
 
 `PERF-05` asked for `RecurringAnnually` in the holiday index's key. Replaying the guard's own statement against seeded

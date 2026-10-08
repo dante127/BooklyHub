@@ -102,7 +102,7 @@ public class AvailabilityService : IAvailabilityService
 
         if (!context.IsBookable)
         {
-            return new DayAvailabilityDto(query.Date, context.TimeZoneId, false, []);
+            return new DayAvailabilityDto(query.Date, context.TimeZoneId, false, [], false);
         }
 
         // One day either side: a slot's buffers can reach over local midnight.
@@ -114,12 +114,12 @@ public class AvailabilityService : IAvailabilityService
 
         if (calendar.ClosedDates.Contains(query.Date))
         {
-            return new DayAvailabilityDto(query.Date, context.TimeZoneId, false, []);
+            return new DayAvailabilityDto(query.Date, context.TimeZoneId, false, [], false);
         }
 
         if (candidateStaffList.Count == 0)
         {
-            return new DayAvailabilityDto(query.Date, context.TimeZoneId, true, []);
+            return new DayAvailabilityDto(query.Date, context.TimeZoneId, true, [], false);
         }
 
         var minBookingTimeUtc = _clock.UtcNow.AddMinutes(context.MinNoticeMinutes);
@@ -165,7 +165,15 @@ public class AvailabilityService : IAvailabilityService
             .ThenBy(s => s.StaffName)
             .ToList();
 
-        return new DayAvailabilityDto(query.Date, context.TimeZoneId, true, sortedSlots);
+        // PERF-04: the roster decides how long this list is, and the roster is tenant data, so the ceiling is the
+        // only bound the response has. The cut keeps the earliest slots and says it happened.
+        var truncated = sortedSlots.Count > AvailabilityLimits.MaxSlotsPerDay;
+        if (truncated)
+        {
+            sortedSlots = sortedSlots.GetRange(0, AvailabilityLimits.MaxSlotsPerDay);
+        }
+
+        return new DayAvailabilityDto(query.Date, context.TimeZoneId, true, sortedSlots, truncated);
     }
 
     public async Task<SlotCheckResult> CheckSlotAsync(

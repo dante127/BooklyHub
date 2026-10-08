@@ -295,9 +295,28 @@ read, which is also why it is the only endpoint that accepts `tenantId` as a que
       "currency": "SYP",
       "availableResourceIds": ["7c1d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f"]
     }
-  ]
+  ],
+  "slotsTruncated": false
 }
 ```
+
+**`slotsTruncated`, and the 500-slot ceiling (`PERF-04`).** The roster decides how many slots a day has, and the
+roster is tenant data, so this route now states a ceiling instead of a length: **500** slots per day
+(`AvailabilityLimits.MaxSlotsPerDay`), and when the day was longer than that the response carries
+`slotsTruncated: true` and keeps the **earliest** slots, so what a portal shows is a contiguous morning rather than a
+sample torn across the day. The ceiling is priced in bytes, because bytes are what the finding was: 500 slots answer
+**188,586 bytes** measured on this host, where the same fixture unbounded answered 384,627 bytes for a 1,020-slot
+roster and 215,354 for a 571-slot one-minute grid, and the day `docs/PERFORMANCE.md` §6 measured at 683 KB was about
+2,000 slots. 500 is therefore a quarter of the heaviest day ever measured here and roughly twenty-five staff-days of
+a real clinic's 08:00–18:00 shift, so a day under the ceiling loses nothing — `AvailabilityPayloadBoundTests` pins
+that at eight staff, 160 slots, all eight of them present, flag `false`.
+**A truncated day is not an empty afternoon.** The slots that were cut are still bookable; to reach them, ask for one
+person with `staffId` (which is the narrow question a booking page usually means) or a different date. A client that
+wants the whole of a 1,000-slot day in one call is asking for a shape this API does not have: there is no `page` on
+this route, and `slotsTruncated` is the signal to narrow rather than to retry.
+
+The roster itself is deliberately not capped: the same measurement says 50 staff cost 19.9 ms, so a cap there would
+buy milliseconds and take a named staff member's day away from a portal that asked for it.
 
 A slot is a *candidate*, not a reservation: the grid is recomputed under the booking guard's lock when
 `POST /api/v1/appointments` runs, so a `200` here followed by a `409` is the normal race, not a contradiction. A
