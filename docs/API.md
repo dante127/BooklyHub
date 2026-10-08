@@ -396,13 +396,15 @@ UTC, whichever of the three ISO shapes the client used:
 The conversion happens at the edge (`UtcInstant.cs`), before the value reaches a command, and the appointment writers
 refuse a value still labeled for a machine's zone (`InvalidDateKind`). It matters because the columns are
 `datetime2`, which stores the ticks it is handed: measured before this rule, a body of `09:00:00+00:00` on a host at
-UTC+3 was written as 12:00 — the appointment moved by the deployment's own offset. The write path answers `Z`,
-including for a value sent without a designator, so the server states the reading it made. **The reads of that same
-row do not**: `GET /api/v1/appointments` and `GET /api/v1/appointments/{id}` answer `"startAtUtc":"2026-10-08T12:30:00"`
-with no designator, because `datetime2` stores no zone and an EF-materialized value arrives labeled `Unspecified`.
-Send and parse `Z` on the request, and treat a naked `…AtUtc` on a read as UTC — which is what it is — rather than
-as local time. This is `TIME-01` in `docs/AUDIT-STATUS.md` §2, measured on the deployed compose stack; until it is
-fixed, that naked spelling is the contract.
+UTC+3 was written as 12:00 — the appointment moved by the deployment's own offset. **Both directions now answer `Z`**,
+including for a value sent without a designator, so the server states the reading it made on the way in and on the
+way out. That was not true until `TIME-01`: the write path answered `Z` while `GET /api/v1/appointments` and
+`GET /api/v1/appointments/{id}` answered the same row as `"startAtUtc":"2026-10-08T12:30:00"`, because `datetime2`
+stores no zone, an EF-materialized value arrives labeled `Unspecified`, and the serializer writes what the `Kind`
+says. It is fixed at the model boundary (`UtcInstantConverter`, applied to every `DateTime` in the context) rather
+than per DTO, so a projection added later cannot answer naked again; a client may rely on the designator being
+present, and a `…AtUtc` field that ever arrives without one is a regression, not a spelling. The instants themselves
+never moved — this was always a labelling defect.
 
 A key is promised to one payload, not one instant: `IdempotencyMiddleware` hashes the request body as text, so
 sending the same start time twice in two different shapes is answered `409` with "This Idempotency-Key was already

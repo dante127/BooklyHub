@@ -354,8 +354,21 @@ two tokens in step 8's login response are the only elisions, replaced by what wa
    request boundary. The server therefore states the reading it made on the write path and does not on the read
    paths, and a client that parses a naked ISO instant as *its own* local time shifts every appointment it lists.
    `docs/API.md` §4 claimed "Responses always carry `Z`"; that claim is corrected to what was measured, and the fix
-   is `TIME-01` in `AUDIT-STATUS.md` §2 — it is a labelling defect, not a stored-value defect: the row in the
+   is `TIME-01` in `AUDIT-STATUS.md` §1 — it is a labelling defect, not a stored-value defect: the row in the
    database is the right instant, and the booking guard, the cutoff policy and the dashboard all agree on it.
+
+   `TIME-01` is fixed, and the two quotes above stay exactly as they were taken — they are the measurement that
+   found it. The proving fact is `UtcInstantBoundaryTests.AnAppointmentReadBackOverHttp_MustLabelEveryInstantAsUtc`,
+   run against real SQL Server for all three `…AtUtc` fields on both read shapes (the entity path and the paged
+   projection). Its control was run on a copy of the tree at `HEAD` with the converter absent, where it failed
+   **3 of 3** with `"2026-10-10T10:00:00"`, `"2026-10-10T10:30:00"` and `"2026-10-08T07:22:12.8116335"`; the same
+   tree, asserted with the projection first, failed the projection too, which is why the fix sits at the EF model
+   boundary instead of in the DTOs. It passes in the fixed tree, with 290 unit and 349 integration tests green and
+   `dotnet ef migrations has-pending-model-changes -p src/BooklyHub.Infrastructure` reporting no model change — the
+   fix adds no migration, because a column that stores no zone still stores no zone. What has **not** been re-run is
+   this checklist's own step 8 against the compose stack: the host's Docker engine stopped at the end of that session,
+   so an operator verifying the deployed image should expect `Z` on the reads and treat a naked answer as the
+   regression this fact now catches on every push.
 
 ## 8. Logs, and what to look at when something is refused
 
@@ -422,13 +435,7 @@ Stated as the handover conversation needs it, not as a defect list. Each item na
    already minted: permissions and identity live frozen in its claims, so a revoked session keeps serving until
    `Jwt:ExpirationMinutes` elapses (`SECURITY.md` §3.2).
 
-10. **A read appointment's timestamps arrive with no zone designator** (`TIME-01`, §7 step 8). The value in the
-    database is the right UTC instant and the booking paths agree on it; what is missing is the label, so
-    `GET /api/v1/appointments` answers `"startAtUtc":"2026-10-08T12:30:00"` where the `201` that created it answered
-    `"…T12:30:00Z"`. Tell an integrator to parse a naked `…AtUtc` from a read as UTC. This is the one item in this
-    section that is a defect rather than an unshipped capability, and it is here because the previous version of this
-    file did not know about it.
-
 Everything above is reachable from a clean tree; none of it is a hidden defect. A deployment that needs one of
 them needs a decision, a provider implementation, or a route — and the decision belongs to the product owner, not
-to this file.
+to this file. One item that used to belong here does not any more: a read appointment's `…AtUtc` fields answering
+with no zone designator (`TIME-01`) is fixed and pinned by a test, and §7 step 8 keeps the measurement that found it.

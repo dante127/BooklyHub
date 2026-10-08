@@ -42,7 +42,8 @@ which this remediation does not do from a bug queue.
 | PERF-05 — missing `(TenantId, LocationId, StartAtUtc)`, `(Status, StartAtUtc)`, sargable annual holidays | Medium | **all three answered; the third on a different diagnosis than the audit's** | the bare `(TenantId, LocationId, StartAtUtc)` was measured and refused: 352 logical reads against the `EndAtUtc` key that `INCLUDE`s `StartAtUtc` (`20261004105059_AddAppointmentLocationOccupancyIndex.cs:13-17`, `DATABASE.md` §3.1, `f404dc3`); `(TenantId, Status, StartAtUtc)` predates the audit (`20260923065132_InitialCreate.cs:953-955`); and the holiday read was costed (`PERFORMANCE.md` §7) — it is **sargable**, but it was not the missing key column that hurt: `TenantId` is the only equality in the predicate, so the read already lands on the tenant's rows and then pays a **key lookup per row** for `LocationId` and `RecurringAnnually`. Measured on the guard's own statement, 40 holiday rows in a 40,040-row table: **124 logical reads to return 10**, and at 200,040 rows the optimizer abandons `IX_Holidays_TenantId_Date` entirely for **one clustered scan of every tenant's calendar — 3,045 reads**. `20261006081209_CoverHolidayCalendarRead` adds the two columns as `INCLUDE`, same key, no new index: 4 reads and 3. | Pinned by `HolidayIndexTests` (shape, cost through the real guard, and a recurring holiday still closing its day — no other test reaches that half of the OR). Two refusals travel with it: `(TenantId, RecurringAnnually, Date) INCLUDE (LocationId)` measured identical at all six distributions, and `Scan count` was 1 on both sides of the fix, so only the page count discriminates. **The bound on all of it: nothing in `src` writes a `Holiday` row** (`AvailabilityService.cs:468` is the only reader; no command, route, or seeder inserts one), so every deployed calendar table is empty and this index pays out only once `CAL-01` populates it |
 | QUAL-02 — a 20-argument DTO hand-built at 4 sites | Medium | **stale** | `ReviewDto` is 12 parameters (`SubmitReviewCommand.cs:11-23`) with exactly one construction site (`:89-101`); the widest dashboard DTO is 17 with one site (`ReportingQueries.cs:9-26`, `:175-192`) | the kernel of truth is that the one site mixes `review.*` with `appointment.Customer/Staff/Service` |
 | QUAL-04 — two competing time sources | Medium | **fixed in the Application layer** | `IClock` has 48+ references across 16 files, one adapter (`CommonServices.cs:19`), and the three ledger stamps are gone: `PaymentCommands.cs` reads `_clock.UtcNow` once per handler and writes that instant to the rows it owns — the charge's `PaymentTransaction.TimestampUtc`, and both `Refund.CreatedAtUtc` and its refund ledger row, which the change tracker does not fill because `Refund`/`PaymentTransaction` are not `IAuditableEntity`. Pinned by `PaymentStampClockTests` (3 facts), one of which is the source rule itself: no file under `src/BooklyHub.Application` may name the machine clock, so a fourth stamp cannot appear without failing a test | what remains is not a second source: the `JWT expires` claim (`Infrastructure/Security/AuthServices.cs:57`) reads the wall clock on purpose, because a token has to agree with the clock its verifier really runs, and the Domain entities' `= DateTime.UtcNow` field defaults (`AppointmentEntities.cs:51,106,115,222,276,295,317`, `PaymentEntities.cs:23,43,60`) are a layering fact, not residue — `Domain` must not know `IClock`, and for an `IAuditableEntity` the tracker overwrites that default with `_clock.UtcNow` at save (`ApplicationDbContext.cs:160-166`) |
-| QUAL-05 — god interface `IApplicationDbContext` | Medium | **live, now documented** | 35 `DbSet`s (`IApplicationDbContext.cs:20-54`, one more than the audit counted), injected into handlers (`AvailabilityService.cs:19`, `SubmitReviewCommand.cs:44`, `ReportingQueries.cs:48`) and controllers (`CatalogControllers.cs:18,63,117`) | split-by-module is a rewrite, not a fix; recorded here as knowingly open |
+| QUAL-05 — god interface `IApplicationDbContext` | Medium | **split-by-module is a rewrite, not a fix** | 35 `DbSet`s (`IApplicationDbContext.cs:20-54`, one more than the audit counted), injected into handlers (`AvailabilityService.cs:19`, `SubmitReviewCommand.cs:44`, `ReportingQueries.cs:48`) and controllers (`CatalogControllers.cs:18,63,117`) | recorded here as knowingly open |
+| TIME-01 — a read `…AtUtc` answers with no zone designator | Medium | **fixed** (code) | found by `DEP-05`'s live walk, not by a test: `POST /api/v1/appointments` answered `"…T12:30:00Z"` and `GET /api/v1/appointments` plus `…/{id}` answered the same row `"2026-10-08T12:30:00"`, because `datetime2` stores ticks with no zone and EF materializes `Kind=Unspecified`. Fixed at the model boundary — `UtcInstantConverter` applied to `Properties<DateTime>()` and `Properties<DateTime?>()` in `ApplicationDbContext.ConfigureConventions` — so no projection or DTO can answer naked again, and proven by `AnAppointmentReadBackOverHttp_MustLabelEveryInstantAsUtc` (3 fields × both read shapes), which failed pre-fix on the naked text and passes now | no migration: `dotnet ef migrations has-pending-model-changes` reports none, and a column that stores no zone still stores no zone. Suites green at 290 unit / 349 integration. Not yet re-run against the compose stack (the host's Docker engine stopped at the session's end) — `DEPLOYMENT.md` §7 says so and step 8 keeps the pre-fix quotes as the measurement that found it |
 
 ## 2. Corrections to claims made during the remediation
 
@@ -283,19 +284,38 @@ Recording these because each one was stated as fact at some point, and the tree 
       access permissions` after building both images. §1 now states it and gives the `!override` recipe; a plain
       `ports:` in an override **appends** and fails the same way, which is the trap.
 
+19. **"`the answers carry `Z`'" described the half that was already right, and the test that proved it was looking at
+    that half.** `BL-05`'s verdict row and `docs/API.md` §4 both stated the designator as a property of this API's
+    answers; a live read of one row showed it was a property of the **write** only (§2.18). Fixing it made three things
+    measurable that were previously asserted:
+    - **The label is safe to apply wholesale, and that was checked before applying it.** All **58** `DateTime` and
+      `DateTime?` properties declared in `src/BooklyHub.Domain` (13 files) are named `…Utc` — `grep` for a `get`
+      accessor whose name does not end in `Utc` returns nothing — so a converter that labels every materialized value
+      `Kind=Utc` contradicts no column. Alongside it: no `ToUniversalTime`/`ToLocalTime` is applied to a value that
+      came from the database, `TimeZoneHelper.ToUtc` is only ever fed `DateOnly.ToDateTime(…)` — genuinely local,
+      genuinely `Unspecified`, and not a persisted instant — and `TimeZoneHelper.ToLocal` already re-labels its
+      argument (`TimeZoneHelper.cs`). `Appointment.Create`/`Reschedule` only ever *refuse* `Kind=Local`, so a
+      `Utc`-labelled read cannot trip the guard that a naked read was slipping through.
+    - **A model-boundary converter reaches projections, not just entities.** That was the reason for fixing it in
+      `ConfigureConventions` instead of per-DTO, and it was measured rather than assumed: the paged
+      `GET /api/v1/appointments` reads through a `Select` projection over columns (`AppointmentQueries.cs:136`), and the
+      control run asserts that shape **first** — pre-fix it answered `"2026-10-10T10:00:00"` for `startAtUtc`, the
+      same naked spelling as the entity read, and post-fix both shapes answer `Z`.
+    - **The test file that named this designator covered the half that already worked.** The suite asserted it at
+      `UtcInstantBoundaryTests.cs:204,230` and both assertions sit on the `201` body of the booking that wrote the
+      row — the one path that already carried the label because the request boundary had stamped it. The control, run
+      on a copy of the tree at `HEAD` with the converter absent, fails **3 of 3**
+      (`… but "2026-10-10T10:30:00" differs near "202"`) against the same strings
+      the deployment produced, which is the point: 636 tests were green on a defect that had a named test file, and
+      what made that file vacuous for this half was the choice of response, not the assertion. A test for a
+      representation rule has to read the thing back, not just write it in.
+    Both suites are green after the fix at **290 unit / 349 integration**, and `dotnet ef migrations
+    has-pending-model-changes -p src/BooklyHub.Infrastructure` reports no model change — a converter that re-labels
+    ticks writes the same bytes, so there is nothing to migrate.
 
 ## 3. What is genuinely live, in the order the next work should take it
 
-1. `TIME-01` — the first code defect this queue has received from a live deployment rather than from a test, and the
-   only one that changes what a client's calendar renders. A `…AtUtc` field on the appointment **read** paths answers
-   with no zone designator (`docs/DEPLOYMENT.md` §7 step 8 records both spellings of one row), because `datetime2`
-   carries no zone and EF materializes `Kind=Unspecified`. The stored instant is correct; the label is missing, and a
-   client parsing the naked value as local time moves every appointment it lists by its own offset. Fix it where the
-   value enters the CLR object rather than in each DTO, so the next read path cannot reintroduce it, and pin it with
-   an assertion on a **read**: the suite does check this designator, twice, at
-   `UtcInstantBoundaryTests.cs:204,230` — both times on the `201` response of the booking that wrote the row, which
-   is the one path that already carries it. 636 tests pass because the covered half is correct.
-2. `PERF-04` residue — the availability day is the one anonymous response with no bound on it, and its size grows
+1. `PERF-04` residue — the availability day is the one anonymous response with no bound on it, and its size grows
    linearly with the candidate-staff roster (683 KB at 50 staff, `PERFORMANCE.md` §6). Bounding it needs a policy
    number and a decision about what a truncated day should say; `CAL-01`'s calendars and the two anonymous catalog
    reads are the same class of "invent behaviour" choice. What does *not* need a decision is the grid's cost: it was
@@ -303,11 +323,11 @@ Recording these because each one was stated as fact at some point, and the tree 
    refused on that number (`PERFORMANCE.md` §6). `DEP-05` added one measured fact to this item: the seeded working
    week makes a closed Saturday answer `isOpen: true` with `slots: []` — the response has no way to say "closed",
    only a way to say "open, nobody here".
-3. `CAL-01` — Holidays / BusinessHours / AvailabilityExceptions have a reader in the booking guard and no route and no
+2. `CAL-01` — Holidays / BusinessHours / AvailabilityExceptions have a reader in the booking guard and no route and no
    seed, so enforcing them means maintaining them by hand in the database. Measured while closing `PERF-05`: the case is
    stronger than "no route and no seed" for Holidays, which has **no writer in `src` at all**, so every deployed
    calendar table is empty and the guard's close-check is dead code until this is decided.
-4. Onboarding, which `DEP-01`'s walk exposed and no finding ID owns: **the only writer of a `Tenant` row in `src` is
+3. Onboarding, which `DEP-01`'s walk exposed and no finding ID owns: **the only writer of a `Tenant` row in `src` is
    `DatabaseSeeder.cs`**, and there is no tenant route (`api/v1/tenants` does not exist). `DEP-03` made the demo block
    opt-in (`Seed:DemoTenants`, default off) because a client's production tenant table must not arrive pre-filled,
    which sharpens rather than closes this: the default first run now leaves **zero** tenants, so the way to put the
@@ -319,15 +339,17 @@ Recording these because each one was stated as fact at some point, and the tree 
    production database the only credential that exists is a platform administrator with no tenant, and there is no
    route that can create a tenant-scoped account (`Controllers/` has no user endpoint). Until onboarding is decided,
    a client cannot get a receptionist.
-5. The two halves of `SEC-12` that this file has never been able to close from code — a stated **CORS policy** (which
+4. The two halves of `SEC-12` that this file has never been able to close from code — a stated **CORS policy** (which
    origins, if any, may send credentialed requests to this API) and **HSTS**. Absent CORS is fail-closed for browsers
    and the absence is a missing statement rather than an open door; both need the operator's deployment story, not a
    patch. (`DEP-03`'s host-header work settles the third thing this list used to call "the same class": the key was
    never dead, only unspellable — see §1 `SEC-13` and §2.16.)
-6. Product decisions, not to be taken from this queue: `SEC-03`'s tenant gate, `BL-08`'s authorship and moderation,
+5. Product decisions, not to be taken from this queue: `SEC-03`'s tenant gate, `BL-08`'s authorship and moderation,
    `DB-02`'s recurring-series definition, `QUAL-05`'s module split.
-7. Operator action only: `SEC-02` — rotate the secret committed before `d767c25`.
-8. One deployment measurement `DEP-05` did not get: `docs/DEPLOYMENT.md` §7 step 5 with `ALLOWED_HOSTS` **naming** a
-   domain, against the compose stack (the host filter itself and the probe's `Host` derivation for every spelling are
-   §3's tables, measured on a live host and on the running stack respectively). This is the one row of the checklist
-   whose answer this repository is asserting from §3 rather than from §7's run.
+6. Operator action only: `SEC-02` — rotate the secret committed before `d767c25`.
+7. Two deployment measurements this repository is asserting from other sections rather than from `docs/DEPLOYMENT.md`
+   §7's own run: **step 5** with `ALLOWED_HOSTS` **naming** a domain against the compose stack (the host filter itself
+   and the probe's `Host` derivation for every spelling are §3's tables, measured on a live host and on the running
+   stack respectively), and **step 8**'s read-side quotes now that `TIME-01` is fixed — §7 carries the pre-fix strings
+   as the measurement that found the defect, and the `Z` the converter produces has only been seen in the test host,
+   because the workstation's Docker engine stopped at the end of `DEP-05`'s session and never came back.

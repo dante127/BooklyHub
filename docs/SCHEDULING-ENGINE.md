@@ -49,6 +49,11 @@ availability guard builds candidate times from a staff member's local calendar a
 with `TimeZoneHelper`, so a refusal there would refuse every booking. The narrowness is the point — `Local` is the one
 label that means "these ticks belong to somebody's zone".
 
+The way out is labeled too, and it is not the caller's job: a `datetime2` column hands EF an `Unspecified` value for
+every stored instant, so `TIME-01` put `UtcInstantConverter` on the whole model (`ApplicationDbContext.ConfigureConventions`)
+and every `DateTime` this context materializes arrives `Kind=Utc` — which is what lets a client trust the `Z` on a read
+of `startAtUtc`, not only on the write that produced it.
+
 However, business hours and booking rules are defined in the tenant's or location's **local time zone** (e.g., `America/New_York` or `Europe/London`):
 
 ### Conversion Workflow (`TimeZoneHelper.cs`)

@@ -75,6 +75,18 @@ public class ApplicationDbContext : DbContext, IApplicationDbContext
     public Guid? CurrentTenantId => _tenantContext.TenantId;
     public bool IsPlatformAdmin => _tenantContext.IsPlatformAdmin;
 
+    protected override void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
+    {
+        base.ConfigureConventions(configurationBuilder);
+
+        // TIME-01. Every persisted instant in this model is a UTC one and every column is a datetime2, which stores
+        // ticks and no zone — so without this a read materializes Kind=Unspecified and the API answers a field named
+        // …AtUtc with no designator, while the write that produced the row answered the same instant with Z. Labels
+        // it at the point the value enters the object, so no projection or DTO can reintroduce the ambiguity.
+        configurationBuilder.Properties<DateTime>().HaveConversion<UtcInstantConverter>();
+        configurationBuilder.Properties<DateTime?>().HaveConversion<UtcInstantConverter>();
+    }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);

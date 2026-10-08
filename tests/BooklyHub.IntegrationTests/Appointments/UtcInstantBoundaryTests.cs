@@ -276,4 +276,52 @@ public class UtcInstantBoundaryTests : IClassFixture<BooklyHubWebApplicationFact
         ReadInstant(root, "fromUtc").Should().Be(from);
         ReadInstant(root, "toUtc").Should().Be(to);
     }
+
+    /// <summary>
+    /// TIME-01, the read half of the same rule. The three facts above pin the instant a booking writes, and they
+    /// pass; the row they wrote was then read back over HTTP answering <c>"2026-10-08T12:30:00"</c> with no
+    /// designator, because the column is <c>datetime2</c> — it stores ticks and no zone — so a value EF
+    /// materializes arrives <c>Kind=Unspecified</c> and the serializer writes what the Kind says. The create
+    /// response carries the <c>Utc</c> label the request boundary handed it, so the write path was covered and the
+    /// read path was not, which is how 636 tests stayed green while a client that parses a naked ISO instant as its
+    /// own local time shifted every appointment on its calendar. This fact is about the answer's text, not its
+    /// ticks: the stored instant was always right.
+    /// </summary>
+    [Theory]
+    [InlineData("startAtUtc")]
+    [InlineData("endAtUtc")]
+    [InlineData("createdAtUtc")]
+    public async Task AnAppointmentReadBackOverHttp_MustLabelEveryInstantAsUtc(string field)
+    {
+        var graph = await SeedGraphAsync();
+        var slot = DateTime.UtcNow.Date.AddDays(2).AddHours(10);
+        var appointment = await SeedConfirmedAppointmentAsync(graph, slot);
+
+        var http = Client(graph, Roles.Staff);
+        var window = $"?fromUtc={Uri.EscapeDataString(WrittenWithoutZone(slot.Date))}Z" +
+                     $"&toUtc={Uri.EscapeDataString(WrittenWithoutZone(slot.Date.AddDays(1)))}Z" +
+                     "&page=1&pageSize=5";
+
+        using var single = JsonDocument.Parse(await http.GetStringAsync($"/api/v1/appointments/{appointment.Id}"));
+        using var page = JsonDocument.Parse(await http.GetStringAsync($"/api/v1/appointments{window}"));
+        var listed = page.RootElement.GetProperty("items").EnumerateArray()
+            .First(item => item.GetProperty("id").GetGuid() == appointment.Id);
+
+        foreach (var (verb, root) in new (string, JsonElement)[]
+                 {
+                     ("GET /api/v1/appointments/{id}", single.RootElement),
+                     ("GET /api/v1/appointments (paged projection)", listed)
+                 })
+        {
+            // Both readers of the same row have to label it the same way, and a naked answer is the ambiguity the
+            // field name was supposed to remove.
+            TextField(root, field).Should().EndWith("Z",
+                $"{verb} answers {field} with no designator, leaving the reader to guess the zone the name names");
+            ReadInstant(root, field).Should().Be(ReadInstant(single.RootElement, field),
+                $"{verb} must not move the instant while labelling it — the projection and the entity are one row");
+        }
+
+        ReadInstant(single.RootElement, "startAtUtc").Should().Be(slot,
+            "labelling is a representation fix; the ticks the booking wrote are the ticks the read must return");
+    }
 }
