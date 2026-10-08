@@ -240,40 +240,94 @@ Recording these because each one was stated as fact at some point, and the tree 
     badge could only ever render a repository that does not exist; and the header declared MIT while the tree had no
     `LICENSE` file — a declared license with no text is not a grant, and a client handover cannot ship one.
 
+18. **`DEP-05` ran the published deployment end to end, and two documented claims did not survive the run**
+    (`7b36f06`, `78f5510`, this commit). What was executed: `docker compose config`, the image build, the whole stack
+    from an empty volume with `SEED_DEMO_TENANTS=true`, all eight steps of `docs/DEPLOYMENT.md` §7, and a booking walk
+    over HTTP against it. The evidence is in §7 now, in the output's own words, so this entry records only what the
+    walk cost the documentation:
+    - **`docs/API.md` §4 said "Responses always carry `Z`".** They do not. `POST /api/v1/appointments` answered
+      `"startAtUtc":"2026-10-08T12:30:00Z"`, and `GET /api/v1/appointments` plus `GET /api/v1/appointments/{id}`
+      answered the **same row** as `"startAtUtc":"2026-10-08T12:30:00"` — no designator, for `startAtUtc`, `endAtUtc`
+      and `createdAtUtc` alike. The mechanism is not mysterious: `datetime2` stores ticks and no zone, so a value EF
+      materializes arrives `Kind=Unspecified` and System.Text.Json writes it naked, while the value the process wrote
+      itself still carries the `Utc` label the request boundary gave it. This is a **labelling** defect, not a
+      stored-value one — the booking guard, the cutoff policy and the dashboard all agree on the instant, and the row
+      in the database is right — but a client that parses a naked ISO instant as its own local time shifts every
+      appointment it lists, which is the `BL-05` failure mode arriving from the direction the tests never pointed.
+      Tracked as `TIME-01` in §3. The claim is corrected to the measured spelling, with the read-side caveat stated
+      as the contract until that lands.
+    - **`docs/API.md` §7 said both catalog reads answer `400 Active tenant context is required.` when no tenant
+      resolves.** True for the anonymous caller that was measured. False for the one authenticated caller this
+      deployment can actually sign in as: the seeded platform administrator has no `tenant_id` claim, so
+      `TenantResolutionMiddleware.cs:37` gives it `Guid.Empty` and `isPlatformAdmin: true`, and the read answers
+      `200 []` instead of refusing. Nothing leaked — the filter matched no row — but the guard has a hole shaped
+      exactly like "a client cannot tell an empty clinic from a missing header", and only a live walk finds it,
+      because every fixture in the suite signs in as a tenant-scoped test user that does not exist on a fresh
+      database.
+    - Two ignore-file defects, each in its own commit because each was measured separately: **`.gitignore` listed
+      `.dockerignore`**, so the file that decides the build context was untracked and therefore absent from every
+      clone — a clean clone sent 172.16 kB of context where this tree sent 54.97 kB, and after the operator followed
+      the README's own `dotnet build` it sent **306.93 MB in 15.7 s**. The shipped image was never affected (81
+      entries in `/app`, publish output only), which is why this is a build-time cost rather than a leak. And
+      **`.env` was not ignored** — the handover's first instruction is `cp .env.example .env` and fill it with the SA
+      password, the signing secret and the seeding administrator's password, and a probe build of a clone printed all
+      three marker values back out of the `COPY . .` layer while `git status` showed `?? .env`: one `git add -A` from
+      being a second `SEC-02`. `.env.example` stays tracked; the probe can no longer find `.env`.
+    - The CI claim this file has carried since `DEP-04` ("measured locally, CI run not yet observed") is closed by
+      reading it: Actions run **#59** at `head_sha=b78fd40` is `completed / success`, #58 at `503696a` and #57 at
+      `5ae2e74` likewise. `ci.yml` builds and runs the two suites and does **not** build the image or render the
+      compose file, so the green badge is not evidence about `Dockerfile` — that evidence is now §7, produced by hand.
+    - One host-side fact that is a note, not a defect: `docker-compose.yml:10,25` publish `127.0.0.1:1433` and
+      `127.0.0.1:6379` as fixed numbers, and on this workstation both were already taken (a local SQL Server instance
+      on 1433, another project's Redis on 6379), so `up -d` failed with `Ports are not available … forbidden by its
+      access permissions` after building both images. §1 now states it and gives the `!override` recipe; a plain
+      `ports:` in an override **appends** and fails the same way, which is the trap.
+
 
 ## 3. What is genuinely live, in the order the next work should take it
 
-1. `PERF-04` residue — the availability day is the one anonymous response with no bound on it, and its size grows
+1. `TIME-01` — the first code defect this queue has received from a live deployment rather than from a test, and the
+   only one that changes what a client's calendar renders. A `…AtUtc` field on the appointment **read** paths answers
+   with no zone designator (`docs/DEPLOYMENT.md` §7 step 8 records both spellings of one row), because `datetime2`
+   carries no zone and EF materializes `Kind=Unspecified`. The stored instant is correct; the label is missing, and a
+   client parsing the naked value as local time moves every appointment it lists by its own offset. Fix it where the
+   value enters the CLR object rather than in each DTO, so the next read path cannot reintroduce it, and pin it with
+   an assertion on a **read**: the suite does check this designator, twice, at
+   `UtcInstantBoundaryTests.cs:204,230` — both times on the `201` response of the booking that wrote the row, which
+   is the one path that already carries it. 636 tests pass because the covered half is correct.
+2. `PERF-04` residue — the availability day is the one anonymous response with no bound on it, and its size grows
    linearly with the candidate-staff roster (683 KB at 50 staff, `PERFORMANCE.md` §6). Bounding it needs a policy
    number and a decision about what a truncated day should say; `CAL-01`'s calendars and the two anonymous catalog
    reads are the same class of "invent behaviour" choice. What does *not* need a decision is the grid's cost: it was
    measured, it is 1.5-4.2 ms at a density no caller can request, and the prefilter over `CandidateStartsUtc` was
-   refused on that number (`PERFORMANCE.md` §6).
-2. `CAL-01` — Holidays / BusinessHours / AvailabilityExceptions have a reader in the booking guard and no route and no
+   refused on that number (`PERFORMANCE.md` §6). `DEP-05` added one measured fact to this item: the seeded working
+   week makes a closed Saturday answer `isOpen: true` with `slots: []` — the response has no way to say "closed",
+   only a way to say "open, nobody here".
+3. `CAL-01` — Holidays / BusinessHours / AvailabilityExceptions have a reader in the booking guard and no route and no
    seed, so enforcing them means maintaining them by hand in the database. Measured while closing `PERF-05`: the case is
    stronger than "no route and no seed" for Holidays, which has **no writer in `src` at all**, so every deployed
    calendar table is empty and the guard's close-check is dead code until this is decided.
-3. Onboarding, which `DEP-01`'s walk exposed and no finding ID owns: **the only writer of a `Tenant` row in `src` is
+4. Onboarding, which `DEP-01`'s walk exposed and no finding ID owns: **the only writer of a `Tenant` row in `src` is
    `DatabaseSeeder.cs`**, and there is no tenant route (`api/v1/tenants` does not exist). `DEP-03` made the demo block
    opt-in (`Seed:DemoTenants`, default off) because a client's production tenant table must not arrive pre-filled,
    which sharpens rather than closes this: the default first run now leaves **zero** tenants, so the way to put the
    first customer's clinic into a fresh production database is still `INSERT` by hand — with the demo half as the only
    alternative, and it writes Apex Dental, Luxe Salon and Pulse Fitness (`America/New_York`, `America/Chicago`,
    `America/Los_Angeles`) plus their invented staff and patients. That is `SEC-03`'s tenant gate wearing a deployment
-   hat: whoever decides who may create a tenant decides how a client gets one.
-4. The two halves of `SEC-12` that this file has never been able to close from code — a stated **CORS policy** (which
+   hat: whoever decides who may create a tenant decides how a client gets one. `DEP-05` found the same gate on the
+   *user* side, and it is sharper: the demo block writes staff and customers rows and **no users**, so on a seeded
+   production database the only credential that exists is a platform administrator with no tenant, and there is no
+   route that can create a tenant-scoped account (`Controllers/` has no user endpoint). Until onboarding is decided,
+   a client cannot get a receptionist.
+5. The two halves of `SEC-12` that this file has never been able to close from code — a stated **CORS policy** (which
    origins, if any, may send credentialed requests to this API) and **HSTS**. Absent CORS is fail-closed for browsers
    and the absence is a missing statement rather than an open door; both need the operator's deployment story, not a
    patch. (`DEP-03`'s host-header work settles the third thing this list used to call "the same class": the key was
    never dead, only unspellable — see §1 `SEC-13` and §2.16.)
-5. Product decisions, not to be taken from this queue: `SEC-03`'s tenant gate, `BL-08`'s authorship and moderation,
+6. Product decisions, not to be taken from this queue: `SEC-03`'s tenant gate, `BL-08`'s authorship and moderation,
    `DB-02`'s recurring-series definition, `QUAL-05`'s module split.
-6. Operator action only: `SEC-02` — rotate the secret committed before `d767c25`.
-7. `DEP-05` — nothing has ever run this tree's own deployment surface end to end. `.github/workflows/ci.yml` restores,
-   builds in Release and runs both suites against a SQL Server container; it never builds the image, never renders
-   `docker-compose.yml`, and never starts the stack, so the `Dockerfile` and compose file `DEP-03` fixed have only
-   been exercised from a workstation. The README's CI badge now points at the real origin, but a badge reports what
-   GitHub says about a workflow, and no machine here has read that: the honest status of the front page's "✅ measured"
-   column is *measured locally, CI run not yet observed*. The remaining evidence is one Actions run and one
-   `docker compose up` on a clean machine, followed by the smoke checklist in `docs/DEPLOYMENT.md` §7 including the step
-   it currently marks unrecorded (sign in, read the catalog, book an appointment).
+7. Operator action only: `SEC-02` — rotate the secret committed before `d767c25`.
+8. One deployment measurement `DEP-05` did not get: `docs/DEPLOYMENT.md` §7 step 5 with `ALLOWED_HOSTS` **naming** a
+   domain, against the compose stack (the host filter itself and the probe's `Host` derivation for every spelling are
+   §3's tables, measured on a live host and on the running stack respectively). This is the one row of the checklist
+   whose answer this repository is asserting from §3 rather than from §7's run.

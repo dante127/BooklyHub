@@ -38,6 +38,35 @@ Ports are published on `127.0.0.1` only: this stack is meant to sit behind a rev
 forwards 443 to `127.0.0.1:5000` is the intended shape. Publishing `1433` or `6379` on a public interface is not
 part of any deployment this document supports.
 
+**Those two published ports are fixed numbers, and a machine already running SQL Server or Redis cannot start this
+stack on them.** Measured on a development host with a local SQL Server instance and another project's Redis
+container up: `docker compose up -d` built both images, started `redis` and `sqlserver`, and then failed with
+`Error response from daemon: Ports are not available: exposing port TCP 127.0.0.1:1433 -> 127.0.0.1:0: listen tcp
+127.0.0.1:1433: bind: An attempt was made to access a socket in a way forbidden by its access permissions.`
+(`Get-NetTCPConnection -State Listen -LocalPort 1433,6379,5000` showed one process holding `1433` on the wildcard
+address and another holding `6379`; `5000` was free, which is why the API published normally. Filtering `netstat` to
+`127.0.0.1` finds neither, because both listeners are on `::` / `0.0.0.0` and the collision is with the wildcard, not
+with the loopback address.) This is not
+a defect in the file — the ports are the operator's debugging handles, and a clean server has them free — but an
+operator who wants both on one box has to move them, and the way to do that without editing the tracked file is an
+override:
+
+```yaml
+# docker-compose.override.yml (or -f docker-compose.yml -f <this file>)
+services:
+  sqlserver:
+    ports: !override
+      - "127.0.0.1:14330:1433"
+  redis:
+    ports: !override
+      - "127.0.0.1:63790:6379"
+```
+
+`!override` is what makes this replace the base list instead of appending to it; a plain `ports:` in the override
+leaves `1433` in the config and fails the same way. Nothing inside the network addresses these ports by the host
+number — `api` reaches `sqlserver,1433` and `redis:6379` by service name — so remapping the host side changes only
+what the operator's own database client types. §7's run used exactly this override.
+
 ## 2. Settings
 
 Compose reads an `.env` file (`cp .env.example .env`), and the `:?` guards mean `docker compose config` refuses to
@@ -223,24 +252,110 @@ ones the deployment uses now, not the ones from when the backup was taken, and r
 
 ## 7. Smoke checklist
 
-Run in this order after a first deploy; each step names what a correct answer looks like, measured on this build.
+Run in this order after a first deploy; each step names what a correct answer looks like.
 
-1. `docker compose --env-file .env config --quiet` — exits 0, or names the variable you left unset.
-2. `docker compose --env-file .env up -d --build` — `migrator` exits 0, `api` reaches `healthy`
-   (`docker ps` shows `(healthy)` after ~20-30 s).
-3. `docker inspect -f '{{.State.Health.Log}}' booklyhub-api` — the last probe exited 0. A `400` here is a `Host`
-   problem (§3), not an application problem.
-4. `curl -i http://127.0.0.1:5000/health/ready` with an admitted `Host` — `200`, and the body names `Database`.
-   With `HTTPS_REDIRECT_PORT` set, expect `307` and read the `Location` instead.
-5. `curl -i -H 'Host: anyone-else.example' http://127.0.0.1:5000/health/live` — **`400`** if `ALLOWED_HOSTS`
-   names your domain. A `200` here means the filter is not installed, i.e. `ALLOWED_HOSTS` is still `*`.
-6. `docker exec booklyhub-api id` — `uid=10001(appuser)`. A `uid=0` means the image was built from the version of
-   `Dockerfile` that used `adduser`, which never produced an image at all.
-7. `docker exec booklyhub-api printenv Payments__Provider Notifications__Provider` — `None`, unless you registered
-   providers. With `None`, §10's money and message limits are live and must be stated to the client.
-8. A sign-in as the administrator, one catalog read, and one booking — the walk that proves the schema, the seed
-   and the availability engine together. **This walk is not yet recorded with real responses**; `DEP-05` owns it,
-   and until that commit lands the honest statement to a client is "steps 1-7 are measured, step 8 is not".
+**All eight steps below were run against this repository on 2026-10-07**, on a fresh volume with
+`SEED_DEMO_TENANTS=true`, `PAYMENTS_PROVIDER=None`, `NOTIFICATIONS_PROVIDER=None` and `ALLOWED_HOSTS=*` (the
+`.env` the operator copies from `.env.example`, filled with generated values). The quoted output is the output; the
+two tokens in step 8's login response are the only elisions, replaced by what was measured about them.
+
+1. `docker compose --env-file .env config --quiet` — exits `0`. With the required variable missing it fails here,
+   before any image is built, and names it:
+   ```
+   $ docker compose --env-file /dev/null config --quiet
+   error while interpolating services.sqlserver.environment.[]: required variable MSSQL_SA_PASSWORD is
+   missing a value: MSSQL_SA_PASSWORD must be set (see .env.example)
+   exit 1
+   ```
+2. `docker compose --env-file .env up -d --build` — both images build, `migrator` exits 0, `api` reaches
+   `healthy`. Measured on this run (the image layers were **cache hits** — an identical context had been built
+   earlier in the same session, so this says nothing about how long a first cold build takes; the volume, though,
+   was genuinely empty and the migration and seed ran for real):
+   ```
+   Container booklyhub-sqlserver  Healthy
+   Container booklyhub-migrator   Exited        # exit code 0
+   Container booklyhub-api        Started
+   $ docker ps --filter name=booklyhub --format '{{.Names}}\t{{.Status}}'
+   booklyhub-redis      Up 24 seconds (healthy)
+   booklyhub-sqlserver  Up 24 seconds (healthy)
+   booklyhub-api        Up 13 seconds (healthy)
+   booklyhub-migrator   Exited (0) 13 seconds ago
+   ```
+   On a host that already runs SQL Server or Redis this is the step that fails, with the port error in §1.
+3. `docker inspect -f '{{range .State.Health.Log}}{{.ExitCode}} {{.Output}}{{end}}' booklyhub-api` — every probe
+   exit code is `0`. Measured: `0 {"status":"Healthy","totalDurationMs":0.6,"checks":[]}` three times. A `400`
+   here is a `Host` problem (§3), not an application problem.
+4. `curl -i http://127.0.0.1:5000/health/ready` — `200`, and the body names `Database`. Measured:
+   ```
+   HTTP/1.1 200 OK
+   Content-Type: application/json; charset=utf-8
+   Server: Kestrel
+   X-Correlation-Id: 74ca8e0e88d945ef95739e2270ad7427
+
+   {"status":"Healthy","totalDurationMs":17,"checks":[{"name":"Database","status":"Healthy","durationMs":12.9}]}
+   ```
+   `/health/live` answers the same envelope with an empty `checks` array — it proves the process serves, nothing
+   else. With `HTTPS_REDIRECT_PORT` set, expect `307` and read the `Location` instead.
+5. `curl -i -H 'Host: anyone-else.example' http://127.0.0.1:5000/health/live` — with `ALLOWED_HOSTS=*` this run
+   answered **`200`**, which is the documented meaning of `*`: no filter is installed. Name the domain and the
+   same request answers `400`; that case, and the probe's `Host` derivation for every spelling, is §3's table.
+   (Re-measuring the named case on this compose stack was queued and then lost: the host's Docker engine stopped
+   mid-session, after step 8's last request, so the stack was not there to restart with a named `ALLOWED_HOSTS`.)
+6. `docker exec booklyhub-api id` — measured:
+   `uid=10001(appuser) gid=10001(appuser) groups=10001(appuser)`. A `uid=0` means the image was built from the
+   version of `Dockerfile` that used `adduser`, which never produced an image at all.
+7. `docker exec booklyhub-api printenv Payments__Provider Notifications__Provider` — measured: `None`, `None`.
+   With `None`, §10's money and message limits are live and must be stated to the client.
+8. **Sign in, read the catalog, book, and try to book the same slot twice.** The seeded platform administrator is
+   the only account the seeder writes, and it belongs to no tenant (`tenantId: null`), so this walk names the
+   tenant per request with `X-Tenant-Id`. `POST /api/v1/auth/login` → measured `200`:
+   ```json
+   {"accessToken":"eyJ... (1123 bytes)","refreshToken":"...","expiresAtUtc":"2026-10-07T14:39:12Z",
+    "user":{"email":"admin@booklyhub.test","tenantId":null,"roles":["PlatformAdmin"],"permissions":"25 entries"}}
+   ```
+   `GET /api/v1/services` with that bearer and `X-Tenant-Id: <apex>` → `200`, three services, each carrying
+   `durationMinutes` and both buffer fields. The same request with **no** header and no token →
+   ```json
+   {"title":"Bad Request","status":400,"detail":"Active tenant context is required.",
+    "instance":"/api/v1/services","correlationId":"5d3125eaf05f4799a5d1c45d04c46a9e"}
+   ```
+   `GET /api/v1/availability?locationId=…&serviceId=…&staffId=…&date=2026-10-08&tenantId=…` → `200`, `isOpen: true`,
+   26 slots; the same query for the weekend (`2026-10-10`, `2026-10-11`) → `isOpen: true` with `slots: []`, which
+   is the seeded working week saying it is closed without the response having a way to say so. The first slot
+   offered was `2026-10-08T12:30:00Z` → `13:15:00Z` with one `availableResourceIds` entry, and the booking below
+   allocated exactly that resource.
+
+   `POST /api/v1/appointments` with that slot, a real `customerId`, a bearer token, `X-Tenant-Id` and an
+   `Idempotency-Key` → **`201 Created`**, `Location: http://127.0.0.1:5000/api/v1/appointments/603af0fa-…`, and:
+   ```json
+   {"id":"603af0fa-863e-42b1-9ebc-073a830d2d4c","status":"Confirmed","startAtUtc":"2026-10-08T12:30:00Z",
+    "endAtUtc":"2026-10-08T13:15:00Z","durationMinutes":45,"price":120.00,"currency":"USD",
+    "customerName":"Emily Watson","staffName":"Dr. Marcus Vance","locationName":"Downtown Dental Center",
+    "allocatedResourceIds":["0333fd0c-1d3b-47a1-9b55-203c243ff47b"]}
+   ```
+   Then the three controls that make this a test rather than a demo, all on the same running stack:
+   - same `Idempotency-Key`, byte-identical body → `201` again with **the same `id`** (`603af0fa-…`), and no
+     second row: the retry a client sends after a dropped connection cannot double-book.
+   - same `Idempotency-Key`, different body → `409` `{"title":"Idempotency Key Conflict","detail":"This
+     Idempotency-Key was already used for a different request."}`.
+   - fresh `Idempotency-Key`, same slot → `409` `{"title":"Booking Conflict","detail":"That time slot is already
+     booked for the selected staff member.","correlationId":"b8c6642a…"}`. The app lock and the availability guard
+     fired on a real SQL Server instance, in Production, over HTTP.
+   - `GET /api/v1/appointments?fromUtc=2026-10-08T00:00:00Z&toUtc=2026-10-09T00:00:00Z` as `apex-dental` →
+     `totalCount: 1`; the **same request** with `X-Tenant-Id` set to `luxe-salon` → `totalCount: 0`.
+   - `GET /api/v1/reports/dashboard` → `200`, `totalAppointments: 1`, `grossRevenue: 120.00`,
+     `upcomingConfirmedCount: 1`, `staleExecutionCount: 0`.
+
+   One thing this walk measured that the docs did not know: the `201` above answers `"startAtUtc":"…T12:30:00Z"`,
+   but reading **that same row back** from `GET /api/v1/appointments` and `GET /api/v1/appointments/{id}` answers
+   `"startAtUtc":"2026-10-08T12:30:00"` with no `Z` (`endAtUtc` and `createdAtUtc` likewise). The columns are
+   `datetime2`, which stores no zone, so a value EF materializes arrives labeled `Unspecified` and System.Text.Json
+   writes it naked — while a value the process wrote itself still carries the `Utc` label it was given at the
+   request boundary. The server therefore states the reading it made on the write path and does not on the read
+   paths, and a client that parses a naked ISO instant as *its own* local time shifts every appointment it lists.
+   `docs/API.md` §4 claimed "Responses always carry `Z`"; that claim is corrected to what was measured, and the fix
+   is `TIME-01` in `AUDIT-STATUS.md` §2 — it is a labelling defect, not a stored-value defect: the row in the
+   database is the right instant, and the booking guard, the cutoff policy and the dashboard all agree on it.
 
 ## 8. Logs, and what to look at when something is refused
 
@@ -306,6 +421,13 @@ Stated as the handover conversation needs it, not as a defect list. Each item na
    credential of the account, in the same transaction as the new hash. What neither can do is stop an access token
    already minted: permissions and identity live frozen in its claims, so a revoked session keeps serving until
    `Jwt:ExpirationMinutes` elapses (`SECURITY.md` §3.2).
+
+10. **A read appointment's timestamps arrive with no zone designator** (`TIME-01`, §7 step 8). The value in the
+    database is the right UTC instant and the booking paths agree on it; what is missing is the label, so
+    `GET /api/v1/appointments` answers `"startAtUtc":"2026-10-08T12:30:00"` where the `201` that created it answered
+    `"…T12:30:00Z"`. Tell an integrator to parse a naked `…AtUtc` from a read as UTC. This is the one item in this
+    section that is a defect rather than an unshipped capability, and it is here because the previous version of this
+    file did not know about it.
 
 Everything above is reachable from a clean tree; none of it is a hidden defect. A deployment that needs one of
 them needs a decision, a provider implementation, or a route — and the decision belongs to the product owner, not

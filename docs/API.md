@@ -396,8 +396,13 @@ UTC, whichever of the three ISO shapes the client used:
 The conversion happens at the edge (`UtcInstant.cs`), before the value reaches a command, and the appointment writers
 refuse a value still labeled for a machine's zone (`InvalidDateKind`). It matters because the columns are
 `datetime2`, which stores the ticks it is handed: measured before this rule, a body of `09:00:00+00:00` on a host at
-UTC+3 was written as 12:00 — the appointment moved by the deployment's own offset. Responses always carry `Z`,
-including for a value sent without a designator, so the server states the reading it made.
+UTC+3 was written as 12:00 — the appointment moved by the deployment's own offset. The write path answers `Z`,
+including for a value sent without a designator, so the server states the reading it made. **The reads of that same
+row do not**: `GET /api/v1/appointments` and `GET /api/v1/appointments/{id}` answer `"startAtUtc":"2026-10-08T12:30:00"`
+with no designator, because `datetime2` stores no zone and an EF-materialized value arrives labeled `Unspecified`.
+Send and parse `Z` on the request, and treat a naked `…AtUtc` on a read as UTC — which is what it is — rather than
+as local time. This is `TIME-01` in `docs/AUDIT-STATUS.md` §2, measured on the deployed compose stack; until it is
+fixed, that naked spelling is the contract.
 
 A key is promised to one payload, not one instant: `IdempotencyMiddleware` hashes the request body as text, so
 sending the same start time twice in two different shapes is answered `409` with "This Idempotency-Key was already
@@ -790,8 +795,14 @@ bound is per payment, not per appointment, so an appointment paid in two capture
 
 The two catalog reads are the public half of the product's data: both are `[AllowAnonymous]`, both take the tenant
 from `X-Tenant-Id` (or from the authenticated context when there is one), and both answer `400` with
-`Active tenant context is required.` when neither resolves a tenant (`ENV-01`, §1.1) — measured with no header at
-all.
+`Active tenant context is required.` when neither resolves a tenant (`ENV-01`, §1.1) — measured on the deployed host
+with no token and no header. One caller does not reach that guard: the **platform administrator** (whose sign-in
+carries no `tenant_id` claim) with no
+`X-Tenant-Id` header is authenticated, names no tenant, and `TenantResolutionMiddleware.cs:37` hands it `Guid.Empty`
+with `isPlatformAdmin: true`. The read is then filtered against a tenant id no row carries, so it answers `200 []` —
+measured on the deployed stack, an empty array against a database seeded with three tenants and their catalogs. No
+rows leak, but a client that reads an empty catalog as "this clinic has no services" is reading its own missing
+header. Send the header.
 
 ### `GET /api/v1/services`
 The bookable service list.

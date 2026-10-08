@@ -205,7 +205,11 @@ dotnet test tests/BooklyHub.IntegrationTests
 ```
 
 `.github/workflows/ci.yml` builds the solution in Release and runs these same two suites against a SQL Server 2022
-service container.
+service container — and nothing else. It does not build the image, does not render `docker-compose.yml`, and does not
+start the stack, so the badge is evidence about the suites and not about the deployment surface; the badge was green
+at `b78fd40` (Actions run #59, `completed / success`, read from GitHub's API on 2026-10-07). The deployment surface's
+evidence is [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) §7, which was run by hand against this repository's own
+compose stack.
 
 ### Verified Test Scenarios:
 | Test Area | Description | Status |
@@ -219,6 +223,7 @@ service container.
 | **Debt Queue** | The outstanding-visits answer is computed by the same `PaymentLedger` rule the charge path enforces, differentially over thirteen payment shapes. | ✅ measured |
 | **Retention Sweep** | A row past its horizon goes and one inside it stays; a dead-letter outbox row survives the sweep that deletes its delivered neighbours; a backlog larger than one batch is emptied rather than left at the first page. | ✅ measured |
 | **Serving Surface** | `AllowedHosts` and the redirect port are read and validated before the pipeline is built; malformed spellings refuse to start (32 unit facts, plus a live-host matrix in `docs/DEPLOYMENT.md` §3). | ✅ measured |
+| **Deployed Stack** | The whole handover walk over HTTP against `docker compose up` on a fresh volume: sign in, read a tenant's catalog, book the first offered slot (`201`), replay the same `Idempotency-Key` and get the same row id, send that key with a different body (`409`), send a fresh key for the booked slot (`409`), and read the appointment list as a *different* tenant and get `totalCount: 0`. Not a test — a measurement of the shipped image, in `docs/DEPLOYMENT.md` §7. | ✅ measured |
 
 ---
 
