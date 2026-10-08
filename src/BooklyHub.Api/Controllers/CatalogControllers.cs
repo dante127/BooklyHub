@@ -26,7 +26,11 @@ public class ServicesController : ControllerBase
 
     [HttpGet]
     [AllowAnonymous]
-    public async Task<ActionResult> GetServices([FromQuery] Guid? categoryId, CancellationToken cancellationToken)
+    public async Task<ActionResult> GetServices(
+        [FromQuery] Guid? categoryId,
+        [FromQuery(Name = "page")] int requestedPage = 1,
+        [FromQuery(Name = "pageSize")] int requestedPageSize = 20,
+        CancellationToken cancellationToken = default)
     {
         var tenantId = TenantGuard.RequireId(_tenantContext);
 
@@ -36,8 +40,17 @@ public class ServicesController : ControllerBase
 
         if (categoryId.HasValue) query = query.Where(s => s.CategoryId == categoryId.Value);
 
+        var page = Paging.NormalizePage(requestedPage);
+        var size = Paging.NormalizePageSize(requestedPageSize);
+
+        var total = await query.CountAsync(cancellationToken);
         var services = await query
+            // ThenBy(Id) because OrderBy(Name) alone is not a total order: two services with the same name page
+            // unpredictably, and SQL Server gives no promise about ties.
             .OrderBy(s => s.Name)
+            .ThenBy(s => s.Id)
+            .Skip(Paging.Offset(page, size))
+            .Take(size)
             .Select(s => new
             {
                 s.Id,
@@ -52,7 +65,7 @@ public class ServicesController : ControllerBase
             })
             .ToListAsync(cancellationToken);
 
-        return Ok(services);
+        return Ok(new { total, page, pageSize = size, items = services });
     }
 }
 
@@ -62,16 +75,23 @@ public class StaffController : ControllerBase
 {
     private readonly IApplicationDbContext _db;
     private readonly ITenantContext _tenantContext;
+    private readonly IAuthorizationService _authorization;
 
-    public StaffController(IApplicationDbContext db, ITenantContext tenantContext)
+    public StaffController(IApplicationDbContext db, ITenantContext tenantContext, IAuthorizationService authorization)
     {
         _db = db;
         _tenantContext = tenantContext;
+        _authorization = authorization;
     }
 
     [HttpGet]
     [AllowAnonymous]
-    public async Task<ActionResult> GetStaff([FromQuery] Guid? locationId, [FromQuery] Guid? serviceId, CancellationToken cancellationToken)
+    public async Task<ActionResult> GetStaff(
+        [FromQuery] Guid? locationId,
+        [FromQuery] Guid? serviceId,
+        [FromQuery(Name = "page")] int requestedPage = 1,
+        [FromQuery(Name = "pageSize")] int requestedPageSize = 20,
+        CancellationToken cancellationToken = default)
     {
         var tenantId = TenantGuard.RequireId(_tenantContext);
 
@@ -82,8 +102,22 @@ public class StaffController : ControllerBase
         if (locationId.HasValue) query = query.Where(s => s.LocationId == locationId.Value);
         if (serviceId.HasValue) query = query.Where(s => s.StaffServices.Any(ss => ss.ServiceId == serviceId.Value));
 
+        var page = Paging.NormalizePage(requestedPage);
+        var size = Paging.NormalizePageSize(requestedPageSize);
+
+        // API-08: which caller may read a staff member's contact details. The same requirement the authorized
+        // staff routes are gated by, evaluated here instead of on the action, because this route has to answer
+        // anonymously — the booking portal's staff picker is one of its callers and needs no token.
+        var mayReadContact = (await _authorization.AuthorizeAsync(
+            User, resource: null, new PermissionRequirement(Permissions.Staff.Read))).Succeeded;
+
+        var total = await query.CountAsync(cancellationToken);
         var staff = await query
             .OrderBy(s => s.LastName)
+            .ThenBy(s => s.FirstName)
+            .ThenBy(s => s.Id)
+            .Skip(Paging.Offset(page, size))
+            .Take(size)
             .Select(s => new
             {
                 s.Id,
@@ -91,8 +125,8 @@ public class StaffController : ControllerBase
                 s.LastName,
                 s.Title,
                 s.Bio,
-                s.Email,
-                s.PhoneNumber,
+                Email = mayReadContact ? s.Email : null,
+                PhoneNumber = mayReadContact ? s.PhoneNumber : null,
                 s.ColorHex,
                 s.LocationId,
                 OfferedServices = s.StaffServices.Select(ss => new
@@ -105,7 +139,7 @@ public class StaffController : ControllerBase
             })
             .ToListAsync(cancellationToken);
 
-        return Ok(staff);
+        return Ok(new { total, page, pageSize = size, items = staff });
     }
 }
 

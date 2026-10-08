@@ -180,7 +180,7 @@ public sealed class NoOutboundProviderDeploymentTests : IAsyncLifetime
         response.StatusCode.Should().Be(HttpStatusCode.OK, await response.Content.ReadAsStringAsync());
 
         var body = await response.Content.ReadAsStringAsync();
-        JsonDocument.Parse(body).RootElement[0].GetProperty("name").GetString()
+        JsonDocument.Parse(body).RootElement.GetProperty("items")[0].GetProperty("name").GetString()
             .Should().Be("Consult", "a refusal of outbound work must not reach the reads a clinic runs on");
     }
 

@@ -50,13 +50,22 @@ GROUP BY [Status];
 Measured at `c67480f`, because this section previously claimed "all list endpoints enforce standardized pagination"
 with a page size "capped at `50`", and neither was true:
 
-- **Four routes are paged, and all four go through one rule.** `GET /api/v1/customers`, `GET /api/v1/reviews`,
+- **Six routes are paged, and all six go through one rule.** `GET /api/v1/customers`, `GET /api/v1/reviews`,
   `GET /api/v1/appointments` and `GET /api/v1/payments/outstanding-visits` normalize through
-  `Paging.NormalizePage` / `NormalizePageSize` / `Offset`. The ceiling is **100** with a default of **20**, not 50
-  (`Paging.cs:5-6`), and an out-of-range ask falls back to the default rather than to the ceiling.
-- **Two list routes are not paged at all.** The anonymous catalog reads answer a bare array with no `page`,
-  `pageSize` or `Take` (`CatalogControllers.cs:27-55`, `:72-109`), so their size is bounded only by how many rows a
-  tenant has. That is `PERF-04`'s open residue, not a clamp waiting for a different number.
+  `Paging.NormalizePage` / `NormalizePageSize` / `Offset`, and since the last half of `PERF-04` closed so do the two
+  anonymous catalog reads, `GET /api/v1/services` and `GET /api/v1/staff`. The ceiling is **100** with a default of
+  **20**, not 50 (`Paging.cs:5-6`), and an out-of-range ask falls back to the default rather than to the ceiling.
+- **The two catalog reads used to be the routes with no bound at all.** They answered a bare array with no `page`,
+  `pageSize` or `Take` (`CatalogControllers.cs`), so their size was bounded only by how many rows a tenant had
+  loaded: on one fixture, 120 services arrived as **25,561 B** and 40 staff as **11,671 B**, in one request, to an
+  anonymous caller. Both now answer `{ total, page, pageSize, items }` — **4,306 B** and **4,725 B** for the default
+  page of 20, **21,347 B** at the 100-row ceiling — so the largest body either can produce is a hundred rows and
+  `total` still tells the caller the real size of the catalog. What was **not** done to them is a cap on the roster:
+  §6 refused that for the availability day on the same measurement, and paging buys the same bound without taking
+  rows away. Each page costs **two** statements — the rows and their `total` — measured at 1 and at 9 rostered
+  members (`CatalogPagingTests`), which is the price of stating the size and is not a per-row fan-out: the nested
+  `offeredServices` joins into the same read, the shape `PERF-02` was about, whose day-side pin is eleven statements
+  in `AvailabilityBatchingTests`.
 - **The offset is computed before it is handed to SQL.** `(page - 1) * pageSize` in `int` wraps negative for a large
   `page` and reaches the server as `OFFSET -40`, which faults; `Paging.Offset` multiplies in `long` and saturates at
   `int.MaxValue` instead (`PAG-01`).

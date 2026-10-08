@@ -314,7 +314,10 @@ two tokens in step 8's login response are the only elisions, replaced by what wa
     "user":{"email":"admin@booklyhub.test","tenantId":null,"roles":["PlatformAdmin"],"permissions":"25 entries"}}
    ```
    `GET /api/v1/services` with that bearer and `X-Tenant-Id: <apex>` → `200`, three services, each carrying
-   `durationMinutes` and both buffer fields. The same request with **no** header and no token →
+   `durationMinutes` and both buffer fields. That was the deployed image's **bare array**, and it is kept as measured:
+   the tree now pages both catalog reads, so the same call answers `{total, page, pageSize, items}` with `total: 3`
+   (`docs/API.md` §7), and the `Z` on the read below is likewise the current code's answer rather than this image's.
+   The same request with **no** header and no token →
    ```json
    {"title":"Bad Request","status":400,"detail":"Active tenant context is required.",
     "instance":"/api/v1/services","correlationId":"5d3125eaf05f4799a5d1c45d04c46a9e"}
@@ -419,23 +422,23 @@ Stated as the handover conversation needs it, not as a defect list. Each item na
    (`BL-08`): `Review.Create` sets `IsVerified` and `IsPublished` true and there is no unpublish route.
 6. **A recurring series cannot be replayed.** `RecurringAppointment` persists no service, staff, location or
    time-of-day, so the series definition survives but the pattern does not regenerate (`DB-02`).
-7. **`GET /api/v1/staff` is `[AllowAnonymous]` and its answer includes `Email` and `PhoneNumber`** (`API-08`). The
-   public review wall is names only; this is the wider disclosure, and an unauthenticated caller can harvest a
-   clinic's whole roster with contact details. Narrowing the projection — or putting the route behind a permission
-   — is a product decision that has not been taken from the queue, so today's answer stands and is documented
-   rather than quietly trimmed.
-8. **The anonymous availability day is unbounded.** Its size grows linearly with the candidate-staff roster —
-   6.7 KB at 1 staff, 111 KB at 10, **683 KB at 50** (`PERF-04`). Bounding it needs a ceiling number and a
-   decision about what a truncated day says.
-9. **Revocation is per credential, and an access token in hand always runs out.** `POST /api/v1/auth/logout`
+7. **Revocation is per credential, and an access token in hand always runs out.** `POST /api/v1/auth/logout`
    revokes the **presented** refresh row and nothing else — it is not a reuse signal, it burns no chain, and it
    leaves the account's other live sessions alone (`FAN-01`); its answer is always `204`, so it tells a caller
    nothing about which tokens exist. `POST /api/v1/auth/change-password` is the one call that revokes every live
    credential of the account, in the same transaction as the new hash. What neither can do is stop an access token
-   already minted: permissions and identity live frozen in its claims, so a revoked session keeps serving until
+   already minted: permissions and identity live frozen in its claims, so a revoked account keeps serving until
    `Jwt:ExpirationMinutes` elapses (`SECURITY.md` §3.2).
 
 Everything above is reachable from a clean tree; none of it is a hidden defect. A deployment that needs one of
 them needs a decision, a provider implementation, or a route — and the decision belongs to the product owner, not
-to this file. One item that used to belong here does not any more: a read appointment's `…AtUtc` fields answering
-with no zone designator (`TIME-01`) is fixed and pinned by a test, and §7 step 8 keeps the measurement that found it.
+to this file. Three items that used to be on this list are not any more:
+
+- a read appointment's `…AtUtc` fields answering with no zone designator (`TIME-01`) is fixed and pinned by a test,
+  and §7 step 8 keeps the measurement that found it;
+- **the anonymous availability day is bounded** (`PERF-04`): at most 500 slots, `slotsTruncated: true` when a day is
+  longer, which caps the response the roster used to size — 6.7 KB at 1 staff, 111 KB at 10, **683 KB at 50** before
+  the ceiling;
+- **`GET /api/v1/staff` no longer answers contact details to an anonymous caller** (`API-08`): `email` and
+  `phoneNumber` are `null` unless the caller holds `staff.read`, and both catalog reads page. The names stay public,
+  because the booking portal renders them; `docs/API.md` §7 is the contract.

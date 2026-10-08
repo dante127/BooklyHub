@@ -820,72 +820,108 @@ from `X-Tenant-Id` (or from the authenticated context when there is one), and bo
 with no token and no header. One caller does not reach that guard: the **platform administrator** (whose sign-in
 carries no `tenant_id` claim) with no
 `X-Tenant-Id` header is authenticated, names no tenant, and `TenantResolutionMiddleware.cs:37` hands it `Guid.Empty`
-with `isPlatformAdmin: true`. The read is then filtered against a tenant id no row carries, so it answers `200 []` —
-measured on the deployed stack, an empty array against a database seeded with three tenants and their catalogs. No
+with `isPlatformAdmin: true`. The read is then filtered against a tenant id no row carries, so it answers an empty
+page — measured on the deployed stack as `200 []`, against a database seeded with three tenants and their catalogs
+(the deployed image predates the paging below, so its body is the bare array; the same call against this code is
+`{"total":0,"page":1,"pageSize":20,"items":[]}`). No
 rows leak, but a client that reads an empty catalog as "this clinic has no services" is reading its own missing
 header. Send the header.
 
 ### `GET /api/v1/services`
 The bookable service list.
 
-**Query parameters:** `categoryId` (optional GUID). **No paging** — the response is the tenant's whole active
-catalog, ordered by `Name`.
+**Query parameters:** `categoryId` (optional GUID), `page` (default 1) and `pageSize` (default 20, bounded by the
+same `Paging` rule §8 describes). Ordered by `Name`, then `Id`.
 
-**Response (200 OK)** — a bare JSON array, not an envelope:
+**Response (200 OK)** — `{ total, page, pageSize, items }`, the customer and review lists' shape:
 ```json
-[
-  {
-    "id": "4c919d69-2dcd-4ae2-ae65-a9c77d442164",
-    "name": "Consult",
-    "description": "A consult",
-    "durationMinutes": 30,
-    "price": 100.00,
-    "currency": "USD",
-    "bufferBeforeMinutes": 0,
-    "bufferAfterMinutes": 0,
-    "categoryName": null
-  }
-]
+{
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "items": [
+    {
+      "id": "4c919d69-2dcd-4ae2-ae65-a9c77d442164",
+      "name": "Consult",
+      "description": "A consult",
+      "durationMinutes": 30,
+      "price": 100.00,
+      "currency": "USD",
+      "bufferBeforeMinutes": 0,
+      "bufferAfterMinutes": 0,
+      "categoryName": null
+    }
+  ]
+}
 ```
 Only `IsActive` services appear, and `categoryName` is the joined label — `null` for an uncategorized service. The
 three fields a booking portal has to get right are here deliberately: `durationMinutes` is what the slot is sized
 to, and `bufferBeforeMinutes`/`bufferAfterMinutes` are what the availability guard widens it by, so a calendar that
 renders only the duration will offer slots the booking route then refuses.
 
+**This route used to answer a bare array of the tenant's whole catalog (`PERF-04`'s residue).** There was no `Take`
+in the old code and no ceiling to fall back on, so the body was however many services the tenant had loaded —
+measured on one fixture at 120 services: **25,561 B** in a single array, where the page this route answers now is
+**4,306 B** and the largest page any caller can ask for is 100 rows (**21,347 B**). A portal that shows twenty had to
+fetch and parse all of them. It pages now, on the numbers the rest of the API already uses: 20 by default, at most
+100 in a page, `total` stating the size of the whole catalog so nothing is hidden by the split.
+`CatalogPagingTests` (5 facts) measures the envelope, the clamps (`?page=0`, `?pageSize=5000`, `?page=2147483647`
+all answer a page rather than a fault), the walk — `?pageSize=100` reaches all 120 rows and each exactly once — and
+the `ORDER BY` the server actually sends, which has to end on `Id` because a name is not unique.
+
 ### `GET /api/v1/staff`
 The staff directory, with what each member offers.
 
 **Query parameters:** `locationId`, `serviceId` — both optional GUIDs, and `serviceId` matches through the
-`StaffServices` join, so it answers "who can perform this service". **No paging.** Ordered by `LastName`.
+`StaffServices` join, so it answers "who can perform this service". `page` (default 1) and `pageSize` (default 20,
+the same `Paging` rule). Ordered by `LastName`, then `FirstName`, then `Id`.
 
-**Response (200 OK)** — a bare JSON array:
+**Response (200 OK)** — `{ total, page, pageSize, items }`:
 ```json
-[
-  {
-    "id": "0ce79108-3015-481c-8bcf-1e5df1423933",
-    "firstName": "Ava",
-    "lastName": "Doc",
-    "title": "Dr",
-    "bio": "bio",
-    "email": "ava@probe.test",
-    "phoneNumber": "+1",
-    "colorHex": "#FFF",
-    "locationId": "7b1ce065-0eaf-41ef-902e-6cdfda8ba21b",
-    "offeredServices": [
-      {
-        "serviceId": "4c919d69-2dcd-4ae2-ae65-a9c77d442164",
-        "serviceName": "Consult",
-        "customDuration": null,
-        "customPrice": null
-      }
-    ]
-  }
-]
+{
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "items": [
+    {
+      "id": "0ce79108-3015-481c-8bcf-1e5df1423933",
+      "firstName": "Ava",
+      "lastName": "Doc",
+      "title": "Dr",
+      "bio": "bio",
+      "email": null,
+      "phoneNumber": null,
+      "colorHex": "#FFF",
+      "locationId": "7b1ce065-0eaf-41ef-902e-6cdfda8ba21b",
+      "offeredServices": [
+        {
+          "serviceId": "4c919d69-2dcd-4ae2-ae65-a9c77d442164",
+          "serviceName": "Consult",
+          "customDuration": null,
+          "customPrice": null
+        }
+      ]
+    }
+  ]
+}
 ```
 Only `IsActive` members appear. `customDuration`/`customPrice` are the per-staff overrides; when they are `null` the
 service's own `durationMinutes` and `price` are what the slot uses, which is the same precedence
-`GET /api/v1/availability` computes with. Note that this anonymous route returns `email` and `phoneNumber` for every
-active member of the tenant — a directory, not a masked list.
+`GET /api/v1/availability` computes with.
+
+**`email` and `phoneNumber` are `null` unless the caller holds `staff.read` (`API-08` closed).** This route is
+`[AllowAnonymous]` and takes the tenant from a header, so until now any caller who could name a tenant slug got a
+directory of contact addresses and phone numbers for its whole active roster, with no token in the request. The gate
+is the same requirement the authorized staff routes carry (`Permissions.Staff.Read`, `CatalogControllers.cs`),
+evaluated per request rather than declared on the action, because the action still has to answer anonymously. The
+keys stay in the body with a `null` value so a portal parses one contract whatever its caller — `StaffContactDisclosureTests`
+asserts the seeded address appears nowhere in the anonymous body — and the fields the public picker renders
+(`firstName`, `lastName`, `title`, `bio`, `colorHex`, `offeredServices`) are unaffected. Measured on one fixture of 40
+rostered members: the old anonymous answer was a bare array of **11,671 B** and its text contains the seeded
+`@probe.test` address; the same 40 rows, paged and gated, are **9,406 B** with no contact text in them. A tenant's own
+`TenantOwner`, `TenantAdmin`, `Manager`, `Staff` and `Receptionist` tokens all hold `staff.read` and read the
+contact details exactly as before; an `Accountant` token, which does not, loses them. Deleting the two fields was
+refused for that reason: this is the only route that reads staff contact details, and the clinic needs them.
 
 ---
 
@@ -933,10 +969,11 @@ builds exceed its 4,000-character ceiling and the route answered `500`.
 }
 ```
 **This is the other pagination envelope.** The appointment list and the collection queue answer `PaginatedList<T>`
-(`items`, `pageNumber`, `pageSize`, `totalCount`, `totalPages`, `hasNextPage`, `hasPreviousPage`); the customer and
-review lists answer `{ total, page, pageSize, items }` — the same idea under different member names, and a client
-that reads `totalCount` off this response reads a field that is not there. Recorded rather than renamed: two shapes
-is a wart, and changing a live field name from a documentation commit is worse than writing the wart down.
+(`items`, `pageNumber`, `pageSize`, `totalCount`, `totalPages`, `hasNextPage`, `hasPreviousPage`); the customer list,
+the review wall and the two catalog reads (§7) answer `{ total, page, pageSize, items }` — the same idea under
+different member names, and a client that reads `totalCount` off this response reads a field that is not there.
+Recorded rather than renamed: two shapes is a wart, and changing a live field name from a documentation commit is
+worse than writing the wart down.
 
 **`page` and `pageSize` are bounded by one rule (`Paging`, `PAG-01` closed).** `?page=0` used to answer `500` with
 the contact-support text, `?pageSize=-5` answered `500`, and `?pageSize=100000` was honoured exactly as asked — a
@@ -947,6 +984,10 @@ page 1, a size outside 1..100 is the default 20, and the offset is multiplied in
 `int.MaxValue`, so a page past the end of the book is an empty page instead of a server fault. The `page` and
 `pageSize` this response echoes are the values that were **applied**, which is what makes `?page=0` and `?page=1`
 answer alike rather than looking alike.
+
+**Six routes sit behind that rule.** The §7 catalog reads joined when `PERF-04`'s residue closed, and the same three
+asks are measured on them: `?page=0`, `?pageSize=5000` and `?page=2147483647` each answer a page of 20 — not a fault,
+and not the whole table (`CatalogPagingTests`).
 
 ### `POST /api/v1/customers`
 Adds a row to the book.

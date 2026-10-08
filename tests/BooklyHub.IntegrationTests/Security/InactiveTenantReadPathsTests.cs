@@ -185,7 +185,7 @@ public class InactiveTenantReadPathsTests : IClassFixture<BooklyHubWebApplicatio
         reviews.StatusCode.Should().Be(HttpStatusCode.OK, await reviews.Content.ReadAsStringAsync());
     }
 
-    /// <summary>Both catalog routes answer a bare array of rows, not an envelope — that is also the PERF-04 residue.</summary>
-    private static List<Guid> IdsOf(JsonElement array) =>
-        array.EnumerateArray().Select(i => i.GetProperty("id").GetGuid()).ToList();
+    /// <summary>Both catalog routes page since PERF-04's residue closed, so the ids a caller reads are in `items`.</summary>
+    private static List<Guid> IdsOf(JsonElement envelope) =>
+        envelope.GetProperty("items").EnumerateArray().Select(i => i.GetProperty("id").GetGuid()).ToList();
 }

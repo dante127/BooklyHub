@@ -178,9 +178,13 @@ public class TenantRefusalTests : IClassFixture<BooklyHubWebApplicationFactory>
         var anonymous = _factory.CreateClient();
         anonymous.DefaultRequestHeaders.Add("X-Tenant-Id", Guid.NewGuid().ToString());
 
-        var catalog = await anonymous.GetAsync("/api/v1/services");
-        catalog.StatusCode.Should().Be(HttpStatusCode.OK, await catalog.Content.ReadAsStringAsync());
-        (await catalog.Content.ReadAsStringAsync()).Should().Be("[]",
+        var catalog = await ReadAsync(await anonymous.GetAsync("/api/v1/services"));
+        catalog.Status.Should().Be(200);
+        // PERF-04's residue: this route used to answer a bare `[]` (the tenant's whole catalog, unbounded). An
+        // unknown tenant is still an empty page, but now it is an empty page inside the envelope.
+        catalog.HasField("items").Should().BeTrue("a paginated object, not a bare array");
+        catalog.Body.GetProperty("total").GetInt32().Should().Be(0);
+        catalog.Body.GetProperty("items").GetArrayLength().Should().Be(0,
             "an unknown tenant is an empty page, not a refusal - the guard is about resolution, not existence");
 
         var customers = await ReadAsync(await _factory
