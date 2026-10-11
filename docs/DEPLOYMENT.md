@@ -414,10 +414,12 @@ Stated as the handover conversation needs it, not as a defect list. Each item na
 3. **No message delivery.** `Notifications:Provider=None` sends nothing, so **reminders never leave the process
    and outbox messages pile up unprocessed with their reason in `Error`**. That pile is bounded by nothing —
    a deployment running `None` for months accumulates dead-letter rows that retention deliberately keeps (§6).
-4. **The calendars are empty.** `Holidays`, `BusinessHours` and `AvailabilityExceptions` have **no route and no
-   seed**, and `Holidays` has no writer in `src` at all, so the booking guard's holiday and exception checks are
-   enforcing a calendar nobody can currently maintain. Only `WorkingHour` rows exist, and only because the demo
-   block writes them (`CAL-01`, `BL-01`'s residual).
+4. **The calendars start empty.** `Holidays`, `BusinessHours` and `AvailabilityExceptions` have routes since `CAL-01`
+   (`api/v1/calendar`, behind `schedules.manage`) and **no seed**, so nothing in a fresh deployment closes a day,
+   states opening hours or blocks a staff member until a manager writes it. Only `WorkingHour` rows appear on their
+   own, and only when `Seed:DemoTenants` is on. A tenant that never writes its week is not broken — it answers every
+   day the way an unscheduled roster does, `isOpen: true` with `slots: []` (measured in `CalendarWriteGuardTests`),
+   because only a holiday or a not-bookable service produces `isOpen: false` (`SCHEDULING-ENGINE.md` §4).
 5. **Reviews are auto-published and unmoderated**, with no check that the reviewer attended the visit
    (`BL-08`): `Review.Create` sets `IsVerified` and `IsPublished` true and there is no unpublish route.
 6. **A recurring series cannot be replayed.** `RecurringAppointment` persists no service, staff, location or

@@ -325,6 +325,175 @@ reason. `SlotUnavailableReason` (`Closed`, `StaffNotAvailable`, `OutsideBookingW
 `ResourceUnavailable`) is what the guard answers with internally and what the recurring creation reports per skipped
 occurrence; on this endpoint its only visible effect is the empty list.
 
+### The calendar the engine reads (`CAL-01`)
+
+`LoadCalendarAsync` decides a day from three tables before it looks at one appointment: **holidays** (which dates the
+tenant is closed), **business hours** (the location's opening window), and **availability exceptions** (one staff
+member's time off). Until the routes below existed, nothing in `src` wrote any of them — the guard's
+`SlotUnavailableReason.Closed` had exactly one producer, `closedDates`, built from a table no code path could fill, so
+on a deployed database the close-check was dead code and closing a day meant an `INSERT` by hand, outside every
+permission and every validation. Reads here need `schedules.read`, writes need `schedules.manage` (so a
+receptionist can look at the calendar and cannot declare a closure), and every one of them is tenant-scoped: a row
+belonging to another tenant answers `404`, not `403`.
+
+Two of the three tables have a reader that is conditional, and the documents below state which condition, because a
+client that writes a row the engine never looks at has been told a lie about what it did.
+
+### `GET /api/v1/calendar/holidays`
+The tenant's closures, soonest-date-first (`date`, then `id`), in the flat pagination envelope (§8).
+
+**Query Parameters:**
+- `from`, `to` (DateOnly `yyyy-MM-dd`, optional) — a window of days that *can* be closed, not a window of anchor dates.
+  An annually-recurring row is in the answer whatever year it was anchored in, because that is the predicate the
+  guard itself uses (`AvailabilityService.cs:485`): it matches month and day, so the row recorded in 2024 is what
+  closes the 2026 date being asked about. Filtering recurring rows by their anchor would hide from a manager the one
+  closure they are looking at.
+- `locationId` (Guid, optional) — which closures **apply** at that location, so tenant-wide rows (`locationId: null`)
+  are included alongside the location's own.
+- `page`, `pageSize` — `Paging`, one rule for every paged list (§8).
+
+**Response (200 OK):**
+```json
+{
+  "total": 2,
+  "page": 1,
+  "pageSize": 20,
+  "items": [
+    { "id": "6f7a1e2b-3c4d-5e6f-7a8b-9c0d1e2f3a4b", "locationId": null, "name": "National day", "date": "2026-12-25", "recurringAnnually": true },
+    { "id": "b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e", "locationId": "2b8f1e2c-4d6a-8b0c-1e3f-5a7b9c1d3e5f", "name": "Branch maintenance", "date": "2026-12-31", "recurringAnnually": false }
+  ]
+}
+```
+
+### `POST /api/v1/calendar/holidays`
+Declares a closure. **Permission:** `schedules.manage`. `Idempotency-Key` applies as it does to every state-changing
+`POST` (§1), and a retry replays the first `201` instead of reaching the duplicate rule.
+
+**Body:** `locationId` (Guid or `null` for every location of the tenant), `name` (1–150 characters), `date`
+(`yyyy-MM-dd`), `recurringAnnually` (bool).
+
+**Response (201 Created):** the row, in the same shape the list projects. The `Location` header names the collection,
+not the row — there is no `GET` by holiday id.
+
+**The bounds, and why each one is a refusal rather than a default:**
+- A **non-recurring** date in the past is `400`. `closedDates` is built from the loaded window — the asked day and its
+  two buffer neighbours — so a dated row behind it closes nothing, and a `201` for it would be a promise the guard
+  cannot keep. A **recurring** row may be anchored in the past: that is the normal shape, and refusing it would make
+  the route unusable for the one case it exists for.
+- More than 3,650 days ahead is `400`. Nothing rejects a dated anchor *inside* that horizon, and the guard's read is
+  bounded by the window, not by the anchor (`PERF-05` measured the annual-holiday read and closed it as
+  measured-and-refused).
+- The same date in the same scope is `422` with `rule: "HolidayAlreadyOnThisDate"`. `locationId: null` and a
+  `locationId` are two different statements, so a tenant-wide closure and a branch closure on one date are both
+  accepted, and both are read.
+- Two concurrent `POST`s of the same date can both land: there is no unique index on `Holidays`, and the duplicate
+  check is a read. Recorded rather than fixed, because the effect of a second identical row is the day being closed —
+  the same thing the first row did. A migration that made it impossible is the other answer, and it is not free.
+
+### `DELETE /api/v1/calendar/holidays/{id}`
+**Permission:** `schedules.manage`. `204` and the day opens again — `AvailabilityService` reads the table on every
+call, so there is nothing to invalidate. The row is deleted outright; these tables carry no soft delete.
+
+### `GET /api/v1/calendar/business-hours`
+The location's opening week. **Query Parameter:** `locationId` (Guid, required).
+
+**Response (200 OK):**
+```json
+{
+  "locationId": "2b8f1e2c-4d6a-8b0c-1e3f-5a7b9c1d3e5f",
+  "timeZoneId": "Asia/Damascus",
+  "days": [
+    { "dayOfWeek": "Monday", "openTime": "09:00:00", "closeTime": "17:00:00", "isClosed": false },
+    { "dayOfWeek": "Saturday", "openTime": "09:00:00", "closeTime": "13:00:00", "isClosed": false }
+  ]
+}
+```
+Not paged, and not a paging rule waiting for a number: at most one row per day of the week is seven. `Time` values are
+`TimeSpan` on the wire (`hh:mm:ss`) and are wall-clock times **in the location's own zone**, which is what
+`TimeZoneId` in the same response is for; the engine converts them to UTC per date.
+
+### `PUT /api/v1/calendar/business-hours`
+Writes the named days of that week. **Permission:** `schedules.manage`.
+
+**Body:** `locationId` (Guid, required) and `days`, one to seven entries of
+`{ dayOfWeek, openTime, closeTime, isClosed }`.
+
+**Response (200 OK):** the whole stored week for that location, in the `GET` shape above — including the days this
+call did not name, which is how a client learns what it left alone.
+
+**Days that are not named are not touched.** This is a `PUT` that upserts the days it is told, and that is deliberate:
+a `PUT` that replaces the whole week would turn a client that sends Monday to Friday into a clinic that closed its
+Saturday without ever being asked. To close a day, name it with `isClosed: true`.
+
+**What the engine actually does with these rows, stated plainly.** `AvailabilityService` reads `BusinessHours` in one
+condition only: a staff member's roster row for that weekday carries break intervals and **no** working interval
+(`AvailabilityService.cs:559-562`), and the opening hours then supply the shift. For a roster row with its own working
+window, this table changes nothing about booking, and `isClosed: true` rows are filtered out of the read entirely. So
+a `200` here is not a claim that the day got quieter — the levers that close a day for everyone are a holiday and an
+absence, and an empty preview is `isOpen: true` with `slots: []`, which is "open, nobody here", not "closed".
+
+**Refusals:** a day named twice (`400` — two rows for one weekday is two answers to the same question), more than
+seven entries, a time that is not a whole minute, a time at or past `24:00`
+(`1.00:00:00` in `TimeSpan`'s own spelling) — the engine turns this value into a `TimeOnly`, which folds `24:00` back
+to `00:00` and would silently delete the window the caller wrote — and a `closeTime` that is not after `openTime`
+unless the day is closed.
+
+### `GET /api/v1/calendar/availability-exceptions`
+Absences, soonest-first, in the flat envelope (§8).
+
+**Query Parameters:** `staffId` (Guid, optional), `fromUtc` / `toUtc` (ISO-8601, optional — the window a block has to
+*overlap*), `page`, `pageSize`.
+
+**Response (200 OK):**
+```json
+{
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "items": [
+    {
+      "id": "c3d4e5f6-a7b8-9c0d-1e2f-3a4b5c6d7e8f",
+      "staffId": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b",
+      "staffName": "Ava Clinic",
+      "startAtUtc": "2026-10-12T06:00:00Z",
+      "endAtUtc": "2026-10-12T10:00:00Z",
+      "isAvailable": false,
+      "reason": "Sick leave"
+    }
+  ]
+}
+```
+With no `fromUtc`, the list defaults to blocks that **have not ended yet**. That is not decoration: this API refuses
+to write an absence that already ended, so a default that opened on the past would page through rows that block
+nothing. Hand-written history is still in the table, and an explicit `fromUtc` reaches it — measured in
+`CalendarWriteGuardTests` at 45 rows in, 40 through the default, 45 with the bound.
+
+### `POST /api/v1/calendar/availability-exceptions`
+Blocks a staff member's time. **Permission:** `schedules.manage`. `Idempotency-Key` applies (§1).
+
+**Body:** `staffId` (Guid), `startAtUtc`, `endAtUtc` (instants; the three shapes §4 accepts, `…AtUtc` read as UTC),
+`isAvailable` (must be `false`), `reason` (optional, ≤300 characters).
+
+**Response (201 Created):** the row, in the list's item shape, with every instant labelled `Z` (§4).
+
+**`isAvailable: true` is refused with `400`, and this is the sharpest statement in this section.** The entity carries
+two halves — time off, or a custom shift — and the engine builds its blocked list from `!IsAvailable` rows only
+(`AvailabilityService.cs:566-568`); it never reads a `true` row as working time. Accepting `true` would store a row
+no reader looks at and answer `201` for it, which is a route that lies. The refusal message says *no reader*, and the
+test proves the row was not written on the way to the refusal. The day after the mutation that removes the rule, the
+same call answers `201` and the extra shift books nothing.
+
+**Refusals:** a staff member outside the caller's tenant (`404`); `endAtUtc` not after `startAtUtc`, a span over
+**92 days** (`400` — the block joins every calendar load that overlaps it, so a year-long row is a permanent tax on
+the read); a block that has already ended (`422`, `rule: "ExceptionAlreadyPast"`). Overlapping blocks are **allowed**
+and no dedup is attempted: the guard unions the blocked intervals, so two rows that cover the same hour change the
+same answer.
+
+### `DELETE /api/v1/calendar/availability-exceptions/{id}`
+**Permission:** `schedules.manage`. `204`, and the hours come back. This is the undo a clinic needs when an absence was
+recorded against the wrong person, and it is the reason the absence facts are asserted in both directions: the write
+takes the slots away from the preview *and* makes the guard refuse the booking, the delete gives them back to both.
+
 ---
 
 ## 4. Appointments
@@ -970,10 +1139,10 @@ builds exceed its 4,000-character ceiling and the route answered `500`.
 ```
 **This is the other pagination envelope.** The appointment list and the collection queue answer `PaginatedList<T>`
 (`items`, `pageNumber`, `pageSize`, `totalCount`, `totalPages`, `hasNextPage`, `hasPreviousPage`); the customer list,
-the review wall and the two catalog reads (§7) answer `{ total, page, pageSize, items }` — the same idea under
-different member names, and a client that reads `totalCount` off this response reads a field that is not there.
-Recorded rather than renamed: two shapes is a wart, and changing a live field name from a documentation commit is
-worse than writing the wart down.
+the review wall, the two catalog reads (§7) and the two calendar lists (§3) answer `{ total, page, pageSize, items }` —
+the same idea under different member names, and a client that reads `totalCount` off this response reads a field that
+is not there. Recorded rather than renamed: two shapes is a wart, and changing a live field name from a documentation
+commit is worse than writing the wart down.
 
 **`page` and `pageSize` are bounded by one rule (`Paging`, `PAG-01` closed).** `?page=0` used to answer `500` with
 the contact-support text, `?pageSize=-5` answered `500`, and `?pageSize=100000` was honoured exactly as asked — a
@@ -985,9 +1154,11 @@ page 1, a size outside 1..100 is the default 20, and the offset is multiplied in
 `pageSize` this response echoes are the values that were **applied**, which is what makes `?page=0` and `?page=1`
 answer alike rather than looking alike.
 
-**Six routes sit behind that rule.** The §7 catalog reads joined when `PERF-04`'s residue closed, and the same three
-asks are measured on them: `?page=0`, `?pageSize=5000` and `?page=2147483647` each answer a page of 20 — not a fault,
-and not the whole table (`CatalogPagingTests`).
+**Eight routes sit behind that rule.** The §7 catalog reads joined when `PERF-04`'s residue closed, and the two §3
+calendar lists joined when `CAL-01` wrote them, because a tenant that declares two closures a year for a decade has
+grown a list route like any other. The same three asks are measured on all of them: `?page=0`, `?pageSize=5000` and
+`?page=2147483647` each answer a page of 20 — not a fault, and not the whole table (`CatalogPagingTests`,
+`CalendarWriteGuardTests`).
 
 ### `POST /api/v1/customers`
 Adds a row to the book.

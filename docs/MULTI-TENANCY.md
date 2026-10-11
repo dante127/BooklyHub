@@ -40,7 +40,7 @@ The `TenantResolutionMiddleware` runs at the front of the HTTP pipeline and esta
 3. **Tenant Existence & Status Check**: There is none in this middleware. It makes no database call, and the global
    query filter only adds `!IsDeleted` (`ApplicationDbContext.cs:83-129`), never `IsActive`. What actually happens
    is measured in `InactiveTenantReadPathsTests`: the one read path that asks whether the tenant is active is the
-   availability service (`AvailabilityService.cs:405-414`), and it does not refuse the request — it answers a
+   availability service (`AvailabilityService.cs:413-422`), and it does not refuse the request — it answers a
    normal `200` with `isOpen: false` and an empty `slots` array, because its own rule set already has a
    "not bookable" shape. Every other anonymous read (`/api/v1/staff`, `/api/v1/services`, `/api/v1/reviews`) filters
    on the **row's** `IsActive` and answers a switched-off tenant's rows unchanged. An invalid or inactive tenant is

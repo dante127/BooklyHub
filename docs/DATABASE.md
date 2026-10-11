@@ -110,7 +110,7 @@ seeded volume; 300 without the `INCLUDE` set, 306 with no index at all).
 | Index Name | Columns | Purpose |
 | :--- | :--- | :--- |
 | `IX_WorkingHours_Tenant_Staff_DayOfWeek` | `(TenantId, StaffId, DayOfWeek)` | Resolving daily shift intervals. |
-| `IX_AvailabilityExceptions_Tenant_Staff_TimeRange` | `(TenantId, StaffId, StartDateTimeUtc, EndDateTimeUtc)` | Overriding holidays, vacations, and sick leaves. |
+| `IX_AvailabilityExceptions_Tenant_Staff_TimeRange` | `(TenantId, StaffId, StartDateTimeUtc, EndDateTimeUtc)` | Time off that blocks a staff member's slots. The guard reads the `IsAvailable = 0` rows only — the override half has no reader, which is why `POST /api/v1/calendar/availability-exceptions` refuses it (`SCHEDULING-ENGINE.md` §4). |
 | `IX_Holidays_TenantId_Date` | `(TenantId, Date)` INCLUDE `(LocationId, RecurringAnnually)` | The booking guard's calendar-close read. |
 
 The guard asks Holidays one question per availability answer:
@@ -134,11 +134,13 @@ both, across the six distributions in `PERFORMANCE.md` §7). The read has to ret
 the index says, and they are not a prefix of anything, so a second key order buys no pages. One more column order for no
 measured page saved is not a fix; it was left out.
 
-One honest limit on all of the above: **nothing in `src` writes a `Holiday` row.** `AvailabilityService` reads the table
-and no command, controller, or seeder inserts into it, so every deployment today answers this read against an empty
-table, where scan and seek are indistinguishable. The 40,040-row pair is seeded by `HolidayIndexTests` itself; the
+One honest limit on the measurement, and no longer one on the code: when this was costed, **nothing in `src` wrote a
+`Holiday` row** — `AvailabilityService` read the table and no command, controller, or seeder inserted into it — so every
+deployment answered this read against an empty table, where scan and seek are indistinguishable. `CAL-01` has since
+given the table a writer (`POST /api/v1/calendar/holidays`), so the read now costs what it was costed at on any
+deployment that maintains its calendar. The 40,040-row pair is seeded by `HolidayIndexTests` itself; the
 200,040-row pair came from the same replay at a heavier fill, written down in `PERFORMANCE.md` §7. The index is what the
-read costs once `CAL-01` gives the calendars a way to be populated, and the read is on the anonymous availability path —
+read costs once the calendars are populated, and the read is on the anonymous availability path —
 a full-table scan per public request is not a cost worth discovering later.
 
 Pinned by `HolidayIndexTests`, which asserts the covered shape in `sys.index_columns`, drives the real guard over the

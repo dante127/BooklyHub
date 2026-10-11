@@ -50,11 +50,14 @@ GROUP BY [Status];
 Measured at `c67480f`, because this section previously claimed "all list endpoints enforce standardized pagination"
 with a page size "capped at `50`", and neither was true:
 
-- **Six routes are paged, and all six go through one rule.** `GET /api/v1/customers`, `GET /api/v1/reviews`,
+- **Eight routes are paged, and all eight go through one rule.** `GET /api/v1/customers`, `GET /api/v1/reviews`,
   `GET /api/v1/appointments` and `GET /api/v1/payments/outstanding-visits` normalize through
   `Paging.NormalizePage` / `NormalizePageSize` / `Offset`, and since the last half of `PERF-04` closed so do the two
-  anonymous catalog reads, `GET /api/v1/services` and `GET /api/v1/staff`. The ceiling is **100** with a default of
-  **20**, not 50 (`Paging.cs:5-6`), and an out-of-range ask falls back to the default rather than to the ceiling.
+  anonymous catalog reads, `GET /api/v1/services` and `GET /api/v1/staff`. The two calendar lists `CAL-01` introduced
+  (`GET /api/v1/calendar/holidays`, `GET /api/v1/calendar/availability-exceptions`) were written on the rule from the
+  start, so a tenant that declares closures for a decade gets a page rather than a growing array. The ceiling is
+  **100** with a default of **20**, not 50 (`Paging.cs:5-6`), and an out-of-range ask falls back to the default rather
+  than to the ceiling.
 - **The two catalog reads used to be the routes with no bound at all.** They answered a bare array with no `page`,
   `pageSize` or `Take` (`CatalogControllers.cs`), so their size was bounded only by how many rows a tenant had
   loaded: on one fixture, 120 services arrived as **25,561 B** and 40 staff as **11,671 B**, in one request, to an
@@ -131,7 +134,7 @@ service in-process answers `NotBookable` and measures nothing), 11 samples with 
 |---|---|---|---|
 | 15 min (the default, `TenantSetting.DefaultSlotIntervalMinutes`) | 96 | 6.9 ms | 6.3 ms |
 | 5 min | 288 | 6.9 ms | 9.1 ms |
-| 1 min (the floor `AvailabilityService.cs:451` allows) | 1440 | 8.4 ms | 10.5 ms |
+| 1 min (the floor `AvailabilityService.cs:459` allows) | 1440 | 8.4 ms | 10.5 ms |
 
 Fifteen times the grid buys 1.5 ms on an empty day and 4.2 ms on a busy one, so the starts the shift check rejects —
 the "dead work" — are not what the request costs. The candidate-staff roster is: 1 staff → 8.1 ms / 6.7 KB,
@@ -187,7 +190,7 @@ bounded anyway.
 `PERF-05` asked for `RecurringAnnually` in the holiday index's key. Replaying the guard's own statement against seeded
 volume said the key was fine and the *coverage* was not: the predicate has one equality (`TenantId`) and the OR supplies
 no seekable range, so what the read pays for is the two columns it needs after landing on the tenant's rows.
-`SET STATISTICS IO` on the statement `AvailabilityService.cs:468` sends, median of four passes after one warm-up, each
+`SET STATISTICS IO` on the statement `AvailabilityService.cs:476` sends, median of four passes after one warm-up, each
 distribution re-seeded and `UPDATE STATISTICS … WITH FULLSCAN`:
 
 | Tenant rows (recurring) | Table rows | `(TenantId, Date)` | + `INCLUDE (LocationId, RecurringAnnually)` | `(TenantId, RecurringAnnually, Date)` INCLUDE `(LocationId)` |
@@ -219,13 +222,16 @@ Three things this measurement nearly got wrong, recorded because §5's list was 
    something else; the recurring share is what the read returns, and it returned exactly that once the counter was
    reset per pass.
 
-A one-day availability request is not a one-day holiday read: `AvailabilityService.cs:108-113` loads the calendar for
+A one-day availability request is not a one-day holiday read: `AvailabilityService.cs:109-113` loads the calendar for
 `{Date-1, Date, Date+1}` because a slot's buffers can reach over local midnight, so `@firstDate`/`@lastDate` arrive as a
 three-day window. That is the shape the index was costed against.
 
-And the limit on all of it, stated where it can be found and not where it is flattering: **no code in `src` writes a
-`Holiday` row** — `AvailabilityService.cs:468` is the only reader, and there is no command, route, or seeder that
-inserts one. Every deployed `Holidays` table is empty, so this index changes nothing until `CAL-01` gives the calendars
-a way to be populated. It was still worth the one migration: it is the narrowest shape §5 allows (same key, two narrow
+The limit on all of it **at measurement time**, stated where it can be found and not where it is flattering: `CAL-01`
+was still open, so no code in `src` wrote a `Holiday` row — `AvailabilityService.cs:476` was the only reader and there
+was no command, route, or seeder that inserted one. Every deployed `Holidays` table was empty and this index changed
+nothing on a real request. That half has since closed: `POST /api/v1/calendar/holidays` writes exactly the rows this
+read serves, so the empty-table excuse no longer applies to a deployment that maintains its calendar. It was still
+worth the one migration: it is the narrowest shape §5 allows (same key, two narrow
 included columns, no new index), the read sits on the anonymous path, and the day a tenant's calendar stops being empty
-is not the day to discover that the guard reads the whole table per request.
+is not the day to discover that the guard reads the whole table per request — and since `CAL-01` that day is one route
+call from a manager, not a database edit from an operator.
