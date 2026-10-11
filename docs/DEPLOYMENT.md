@@ -82,7 +82,7 @@ render a deployment that leaves one unset — that check happens client-side, be
 | `PAYMENTS_PROVIDER` | `Payments:Provider` | **yes in Production** | `None` (the default) charges nothing and answers every charge `422 PaymentFailed` naming its own configuration key, writing no ledger row. `Simulated` is the only other value and **Production refuses it** — it answers `Paid` with a synthetic `txn_sim_*` id. A real gateway implements the provider interface and names it here. |
 | `NOTIFICATIONS_PROVIDER` | `Notifications:Provider` | **yes in Production** | `None` sends nothing and every send throws, which leaves a reminder **unrecorded** and an outbox message **unprocessed with its reason in `Error`** — that is the point: a completed task is the only thing a caller reads as "it left". `Simulated` logs `[... DISPATCHED]` and returns success, and Production refuses it. |
 | `SEED_ADMIN_EMAIL`, `SEED_ADMIN_PASSWORD` | `Seed:AdminEmail`, `Seed:AdminPassword` | **yes, on the first seeding run** | The platform administrator. An empty email refuses the run before it writes anything, naming the key (`ProductionSeedTests`). |
-| `SEED_DEMO_TENANTS` | `Seed:DemoTenants` | no (default `false`) | `false` seeds roles, permissions and the administrator only — **zero tenants**. `true` adds the scripted demo: Apex Dental, Luxe Salon, Pulse Fitness with their staff and invented patients. Read on the **first** run only; on a database that already has reference rows, flipping it later is a logged no-op (§4). |
+| `SEED_DEMO_TENANTS` | `Seed:DemoTenants` | no (default `false`) | `false` seeds roles, permissions and the administrator only — **zero tenants**. `true` adds the scripted demo: Apex Dental, Luxe Salon, Pulse Fitness with their staff and invented patients. Read on the **first** run only; on a database that already has an administrator, flipping it later is a logged no-op (§4). |
 | `ALLOWED_HOSTS` | `AllowedHosts` | no (default `*`) | The `Host` values the site answers on. `*` admits every host and installs no narrowing. **`*` is the safe default only in the sense that it is the old behaviour**: it answers any `Host` header, so name your real domain in production. Spellings the matcher cannot honour (a space inside an entry, `*a.test`, `*` beside a name) **refuse to start** rather than lock out traffic — §3 has the measured table. |
 | `HTTPS_REDIRECT_PORT` | `HttpsRedirection:Port`, or `ASPNETCORE_HTTPS_PORT` | no (default unset) | Left unset, no redirect middleware is installed. Set, every plain-HTTP request is redirected to that port — **including `/health/live`**, which then answers `307` (§3). A non-port value (hex, a sign, `4,43`, out of range) refuses startup, because a redirect asked for and silently not installed is a deployment that believes it redirects. |
 | `FORWARDING_KNOWN_PROXIES` | `Forwarding:KnownProxies` | no (default unset) | The **address** of the proxy that writes `X-Forwarded-For`. Without it every caller behind one proxy shares the global 100/min and the auth 10/min buckets, so one anonymous caller can lock the sign-in door for the whole deployment. A host *name* is refused at startup; give the address the connections actually arrive from. `Forwarding:KnownNetworks` takes CIDR blocks for a proxy whose address moves. |
@@ -155,44 +155,167 @@ dotnet run --project src/BooklyHub.Api -- --migrate-only  # the same step, on a 
 `AutoMigrateAndSeed=true` runs the same block and then serves. Failures are unhandled on purpose, so a broken
 schema produces a non-zero exit instead of traffic.
 
-Seeding is **one-shot by design**. The sentinel is "has this database got its permissions rows yet", which is the
-first thing the method writes unconditionally. Measured on the second run of a fresh stack:
+Seeding has two halves with two different lifetimes: **reference data converges on every run**, the administrator and
+the scripted demo are written once. The sentinel for "already seeded" is deliberately not "does this database have
+permission rows" — a convergent pass writes those on every run, so that question would answer true before anybody
+could sign in. It is "does it have a user holding the `PlatformAdmin` role" (`DatabaseSeeder.cs:42-52`), measured on
+one host across three consecutive `--migrate-only` runs against one database:
 
 ```
-[11:06:57 INF] Database already seeded. Skipping initial seeding.
+[11:00:23 INF] [] Reconciled reference data: 27 permission(s), 7 role(s) and 133 grant(s) added.
+[11:00:23 INF] [] Seeding the platform administrator (no demo tenants)...
+[11:00:23 INF] [] Seeded reference data and the platform administrator; no demo tenants created.
+[10:58:34 INF] [] Database already seeded. Skipping the administrator and the demo half.   # every run after
 ```
 
 and the migrator container exits 0. This is why `SEED_DEMO_TENANTS` is read once: an operator who runs the stack
-with the default, then flips it to `true` and brings it up again, gets the log line above and no demo tenants —
+with the default, then flips it to `true` and brings it up again, gets the last log line above and no demo tenants —
 the intended outcome (a half-applied demo block is worse than none) but not an obvious one. To change what the
 demo half did, restore a database from before the first run.
 
-After a **reference-only** first run (`SEED_DEMO_TENANTS=false`, the compose default) the database holds:
+The reconciliation pass is the thing a restart still owes. A deployment that boots on a build which added a
+permission or a role gets those rows before its first tenant is staffed, rather than 404ing a grant forever
+(`Permissions.GetDefaultPermissionsForRole` can name a key the database has never heard of). Measured by pushing a
+seeded database back to the shape the **previous** build leaves — `DELETE` the `Manager`, `Accountant` and
+Receptionist roles with their grants, and the two `users.*` permissions, which leaves 4 roles and 25 permissions —
+and running the same command again:
+
+```
+[10:58:58 INF] [] Reconciled reference data: 2 permission(s), 3 role(s) and 50 grant(s) added.
+[10:58:58 INF] [] Database already seeded. Skipping the administrator and the demo half.
+```
+
+Both lines, in that order, because the reference half converges and the administrator half still refuses to re-run:
+one `Users` row after the second run is the assertion that keeps this honest.
+
+The pass is **additive only**. Measured: a grant the code never issues — `tenancy.manage` handed to `Staff` by hand —
+was still in `RolePermissions` after the next run, and the run said nothing about it. Deploying a build does not
+revoke anything; revocations are an operator `DELETE`.
+
+After a **reference-only** first run (`SEED_DEMO_TENANTS=false`, the compose default) the database holds — each number
+below read out of the database the run above wrote, not counted from the code:
 
 | Table | Rows |
 | :--- | :--- |
-| `Roles` | 5 (the system roles) |
-| `Permissions` | `Permissions.All.Count` — every permission the code grants against |
+| `Roles` | 7 — every name in `Roles.All`. A role the database never wrote is a grant that answers `RoleNotGrantable`, and the operator cannot read that out of a config file |
+| `Permissions` | 27 — `Permissions.All.Count`, including the `users.read` / `users.manage` pair `ONB-01` adds |
+| `RolePermissions` | 133 — every role seeded with exactly its documented grant set |
 | `Users` | 1 — the platform administrator from `SEED_ADMIN_EMAIL` |
-| `Tenants` | **0** |
-| `StaffMembers`, `Customers` | 0 |
+| `Tenants`, `TenantSettings` | **0** |
+| `Locations`, `StaffMembers`, `Customers` | 0 |
 
-Those numbers are pinned by `ProductionSeedTests` (5 facts), which is the first test code ever to execute
-`DatabaseSeeder` — the fixture host sets `AutoMigrateAndSeed=false`, so 341 integration facts before it migrated a
+Those numbers are pinned by `ProductionSeedTests` (7 facts), which is the first test code ever to execute
+`DatabaseSeeder` — the fixture host sets `AutoMigrateAndSeed=false`, so every integration fact before it migrated a
 schema and walked past the seeding path.
 
 With `SEED_DEMO_TENANTS=true` the demo block adds, per tenant, **one** location, **one** staff member with a
 working week, and a couple of invented patients: Apex Dental (3 services, 2 resource groups holding 3 resources,
 2 customers, one completed appointment with a review), Luxe Salon (2 services, 1 resource group with 2 chairs,
 1 customer), Pulse Fitness (2 services, no resource groups, 1 customer). Read it as a demonstration of the data
-model rather than a data set to shrink: it writes 3 tenants and 4 customers, and it is the only code in `src` that
-writes a `Tenant` row at all.
+model rather than a data set to shrink: it writes 3 tenants and 4 customers. Until `ONB-01` it was also the only code
+in `src` that wrote a `Tenant` row at all, which is the fact the rest of this section is about; the block is now the
+development convenience and the routes below are the client path.
 
-**There is no supported way to add a tenant.** The only writers of a `Tenant` row in `src` are inside the seeder's
-demo block, and there is no `api/v1/tenants` route (`SEC-03`'s gate, unresolved). So a client's own clinic gets in
-one of two ways today: `SEED_DEMO_TENANTS=true` and edit the three invented tenants down by hand, or `INSERT` the
-rows directly. This is a product decision that has been deliberately not taken from a bug queue; §10 lists it as
-the first thing a handover conversation has to answer.
+### Pre-deploy check for the `ONB-01` migration
+
+`20261011070449_MakeUserEmailUniqueServerWide` replaces the per-tenant email index with a server-wide unique one
+(`DATABASE.md` §3.5). A database the **previous** build wrote can already hold the same address twice — the old index
+let two clinics share it and left every `TenantId NULL` row unconstrained — and against that shape SQL Server
+refuses the `CREATE`. Run this before the deploy:
+
+```sql
+SELECT Email, COUNT(*) AS Accounts FROM dbo.Users GROUP BY Email HAVING COUNT(*) > 1;
+```
+
+No rows means the migration applies. Rows means the deploy fails, and fails whole. Measured on LocalDB by dropping
+`IX_Users_Email` (the previous build's state), inserting a second row with the administrator's own address, running
+the check above — which answered `ops@example.test | 2` — and then attempting the `CREATE`:
+
+```
+Msg 1505, Level 16, State 1, Server Fouad-PC\LOCALDB#8E2E50B4, Line 1
+The CREATE UNIQUE INDEX statement terminated because a duplicate key was found for the object name 'dbo.Users'
+and the index name 'IX_Users_Email'. The duplicate key value is (ops@example.test).
+The statement has been terminated.
+```
+
+`MigrateAsync` wraps a migration in a transaction, so the refused run leaves the old index in place and writes no
+history row: the deployment keeps serving on the schema it had rather than half-applying. The operator has to choose
+which of the pair is the account that signs in, remove or rename the other, and re-run the same command.
+
+### Adding a client's clinic over HTTP (`ONB-01`)
+
+There is now a supported way to put a customer's clinic into a running deployment, and it is the API. The walk below
+is not a sketch: it is the thirteen requests a script sent, in this order, against a fresh LocalDB database whose only
+rows were the reference set above — with the bodies it actually sent, including the slug it was asked with. The seed
+credential is `ops@example.test` / `A-long-enough-seed-password!`, the pair that run set through `Seed:AdminEmail` and
+`Seed:AdminPassword` for the measurement; it is not any deployment's credential, and the clinic's own addresses are
+`@onboarding.test` fixtures.
+
+```bash
+API=http://localhost:5099
+
+# 1. sign in as the seeded administrator → 200, "roles":["PlatformAdmin"], "tenantId":null, 27 permissions.
+curl -sX POST $API/api/v1/auth/login -d '{"Email":"ops@example.test","Password":"A-long-enough-seed-password!"}'
+
+# 2. read the grantable set before granting anything → 200, seven roles, each with its permission list, and
+#    "grantableToATenantAccount":false on PlatformAdmin alone.
+curl -s $API/api/v1/roles -H "Authorization: Bearer $ADMIN"
+
+# 3. create the clinic and the one account that owns it, in one request. The slug is sent padded and upper-cased
+#    because that is what the route was handed, and what it stored is below.
+curl -sX POST $API/api/v1/tenants -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{
+  "Name":"Apex Dental","Slug":"  APEX-DENTAL-82d195b2859348a98e3ce0ff9e138e13  ","TimeZoneId":"Asia/Damascus",
+  "Plan":null,"OwnerEmail":"owner-91f61095ec91496bbf6e392af326d30a@onboarding.test",
+  "OwnerPassword":"a-chosen-password-1234","OwnerFirstName":"Olivia","OwnerLastName":"Owner",
+  "OwnerPhoneNumber":"+1-555-0100"}'
+
+# 4. list what exists → {"total":1,"page":1,"pageSize":5,"items":[…]}
+# 5. the owner signs in with the password from step 3 → 200, ["TenantOwner"], tenantId set, 26 permissions.
+# 6. that owner asks for a second clinic → 403.
+curl -sX POST $API/api/v1/tenants -H "Authorization: Bearer $OWNER" -H 'Content-Type: application/json' -d '{
+  "Name":"Second Clinic","Slug":"second-clinic","TimeZoneId":"UTC","Plan":null,
+  "OwnerEmail":"second@onboarding.test","OwnerPassword":"a-chosen-password-1234",
+  "OwnerFirstName":"Sam","OwnerLastName":"Owner","OwnerPhoneNumber":null}'
+
+# 7. hire the receptionist into the owner's own tenant → 201.
+curl -sX POST $API/api/v1/users -H "Authorization: Bearer $OWNER" -H 'Content-Type: application/json' -d '{
+  "Email":"recep-91f61095ec91496bbf6e392af326d30a@onboarding.test","Password":"a-chosen-password-1234",
+  "FirstName":"Rita","LastName":"Reception","PhoneNumber":null,"Roles":["Receptionist"]}'
+
+# 8. the tenant's roster → {"total":2,…}, owner and receptionist.
+# 9. the same hire sent by the administrator with no X-Tenant-Id → 400, the row in the table below.
+# 10. the receptionist signs in → 200, ["Receptionist"], 15 permissions — enough to book, not to staff.
+# 11-12. that receptionist reads /api/v1/roles and /api/v1/users → 403 and 403.
+# 13. a probe asked GET /api/v1/health/ready → 404, because health is not under /api/v1 (§5). Recorded rather than
+#     quietly dropped, so nobody reads that 404 as a defect in the seven routes above.
+```
+
+Measured answers, in the same order: `201 Created` with `Location: http://localhost:5099/api/v1/tenants` and a body
+whose keys are exactly the sample `API.md` §11 prints — two `DOC-03` facts compare the two key sets, so this document
+cannot drift from that one without failing a test (§11's own values come from an earlier run of the same sequence, at
+`07:39`, and say so). In that
+body: `"slug":"apex-dental-82d195b2859348a98e3ce0ff9e138e13"`, trimmed and lowercased from the padded upper-case text
+above, because `Tenant.NormalizeSlug` is the same function the duplicate read uses and the constructor calls;
+`"plan":"Standard"` for the request that sent `null`; `"createdAtUtc":"2026-10-11T08:02:13.4892126Z"`; and one
+`settings` object at the shipped defaults (120/60/24/12/15/true/24/false). `201 Created` for the account, and
+`{"total":2,…}` from `GET /api/v1/users`. Four refusals measured on the same host, each one the reason a step is
+ordered the way it is:
+
+| Act | Measured answer | Why |
+| :--- | :--- | :--- |
+| the `TenantOwner` posting `POST /api/v1/tenants` for a second clinic | `403` | `tenancy.manage` is held by **no** tenant role (`Permissions.cs:124-125`) — creating a clinic is a platform act |
+| the `PlatformAdmin` posting `POST /api/v1/users` with no `X-Tenant-Id` | `400 {"detail":"Active tenant context is required."}` | the write refuses `TenantId = 00000000-…` rather than storing a row no tenant's filtered read will ever return (`TenantGuard.cs:40-47`) |
+| the receptionist reading `GET /api/v1/users` | `403` | `users.read` goes to `TenantOwner`, `TenantAdmin` and `Manager`, and to nothing that serves patients |
+| the receptionist reading `GET /api/v1/roles` | `403` | same gate; the role list is what a caller would grant from |
+
+**What the walk still cannot do.** There is no route that deletes a tenant, an account, or a `TenantSetting` row, and
+no route that edits the eight settings values after creation (`API.md` §11.1). `PUT /api/v1/tenants/{id}/status` and
+`PUT /api/v1/users/{id}/status` deactivate — that is the supported removal, and the rows stay. A mis-provisioned
+clinic is therefore still permanent, which is why the slug, the time-zone id and the owner address are all validated
+before the first row is written rather than corrected afterwards. And nothing on this walk creates a **location**, a
+**service**, a **staff member** record or a **working week**: a freshly provisioned clinic has an owner, a receptionist
+and zero appointments it is possible to make. That gap is `AUDIT-STATUS.md` §3 item 1, and until it is closed the
+first manager's first act is still a hand-written `INSERT`.
 
 ## 5. Health, readiness, and what an orchestrator should do
 
@@ -308,7 +431,9 @@ two tokens in step 8's login response are the only elisions, replaced by what wa
    With `None`, §10's money and message limits are live and must be stated to the client.
 8. **Sign in, read the catalog, book, and try to book the same slot twice.** The seeded platform administrator is
    the only account the seeder writes, and it belongs to no tenant (`tenantId: null`), so this walk names the
-   tenant per request with `X-Tenant-Id`. `POST /api/v1/auth/login` → measured `200`:
+   tenant per request with `X-Tenant-Id`. Since `ONB-01` the walk does not have to depend on the demo block for its
+   tenant at all — §4's provisioning sequence creates one over HTTP first; this run was made with
+   `SEED_DEMO_TENANTS=true` because that is what the stack was up with. `POST /api/v1/auth/login` → measured `200`:
    ```json
    {"accessToken":"eyJ... (1123 bytes)","refreshToken":"...","expiresAtUtc":"2026-10-07T14:39:12Z",
     "user":{"email":"admin@booklyhub.test","tenantId":null,"roles":["PlatformAdmin"],"permissions":"25 entries"}}
@@ -400,14 +525,21 @@ needs to know:
   the browser), so this is a missing statement rather than an open door — but it means a browser front-end on a
   different origin needs the policy decided first (`SEC-12`).
 - **Back up before upgrading**, and read the migration list in `src/BooklyHub.Infrastructure/Migrations` — a
-  deployment that skips a release still gets every migration, because migration is one command.
+  deployment that skips a release still gets every migration, because migration is one command. One of them needs a
+  check first: the `ONB-01` email index is unique over the whole `Users` table and refuses to build on a database
+  that already shares an address between two accounts (§4).
 
 ## 10. What a client cannot do with this build yet
 
 Stated as the handover conversation needs it, not as a defect list. Each item names the finding that tracks it.
 
-1. **No way to add a tenant.** No route, and the only `Tenant` writers are inside the seeder's demo block
-   (`SEC-03`, §4). A new clinic means a database edit.
+1. **A clinic can be created; it cannot yet be booked in.** `ONB-01` made the tenant and its accounts an API act
+   (§4), so a new clinic is no longer a database edit — but nothing on that path creates a **location**, a
+   **service**, a **staff member record**, a **resource** or a **working week**, so a freshly provisioned tenant has
+   nobody it can give an appointment to. `AUDIT-STATUS.md` §3 item 1 is that gap, and until it closes the first
+   manager's first act is still a hand-written `INSERT`. There is also still no **delete** for a tenant or an
+   account: `…/status` deactivates and the rows stay, which is why `SEC-03`'s gate is a product decision rather than
+   a route nobody thought to add.
 2. **No payment gateway.** `Payments:Provider=None` refuses every charge with a reason and writes no ledger row.
    A real gateway implements the provider interface and registers it. `Simulated` exists for development and
    Production refuses it, because it answers every positive charge as `Paid` with a synthetic `txn_sim_*` id.

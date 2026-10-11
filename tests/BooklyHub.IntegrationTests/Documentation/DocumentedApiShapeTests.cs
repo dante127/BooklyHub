@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using BooklyHub.Application.Security;
+using BooklyHub.Domain.Entities.Identity;
 using BooklyHub.Domain.Entities.Organizations;
 using BooklyHub.Domain.Entities.Scheduling;
 using BooklyHub.Domain.Entities.Services;
@@ -328,6 +330,98 @@ public class DocumentedApiShapeTests : IClassFixture<BooklyHubWebApplicationFact
             .Should().BeTrue("this fixture needs the configured tenant, the opposite of the fallback facts");
 
         return graph;
+    }
+
+    /// <summary>
+    /// The two <c>ONB-01</c> samples, pinned the same way the login and availability samples are: the document lists
+    /// the keys a client may read off a provisioned clinic, and this reads the keys the action actually answers with.
+    /// </summary>
+    /// <remarks>
+    /// The role rows are inserted rather than seeded. This fixture's host never runs <c>DatabaseSeeder</c>
+    /// (<c>AutoMigrateAndSeed=false</c>), and the provision command resolves <c>TenantOwner</c> against
+    /// <c>Roles</c> — a database with no such row refuses with <c>RoleNotSeeded</c>, which would make this fact about
+    /// the seeder instead of about the sample.
+    /// </remarks>
+    private async Task SeedGrantableSystemRolesAsync()
+    {
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+        foreach (var name in new[] { Roles.TenantOwner, Roles.Receptionist })
+        {
+            if (!await db.Roles.IgnoreQueryFilters().AnyAsync(r => r.Name == name && r.TenantId == null))
+            {
+                db.Roles.Add(new Role(name, name, isSystemRole: true));
+            }
+        }
+
+        await db.SaveChangesAsync();
+    }
+
+    private static object ProvisionTenantPayload(string slug, string ownerEmail) => new
+    {
+        Name = "Docs Clinic",
+        Slug = slug,
+        TimeZoneId = "UTC",
+        Plan = (string?)null,
+        OwnerEmail = ownerEmail,
+        OwnerPassword = "a-chosen-password-1234",
+        OwnerFirstName = "Olivia",
+        OwnerLastName = "Owner",
+        OwnerPhoneNumber = "+1-555-0100"
+    };
+
+    [Fact]
+    public async Task TheProvisionTenantSample_MustNameTheKeysTheActionReturns()
+    {
+        await SeedGrantableSystemRolesAsync();
+
+        var response = await _factory.CreatePlatformAdminClient().PostAsJsonAsync(
+            "/api/v1/tenants", ProvisionTenantPayload($"docs-onb-{Guid.NewGuid():N}", $"doc-onb.{Guid.NewGuid():N}@example.test"));
+        var body = await response.Content.ReadAsStringAsync();
+        response.StatusCode.Should().Be(HttpStatusCode.Created, body);
+
+        var actual = ApiDoc.ResponseKeyPaths(body);
+
+        // Not decoration: an empty or single-object response would let BeEquivalentTo compare two key sets this call
+        // never saw a nested field of.
+        actual.Should().Contain(["settings.requireUpfrontPayment", "owner.roles", "owner.phoneNumber"],
+            "the shape this document is a claim about is the nested one — a tenant, its settings row and its owner");
+
+        actual.Should().BeEquivalentTo(ApiDoc.SampleKeyPaths("POST /api/v1/tenants"),
+            "a reader provisions a clinic from this sample, so a settings key or an owner field the sample does not " +
+            "list is a client that never learned to read it");
+    }
+
+    [Fact]
+    public async Task TheHiredAccountSample_MustNameTheKeysTheActionReturns()
+    {
+        await SeedGrantableSystemRolesAsync();
+
+        var created = await _factory.CreatePlatformAdminClient().PostAsJsonAsync(
+            "/api/v1/tenants", ProvisionTenantPayload($"docs-hire-{Guid.NewGuid():N}", $"doc-hire.{Guid.NewGuid():N}@example.test"));
+        var tenantBody = await created.Content.ReadAsStringAsync();
+        created.StatusCode.Should().Be(HttpStatusCode.Created, tenantBody);
+
+        var tenantId = JsonDocument.Parse(tenantBody).RootElement.GetProperty("id").GetGuid();
+        var response = await _factory.CreateClientForTenant(tenantId, Roles.TenantOwner)
+            .PostAsJsonAsync("/api/v1/users", new
+            {
+                Email = $"doc-recep.{Guid.NewGuid():N}@example.test",
+                Password = "a-chosen-password-1234",
+                FirstName = "Nora",
+                LastName = "Reception",
+                PhoneNumber = (string?)null,
+                Roles = new[] { Roles.Receptionist }
+            });
+        var body = await response.Content.ReadAsStringAsync();
+        response.StatusCode.Should().Be(HttpStatusCode.Created, body);
+
+        ApiDoc.ResponseKeyPaths(body).Should().BeEquivalentTo(ApiDoc.SampleKeyPaths("POST /api/v1/users"),
+            "this is the answer a portal builds its staff form from — and the one field it must never find is a " +
+            "password hash");
+        body.Should().NotContain("passwordHash", "the sample says so, and a leak here would only show up as a key the " +
+            "two sets disagree about if the response was read at all");
     }
 }
 

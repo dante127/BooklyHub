@@ -19,16 +19,36 @@ namespace BooklyHub.Infrastructure.Data.Seeding;
 
 public static class DatabaseSeeder
 {
+    // Every role a sign-in can be authorized against, and the one line an operator reads about it. `Roles.All`
+    // is the code's list and this is the database's; the pair is pinned by a fact in ProductionSeedTests, because
+    // a name missing here is a grant that 404s as `RoleNotGrantable` in a live deployment and nothing else says so.
+    private static readonly (string Name, string Description)[] SystemRoles =
+    [
+        (Roles.PlatformAdmin, "Global SaaS Administrator"),
+        (Roles.TenantOwner, "Tenant Owner"),
+        (Roles.TenantAdmin, "Tenant Administrator"),
+        (Roles.Manager, "Branch Manager"),
+        (Roles.Staff, "Staff Member"),
+        (Roles.Receptionist, "Receptionist"),
+        (Roles.Accountant, "Accountant")
+    ];
+
     public static async Task SeedAsync(ApplicationDbContext db, IPasswordHasher hasher, IClock clock, IConfiguration configuration, ILogger logger)
     {
-        // The sentinel is the first thing this method writes unconditionally, not a tenant. Judging "already
-        // seeded" by the tenant table was safe only while every seeded database contained demo tenants: with
-        // the demo half now opt-in, a reference-only first run left the next run to re-insert the same roles
-        // and permissions onto the keys the first one wrote (measured against the old sentinel: "Violation of
-        // PRIMARY KEY constraint 'PK_Permissions'", duplicate key "appointments.cancel").
-        if (await db.Permissions.IgnoreQueryFilters().AnyAsync())
+        // ONB-01: reference data now converges on every run, so the question "has this database been seeded" is
+        // no longer "does it have permissions" — it is "does it have somebody who can sign in". The old sentinel
+        // read the permissions table, which a convergent pass writes on every run, so it would have become true
+        // before the administrator was ever created and left the deployment with roles and no way in.
+        var hasAdministrator = await db.Users.IgnoreQueryFilters()
+            .AnyAsync(u => u.UserRoles.Any(ur => ur.Role!.Name == Roles.PlatformAdmin));
+
+        if (hasAdministrator)
         {
-            logger.LogInformation("Database already seeded. Skipping initial seeding.");
+            // The one thing a restart still owes: a deployment that starts on a build which added a permission
+            // (ONB-01's `users.read`/`users.manage`) or a role gets those rows before its first tenant is staffed,
+            // rather than 404ing a grant forever. The administrator and the scripted demo are not re-run.
+            await ReconcileReferenceDataAsync(db, logger);
+            logger.LogInformation("Database already seeded. Skipping the administrator and the demo half.");
             return;
         }
 
@@ -36,35 +56,15 @@ public static class DatabaseSeeder
         var adminPassword = RequireConfiguration(configuration, "Seed:AdminPassword");
         var demoTenants = configuration.GetValue<bool>("Seed:DemoTenants");
 
-        logger.LogInformation("Seeding roles, permissions and the platform administrator ({Mode})...",
+        // After the two required keys, deliberately: a run that refuses must leave an empty database rather than a
+        // half-seeded one, which is what `ASeedWithNoAdministratorEmail_MustRefuseAndWriteNothing` measures.
+        await ReconcileReferenceDataAsync(db, logger);
+
+        logger.LogInformation("Seeding the platform administrator ({Mode})...",
             demoTenants ? "with demo tenants" : "no demo tenants");
 
-        // Seed Roles & Permissions
-        var permissions = Permissions.All.Select(p => new Permission(p, p.Split('.')[0], p)).ToList();
-        db.Permissions.AddRange(permissions);
-
-        var platformAdminRole = new Role(Roles.PlatformAdmin, "Global SaaS Administrator", isSystemRole: true);
-        var tenantOwnerRole = new Role(Roles.TenantOwner, "Tenant Owner", isSystemRole: true);
-        var tenantAdminRole = new Role(Roles.TenantAdmin, "Tenant Administrator", isSystemRole: true);
-        var staffRole = new Role(Roles.Staff, "Staff Member", isSystemRole: true);
-        var receptionistRole = new Role(Roles.Receptionist, "Receptionist", isSystemRole: true);
-
-        db.Roles.AddRange(platformAdminRole, tenantOwnerRole, tenantAdminRole, staffRole, receptionistRole);
-
-        foreach (var p in permissions)
-        {
-            platformAdminRole.RolePermissions.Add(new RolePermission { RoleId = platformAdminRole.Id, PermissionId = p.Id });
-        }
-
-        foreach (var p in Permissions.GetDefaultPermissionsForRole(Roles.TenantOwner))
-        {
-            tenantOwnerRole.RolePermissions.Add(new RolePermission { RoleId = tenantOwnerRole.Id, PermissionId = p });
-        }
-
-        foreach (var p in Permissions.GetDefaultPermissionsForRole(Roles.Staff))
-        {
-            staffRole.RolePermissions.Add(new RolePermission { RoleId = staffRole.Id, PermissionId = p });
-        }
+        var platformAdminRole = await db.Roles.IgnoreQueryFilters()
+            .SingleAsync(r => r.Name == Roles.PlatformAdmin && r.TenantId == null);
 
         // Global Platform Admin User
         var platformAdminUser = new User
@@ -84,8 +84,7 @@ public static class DatabaseSeeder
             // A client's first run gets an empty product and one administrator. The block below is a scripted
             // demo — three clinics, their staff, and invented patients with names, emails and appointments —
             // and it belongs in a development database, not in the production tenant table nobody can delete
-            // from (there is no tenant delete route, and `SEC-03`'s onboarding gap means these would be the
-            // only tenants this server has ever had).
+            // from (there is no tenant delete route, and until ONB-01 there was no route that could create one).
             await db.SaveChangesAsync();
             logger.LogInformation("Seeded reference data and the platform administrator; no demo tenants created.");
             return;
@@ -261,6 +260,87 @@ public static class DatabaseSeeder
 
         await db.SaveChangesAsync();
         logger.LogInformation("Database seeding completed successfully for 3 tenants.");
+    }
+
+    /// <summary>
+    /// Writes the reference rows that are missing, and only those: permissions, the seven system roles, and the
+    /// role-to-permission grants <see cref="Permissions.GetDefaultPermissionsForRole"/> names for each one.
+    ///
+    /// ONB-01 is the reason this exists as a pass rather than a straight insert. The old body inserted the whole
+    /// set on what it believed was the first run, so a permission added by a later build never reached an existing
+    /// deployment — <c>users.manage</c> would simply not exist in a live database, and the accounts route would
+    /// authorize nobody. It is also why three of the seven roles were broken before this: the old code granted
+    /// permissions to PlatformAdmin, TenantOwner and Staff only, so a Receptionist — the first account any new
+    /// onboarding route will be asked to create — signed in with a token carrying no permissions at all.
+    ///
+    /// Convergence is additive. A grant removed from the code stays in a live database until somebody deletes it,
+    /// because nothing here knows which rows the current build disowns, and a seeder that deleted role grants on
+    /// startup would be a seeder that silently revokes an operator's custom work.
+    /// </summary>
+    private static async Task ReconcileReferenceDataAsync(ApplicationDbContext db, ILogger logger)
+    {
+        var knownPermissionIds = await db.Permissions.IgnoreQueryFilters().Select(p => p.Id).ToListAsync();
+        var missingPermissions = Permissions.All
+            .Where(name => !knownPermissionIds.Contains(name, StringComparer.OrdinalIgnoreCase))
+            .Select(name => new Permission(name, name.Split('.')[0], name))
+            .ToList();
+
+        var knownRoles = await db.Roles.IgnoreQueryFilters()
+            .Where(r => r.TenantId == null)
+            .Select(r => new { r.Name, r.Id })
+            .ToListAsync();
+        var missingRoles = SystemRoles
+            .Where(pair => !knownRoles.Select(r => r.Name).Contains(pair.Name, StringComparer.OrdinalIgnoreCase))
+            .Select(pair => new Role(pair.Name, pair.Description, isSystemRole: true))
+            .ToList();
+
+        db.Permissions.AddRange(missingPermissions);
+        db.Roles.AddRange(missingRoles);
+
+        var roleIdsByName = knownRoles.ToDictionary(r => r.Name, r => r.Id, StringComparer.OrdinalIgnoreCase);
+        foreach (var role in missingRoles)
+        {
+            roleIdsByName[role.Name] = role.Id;
+        }
+
+        // Keyed on the id, not the role name: `Roles` is unique on `(TenantId, Name)`, so a tenant's custom
+        // "Manager" and the global one are different rows that a name-keyed set would confuse.
+        var granted = (await db.RolePermissions.IgnoreQueryFilters()
+                .Select(rp => new { rp.RoleId, rp.PermissionId })
+                .ToListAsync())
+            .Select(x => (x.RoleId, x.PermissionId))
+            .ToHashSet();
+
+        var grantsAdded = 0;
+        foreach (var (name, _) in SystemRoles)
+        {
+            var roleId = roleIdsByName[name];
+            foreach (var permissionName in Permissions.GetDefaultPermissionsForRole(name))
+            {
+                if (!Permissions.All.Contains(permissionName, StringComparer.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"Role '{name}' grants '{permissionName}', which is not in Permissions.All, so no row exists to grant it with.");
+                }
+
+                if (granted.Add((roleId, permissionName)))
+                {
+                    db.RolePermissions.Add(new RolePermission { RoleId = roleId, PermissionId = permissionName });
+                    grantsAdded++;
+                }
+            }
+        }
+
+        var rowsAdded = missingPermissions.Count + missingRoles.Count + grantsAdded;
+        if (rowsAdded == 0)
+        {
+            return;
+        }
+
+        await db.SaveChangesAsync();
+        logger.LogInformation(
+            "Reconciled reference data: {Permissions} permission(s), {Roles} role(s) and {Grants} grant(s) added.",
+            missingPermissions.Count, missingRoles.Count, grantsAdded);
     }
 
     private static string RequireConfiguration(IConfiguration configuration, string key)

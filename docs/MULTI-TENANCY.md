@@ -101,6 +101,26 @@ no-show sweep is the worker that writes *appointment* rows, and it scopes itself
 notification rows only, one per booking, and scopes them the same way — by predicate, not by lock.
 
 - `IgnoreQueryFilters()` was rejected as the fix: it also drops the `!IsDeleted` soft-delete filter and has to be remembered per query.
+
+**`Users` is scoped by a predicate, not by a filter (`ONB-01`).** `User` is not an `ITenantEntity`, because a platform
+administrator belongs to no tenant and a filter over `TenantId` would hide exactly that row from the account that has
+to exist for the product to be operable. The cost is that nothing scopes an account read automatically: every
+tenant-side account route names the tenant in its own predicate, and the two that decide a cross-tenant question are
+`Users.FirstOrDefaultAsync(u => u.Id == id && u.TenantId == tenantId)` in the status writer
+(`OnboardingCommands.cs:411-413`) and the same pair in the list. Drop that `&& u.TenantId == …` and another tenant's
+account id is a `200` with somebody else's roster in it; `TwoTenants_MustNotSeeOrAddressEachOthersAccounts` is the
+fact that keeps the predicate load-bearing rather than decorative.
+
+**A signed-in platform administrator is not a tenant context.** `TenantResolutionMiddleware.cs:37` gives an
+authenticated caller with no `tenant_id` claim — which is precisely a `PlatformAdmin` — a resolved tenant of `null`,
+and `TenantGuard.RequireId` reads both `null` and `Guid.Empty` as "nothing resolved" (`TenantGuard.cs:40-47`). So an
+administrator who wants to staff a clinic sends `X-Tenant-Id` like any other caller, and one who forgets is refused
+`400 Active tenant context is required.` measured on the wire (`DEPLOYMENT.md` §4). The alternative was the bug this
+closes: an unguarded write stored `TenantId = 00000000-0000-0000-0000-000000000000`, a row no tenant's filtered read
+will ever return and no route can delete. The same empty Guid that means "platform scope" to a **reader** — it is what
+`SystemTenantScope` binds, and what `IsPlatformAdmin` is paired with — means "refuse" to a **writer**, and
+`IdempotencyMiddleware` already read it that way; `ONB-01` made the write side agree.
+
 - Binding the scope to one tenant was rejected too: `OutboxMessage` carries no `TenantId`, and the reminder sweep is cross-tenant by design.
 - Request-path code must never call `CreateSystemScope()`; the middleware owns tenant binding for HTTP calls.
 

@@ -1139,7 +1139,8 @@ builds exceed its 4,000-character ceiling and the route answered `500`.
 ```
 **This is the other pagination envelope.** The appointment list and the collection queue answer `PaginatedList<T>`
 (`items`, `pageNumber`, `pageSize`, `totalCount`, `totalPages`, `hasNextPage`, `hasPreviousPage`); the customer list,
-the review wall, the two catalog reads (§7) and the two calendar lists (§3) answer `{ total, page, pageSize, items }` —
+the review wall, the two catalog reads (§7), the two calendar lists (§3) and the two onboarding lists (§11) answer
+`{ total, page, pageSize, items }` —
 the same idea under different member names, and a client that reads `totalCount` off this response reads a field that
 is not there. Recorded rather than renamed: two shapes is a wart, and changing a live field name from a documentation
 commit is worse than writing the wart down.
@@ -1371,3 +1372,339 @@ Two consequences a client deployment has to plan around, both measured against t
 
 `ServingSurfaceTests` (32 facts) pins the reading side — what counts as declared, what is refused, and why `*` alone
 means "no narrowing" while `*` beside a name means "refuse". The matrix above is the half a unit test cannot reach.
+
+## 11. Onboarding — a clinic, its owner, and its staff (`ONB-01`)
+
+Every body in this section is a measured response, not a sketch: the shapes below were read off a host that provisioned
+a clinic, hired a receptionist over HTTP, and signed both in.
+
+Until these seven routes existed, the only writer of a `Tenant` row in `src` — and of a `User` row — was
+`DatabaseSeeder`. A fresh client deployment came up with **zero tenants and one credential** (`DEPLOYMENT.md` §4), and
+"put the customer's clinic in, then give it a receptionist" meant `INSERT` statements run by hand: outside every
+validator, outside every permission, answered in a different format from any error this API produces, and invisible to
+the portal that then had to book appointments against the rows.
+
+| Route | Gate | Tenant context |
+| :--- | :--- | :--- |
+| `POST /api/v1/tenants` | `tenancy.manage` | none needed — the write *creates* the tenant |
+| `GET /api/v1/tenants` | `tenancy.manage` | none needed, on purpose |
+| `PUT /api/v1/tenants/{id}/status` | `tenancy.manage` | none needed |
+| `GET /api/v1/users` | `users.read` | required |
+| `POST /api/v1/users` | `users.manage` | required, and the only tenant the write can name |
+| `PUT /api/v1/users/{id}/status` | `users.manage` | required |
+| `GET /api/v1/roles` | `users.read` | not required |
+
+The two gates differ because the two acts differ. Creating a clinic is a platform act, so `tenancy.manage` is held by
+**no tenant role**: `Permissions.GetDefaultPermissionsForRole` takes it off `TenantOwner` and `TenantAdmin`
+(`Permissions.cs:124-125`), which is why the owner's own `POST /api/v1/tenants` is a `403` and not a second clinic.
+Staffing a clinic is the tenant's own act, so `users.read` / `users.manage` — two new permission keys — go to
+`TenantOwner`, `TenantAdmin` and `Manager` and stay off `Staff`, `Receptionist` and `Accountant`. A `PlatformAdmin`
+token passes every check without consulting its claims (`PermissionAuthorization.cs:22-26`), so in practice the
+tenant-side routes are this: an administrator who wants to act inside a tenant sends `X-Tenant-Id` like any other
+caller, and one who does not is refused by the tenant guard in the table below.
+
+`Idempotency-Key` (§1) applies to the two `POST`s: the middleware wraps every non-`GET`, and a retry with the same key
+and the same body replays the first answer — including a first answer that was a `4xx`, which is what a retry that
+fixed nothing deserves — while the same key with a **different** body is a `409`.
+
+### `POST /api/v1/tenants`
+Creates a clinic **and the one account that owns it**, in one save. The owner is not optional and not a second
+request: a tenant nobody can sign into is the broken state this finding is about, and two routes would leave a caller
+that created the tenant and lost the second request holding a clinic with no way to finish it. The owner's role is not
+a parameter either — it is `TenantOwner`, so this route cannot be pointed at `PlatformAdmin`.
+
+**Body:** `name`, `slug`, `timeZoneId`, `plan` (nullable), `ownerEmail`, `ownerPassword`, `ownerFirstName`,
+`ownerLastName`, `ownerPhoneNumber` (nullable). Names are PascalCase on the wire as in the rest of the API.
+
+**Response (201 Created):** the tenant, its settings row, and the owner — all four rows or none, because
+`SaveChangesAsync` sends them inside one transaction.
+
+```json
+{
+  "id": "302a509f-ed87-4e10-aba9-7f7b6ae81b6a",
+  "name": "Apex Dental",
+  "slug": "apex-dental-82d195b2859348a98e3ce0ff9e138e13",
+  "timeZoneId": "Asia/Damascus",
+  "plan": "Standard",
+  "isActive": true,
+  "createdAtUtc": "2026-10-11T07:39:40.8461887Z",
+  "settings": {
+    "minBookingNoticeMinutes": 120,
+    "maxAdvanceBookingDays": 60,
+    "cancellationCutoffHours": 24,
+    "reschedulingCutoffHours": 12,
+    "slotIntervalMinutes": 15,
+    "confirmationEmailEnabled": true,
+    "reminderNoticeHours": 24,
+    "requireUpfrontPayment": false
+  },
+  "owner": {
+    "id": "8466ec37-e229-4346-9a91-23f6cf888664",
+    "email": "owner-91f61095ec91496bbf6e392af326d30a@onboarding.test",
+    "firstName": "Olivia",
+    "lastName": "Owner",
+    "phoneNumber": "+1-555-0100",
+    "isActive": true,
+    "roles": ["TenantOwner"]
+  }
+}
+```
+
+- The `Location` header names the collection (`/api/v1/tenants`), not the row — there is no `GET` by tenant id.
+- `settings` is the newly created `TenantSetting` row at the entity's own defaults (`Tenant.cs:73-80`, the same
+  constants the readers fall back to when a tenant has no settings row). **This route creates that row and no route
+  edits it**: the eight values stay at their defaults until `PERF-04`'s open note is closed.
+- `slug` is stored as `Tenant.NormalizeSlug` produces it — trimmed and lowercased — and the duplicate check compares
+  that same normalized value, so `" Apex "` cannot become a second row the unique index calls a duplicate of `"apex"`.
+  The measured body above came back from a request that sent `  APEX-DENTAL-…  `.
+- `plan` arrives as `Standard` when it is null or blank; `createdAtUtc` carries `Z` like every other instant this API
+  answers (`TIME-01`).
+
+**Refusals, each one a way the hand-written `INSERT` used to answer wrong:**
+
+| Condition | Answer | Measured |
+| :--- | :--- | :--- |
+| name missing, or over 200 characters (the column) | `400`, `errors.Name` | `AnIllegalTimeZoneOrSlugOrPassword_MustBeRefusedBeforeAnyRowExists` |
+| slug shorter than 3 or longer than 100, or not `^[a-z0-9]+(-[a-z0-9]+)*$` **after** normalization | `400`, `errors.Slug` | same fact |
+| `timeZoneId` this server cannot resolve | `400`, `errors.TimeZoneId` | same fact |
+| password shorter than `PasswordPolicy.MinLength` (12) or over 256 | `400`, `errors.OwnerPassword` | same fact |
+| slug already taken, including by a soft-deleted tenant | `422`, `rule: "TenantSlugAlreadyTaken"` | `ATakenSlug_MustBeRefusedEvenWhenItIsTypedDifferently` |
+| `ownerEmail` already naming an account anywhere on the server | `422`, `rule: "EmailAlreadyRegistered"` | `AnAddressAnotherTenantAlreadyHas_MustBeRefusedServerWide` |
+| caller holds no `tenancy.manage` | `403`, §1.1 envelope, before the body is read | `AProvisionedTenant_MustSignInItsOwnerWithTheSeededOwnerPermissions` |
+
+The time-zone rule exists because `TimeZoneHelper.ResolveTimeZone` **has** to return a zone and answers an unknown id
+with UTC (`:30`). That is right for a reader that must not fall over and wrong as permission to store the id: a clinic
+written as `Asia/Damascas` would offer a whole day of slots two hours early in a response that reports nothing. So a
+route that persists a `TimeZoneId` asks `IsKnownTimeZoneId` first, and the ladder it walks is the same three steps —
+system id, IANA→Windows, Windows→IANA — because a validator that disagrees with the reader is a second opinion nobody
+needs.
+
+The slug check reads `IgnoreQueryFilters()` because `IX_Tenants_Slug` carries no filter (`CoreConfigurations.cs:30`), so
+a deleted tenant still owns its slug; a filtered read would answer `201` for a row the database then refuses.
+
+### `GET /api/v1/tenants`
+The whole tenant table, paged by `page` / `pageSize` under the one `Paging` rule (§8), ordered by `name` then `id`.
+**Permission:** `tenancy.manage`.
+
+There is deliberately no tenant guard on this route: it stands outside every tenant and reads every row, which is what
+makes it safe to gate on a permission no tenant can hold. `Tenants` is not an `ITenantEntity`, so nothing scopes it for
+the caller by accident — the gate is the scoping.
+
+**Response (200 OK):**
+```json
+{
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "items": [
+    {
+      "id": "302a509f-ed87-4e10-aba9-7f7b6ae81b6a",
+      "name": "Apex Dental",
+      "slug": "apex-dental-82d195b2859348a98e3ce0ff9e138e13",
+      "plan": "Standard",
+      "timeZoneId": "Asia/Damascus",
+      "isActive": true,
+      "createdAtUtc": "2026-10-11T07:39:40.8461887Z"
+    }
+  ]
+}
+```
+Note the key order differs from `POST`: this projection is `{id, name, slug, plan, timeZoneId, …}` while the created
+answer is `{id, name, slug, timeZoneId, plan, …}`. Same fields, different order; a client that reads by position rather
+than by name is reading the wrong document.
+
+### `PUT /api/v1/tenants/{id}/status`
+**Permission:** `tenancy.manage`. Body `{ "isActive": <bool> }`. The only writer of `Tenant.IsActive`, a column
+`AvailabilityService` has read since before this route existed: flagged off, the public portal answers a closed day.
+
+**Response (200 OK):**
+```json
+{
+  "id": "302a509f-ed87-4e10-aba9-7f7b6ae81b6a",
+  "slug": "apex-dental-82d195b2859348a98e3ce0ff9e138e13",
+  "isActive": false
+}
+```
+
+Measured in both directions (`ATenantSwitchedOff_MustOfferNoSlotsAndComeBackOn`): with the fixture's own week written,
+the preview answers `isOpen: true` with slots, the switch makes it `isOpen: false` with `slots: []`, and switching back
+reopens it. **What it does not do is sign anybody out.** The suspended tenant's accounts keep signing in, keep
+refreshing, and keep reading their own rows through every route in this document; only the calendar goes quiet. Whether
+a suspended tenant should be refused at the door instead is `SEC-03`'s open question and this route leaves it open
+rather than answer a security policy from a provisioning change. An unknown `id` is `404`; a soft-deleted tenant is not
+a switched-off one and is `404` too — there is no delete route, and reviving a tenant through a status write would be a
+delete route's job.
+
+### `GET /api/v1/users`
+The caller's own roster, paged (`page` / `pageSize`, §8), ordered by `email`. **Permission:** `users.read`.
+
+**Response (200 OK):**
+```json
+{
+  "total": 1,
+  "page": 1,
+  "pageSize": 20,
+  "items": [
+    {
+      "id": "8466ec37-e229-4346-9a91-23f6cf888664",
+      "email": "owner-91f61095ec91496bbf6e392af326d30a@onboarding.test",
+      "firstName": "Olivia",
+      "lastName": "Owner",
+      "phoneNumber": "+1-555-0100",
+      "isActive": true,
+      "roles": ["TenantOwner"]
+    }
+  ]
+}
+```
+Never `passwordHash`. The tenant is **not** a query parameter: `User` is not an `ITenantEntity`, so no global filter
+narrows this table (`ApplicationDbContext.cs:96-141`) and the explicit `u.TenantId == tenantId` in the action is the
+entire isolation of the read (`TwoTenants_MustNotSeeOrAddressEachOthersAccounts` fails on it if it is dropped). The
+ordering is safe without an id tiebreaker because `IX_Users_Email` makes the address provably unique server-wide
+(`DATABASE.md` §3.5).
+
+### `POST /api/v1/users`
+Hires an account into the tenant the caller is already standing in. **Permission:** `users.manage`.
+
+**Body:** `email`, `password`, `firstName`, `lastName`, `phoneNumber` (nullable), `roles` (array of names). There is no
+`tenantId` on the body, and that is the point: a body that could name a tenant would be a body that could name
+somebody else's, and nothing at save time rejects a foreign-tenant write on this table
+(`ApplicationDbContext.cs:152-169` runs for `ITenantEntity` only).
+
+**Response (201 Created):**
+```json
+{
+  "id": "ef217602-7e35-4717-a96c-ff81fd32c3e7",
+  "email": "recep-f8d0058f0f934c4dad77a883549a9f82@onboarding.test",
+  "firstName": "Nora",
+  "lastName": "Reception",
+  "phoneNumber": null,
+  "isActive": true,
+  "roles": ["Receptionist"]
+}
+```
+
+**Refusals:**
+
+| Condition | Answer | Measured |
+| :--- | :--- | :--- |
+| `roles` empty, or more than 3 names, or one named twice | `400`, `errors.Roles` | `AnAccountOutsideTheRoleBound_MustBeRefusedAndWriteNoRow` |
+| `roles` containing `PlatformAdmin` | `400`, `errors.Roles` — and a **mixed** list is refused whole, not half-applied | `TheAccountsRoute_MustRefuseToMintAPlatformAdmin` |
+| a name that is not a system role of *this* database | `422`, `rule: "RoleNotGrantable"` | `ARoleThisDatabaseDoesNotKnow_MustBeRefusedAsABusinessRuleNotACrash` |
+| email already naming an account on this server | `422`, `rule: "EmailAlreadyRegistered"` | `AnAddressAnotherTenantAlreadyHas_MustBeRefusedServerWide` |
+| signed-in `PlatformAdmin` with no `X-Tenant-Id` | `400`, `detail: "Active tenant context is required."` | `APlatformAdminWithNoTenantSelected_MustBeRefusedAndWriteNoOrphanAccount` |
+| password, name, email shape | `400`, keyed by the PascalCase property refused | `AnIllegalTimeZoneOrSlugOrPassword_MustBeRefusedBeforeAnyRowExists` |
+
+`PlatformAdmin` is the one name this route will not put on an account, because its holder is checked before any
+permission claim is read (`PermissionAuthorization.cs:22-26`): a tenant-side route that could mint one would be a way
+to create a caller no tenant rule constrains. Role names are resolved against rows —
+`TenantId IS NULL` **and** `IsSystemRole` — not against `Roles.All`, so a database seeded by an older build refuses a
+role it has never heard of as a business rule instead of granting nothing.
+
+**One address, one account, server-wide.** `AuthController.cs:342` resolves a sign-in by email address alone, so two
+tenants holding `shared@clinic.test` is not two accounts — it is one account whose tenant an `ORDER BY` nobody wrote
+would choose. That rule is written twice on purpose: as the read above, and as `IX_Users_Email`, the unique unfiltered
+index (`DATABASE.md` §3.5) for the writes that race the read. The index decides, and the handler translates what it
+decides back into the same `422` the read gives, so a loser is told the address was taken rather than handed a `500`
+for a collision its own request participated in. Measured: four concurrent `POST`s of one address leave **exactly one**
+`201`, three `422`s, **zero** `5xx`, and one row
+(`ConcurrentWritesForOneAddress_MustLeaveOneAccountAndNoServerError`).
+
+### `PUT /api/v1/users/{id}/status`
+**Permission:** `users.manage`. Body `{ "isActive": <bool> }`. The only writer of `User.IsActive`, the column `ACT-01`
+gave a meaning to: an account switched off can neither sign in nor refresh.
+
+**Response (200 OK):**
+```json
+{
+  "id": "ef217602-7e35-4717-a96c-ff81fd32c3e7",
+  "email": "recep-f8d0058f0f934c4dad77a883549a9f82@onboarding.test",
+  "isActive": false
+}
+```
+
+- The id is matched **and** constrained to the caller's tenant in one predicate, so another tenant's account id is a
+  `404` like any other unknown id (`TwoTenants_MustNotSeeOrAddressEachOthersAccounts`), not a `403` that discloses it.
+- Switching off **your own** account is `422`, `rule: "CannotDeactivateOwnAccount"`. There is no self-service
+  reactivation anywhere in this API, so allowing it would make one misclick an outage for one person and a helpdesk
+  ticket for whoever has to run SQL.
+- Measured end to end (`AnAccountSwitchedOff_MustStopSigningInAndRefreshAndNobodySwitchesThemselvesOff`): the account's
+  own captured refresh token starts answering `401` and its login answers `401`; `isActive: true` restores both.
+- An active token a caller already holds is **not** revoked here — it stays valid until it expires (60 minutes,
+  `appsettings.json:10`). `SEC-06`'s frozen-claims window is the reason, and `SEC-05c` is the account's own way out.
+
+### `GET /api/v1/roles`
+The roles `POST /api/v1/users` will accept, read out of **this** deployment rather than out of a document.
+**Permission:** `users.read`. No tenant guard: a role name is not a tenant's secret, and the answer is the same for
+every caller of one build.
+
+**Response (200 OK)** — three of the seven elements shown, each one complete; the answer holds every system role row
+this database has (`Roles.All` is seven on a database seeded by this build, and fewer on one seeded by an older one,
+which is exactly why this reads the table):
+
+```json
+{
+  "roles": [
+    {
+      "name": "Accountant",
+      "description": "Accountant",
+      "grantableToATenantAccount": true,
+      "permissions": ["appointments.read", "payments.manage", "payments.read", "payments.refund", "reports.read"]
+    },
+    {
+      "name": "Manager",
+      "description": "Branch Manager",
+      "grantableToATenantAccount": true,
+      "permissions": [
+        "appointments.cancel", "appointments.checkin", "appointments.complete", "appointments.create",
+        "appointments.read", "appointments.reschedule", "appointments.update", "audit.read", "customers.create",
+        "customers.read", "customers.update", "payments.manage", "payments.read", "reports.read", "resources.manage",
+        "resources.read", "schedules.manage", "schedules.read", "services.manage", "services.read", "staff.manage",
+        "staff.read", "users.manage", "users.read"
+      ]
+    },
+    {
+      "name": "PlatformAdmin",
+      "description": "Global SaaS Administrator",
+      "grantableToATenantAccount": false,
+      "permissions": [
+        "appointments.cancel", "appointments.checkin", "appointments.complete", "appointments.create",
+        "appointments.read", "appointments.reschedule", "appointments.update", "audit.read", "customers.create",
+        "customers.delete", "customers.read", "customers.update", "payments.manage", "payments.read",
+        "payments.refund", "reports.read", "resources.manage", "resources.read", "schedules.manage", "schedules.read",
+        "services.manage", "services.read", "staff.manage", "staff.read", "tenancy.manage", "users.manage", "users.read"
+      ]
+    }
+  ]
+}
+```
+Not paged, and not a paging rule waiting for a number: the system roles are a fixed handful, same shape as
+`GET /api/v1/calendar/business-hours` (§3). `permissions` are the `RolePermission` rows this database holds, sorted by
+key, so a caller can see what a role actually buys instead of trusting a name. `grantableToATenantAccount` is `false`
+only for `PlatformAdmin` — the read states the write's rule so a form does not offer an option that answers `400`.
+`TheRolesRoute_MustAnswerThisDeploymentsGrantableSet` pins all seven names, every grant set, and that flag.
+
+### 11.1 What these routes do not do
+
+Written down because a reader who has just provisioned a clinic is the reader who will notice.
+
+- **Nothing here creates a location, a service, a staff member, a resource, a working hour, or a customer.** A
+  provisioned tenant therefore has an owner, a login, and an empty calendar: the first manager's first acts are still
+  `INSERT` for the bookable half, then `PUT /api/v1/calendar/business-hours`. That gap is the finding these routes
+  expose and the next item in `AUDIT-STATUS.md` §3.
+- **No delete route, for a tenant or an account.** `Tenant` and `User` are `ISoftDeletable`, so a row can only be
+  switched off (`isActive`) here. A deleted tenant keeps owning its slug, which is stated in the `422` text rather than
+  hidden.
+- **No route edits `TenantSetting`.** The eight values in the `POST /api/v1/tenants` answer are the entity defaults
+  until `PERF-04`'s note closes.
+- **No role creation.** `GET /api/v1/roles` reads system roles only; a tenant cannot invent one, and `User.Roles` can
+  therefore never name a role whose permission set is undefined.
+- **No suspension at the door** (`SEC-03`) and no answer to "who may create a tenant" beyond a permission key: the gate
+  is `tenancy.manage`, held by `PlatformAdmin` alone.
+
+`OnboardingTests` (17 facts) runs this over real HTTP against a migrated **and seeded** database — reference rows
+included, `DatabaseSeeder` itself doing the seeding — because the central claim is that a provisioned owner's token
+carries the permissions this deployment's `RolePermission` rows hold. Sign-ins are why each fact has its own host: the
+`auth` tier is ten requests a minute per address (§1.1). The two `201` samples above are pinned to the live bodies by
+`TheProvisionTenantSample_MustNameTheKeysTheActionReturns` and `TheHiredAccountSample_MustNameTheKeysTheActionReturns`
+(`DOC-03`'s mechanism), and every route in this section needs its heading to exist for `DOC-04`.

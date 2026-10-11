@@ -186,13 +186,15 @@ non-Production environment name. A deployment that needs card payments or patien
 interfaces and names them in `PAYMENTS_PROVIDER` / `NOTIFICATIONS_PROVIDER`.
 
 `SEED_DEMO_TENANTS` defaults to `false`, so a fresh client stack comes up with **zero tenants** and one platform
-administrator — see the note on onboarding below.
+administrator. Since `ONB-01` that is the intended starting shape rather than a dead end: the administrator
+provisions the first clinic over `POST /api/v1/tenants` and that clinic staffs itself over `POST /api/v1/users`, so
+no customer's data has to be `INSERT`ed by hand (`docs/DEPLOYMENT.md` §4 walks the sequence with its real responses).
 
 ---
 
 ## 🧪 Automated Testing Suite
 
-290 unit facts and 346 integration facts, all green on this tree. The integration tests run against a real
+290 unit facts and 400 integration facts, all green on this tree. The integration tests run against a real
 SQL Server — LocalDB by default, or the instance `BOOKLYHUB_TEST_CONNECTIONSTRING` names.
 
 ```bash
@@ -200,7 +202,7 @@ SQL Server — LocalDB by default, or the instance `BOOKLYHUB_TEST_CONNECTIONSTR
 dotnet test tests/BooklyHub.UnitTests
 
 # Integration tests — concurrency, tenant isolation, N+1 regressions, payments, notifications,
-# retention, rate limiting, deployment surfaces (346 tests, ~33 s against LocalDB)
+# retention, rate limiting, onboarding, deployment surfaces (400 tests, ~43 s against LocalDB)
 dotnet test tests/BooklyHub.IntegrationTests
 ```
 
@@ -234,14 +236,18 @@ Outside Development — and therefore in every container — `Seed:DemoTenants` 
 | Table | Rows after a default first run |
 | :--- | :--- |
 | `Permissions` | one per permission in `Permissions.All` |
-| `Roles` | 5 system roles |
+| `Roles` | 7 system roles — every name in `Roles.All`, because a role the database never wrote is a grant that answers `RoleNotGrantable` |
 | `Users` | 1 — the platform administrator from `Seed:AdminEmail` |
 | `Tenants` | **0** |
 
-**There is no supported way to add a tenant.** No `api/v1/tenants` route exists, and the only writers of a `Tenant`
-row are inside the seeder's demo block. So the first clinic on a new deployment gets in one of two ways today: seed
-with `SEED_DEMO_TENANTS=true` and edit the invented rows down, or insert the rows directly. This is an open product
-decision (`SEC-03`), stated in `docs/DEPLOYMENT.md` §10 rather than quietly worked around.
+**Adding a tenant is a route now (`ONB-01`).** `POST /api/v1/tenants` creates the clinic *and* the one account that
+owns it, in one transaction, behind `tenancy.manage` — a permission no tenant role holds, so a clinic cannot mint a
+clinic. `POST /api/v1/users` then hires into it behind `users.manage`, which `TenantOwner`, `TenantAdmin` and `Manager`
+have and the three roles that serve patients do not. What is still missing is the rest of a working clinic: nothing on
+that path creates a location, a service, a staff member, a resource or a working week, so a freshly provisioned tenant
+has nothing bookable in it. That gap is `docs/AUDIT-STATUS.md` §3 item 1, and it is why `SEED_DEMO_TENANTS=true` is
+still the way to get a database a reviewer can click through. `SEC-03` stays open for a different reason: whether a
+tenant id is a secret on the anonymous reads.
 
 With `Seed:DemoTenants=true` the seeder adds the scripted demo — three tenants, each with one location, one staff
 member with a working-week, and invented patients:
@@ -253,7 +259,8 @@ member with a working-week, and invented patients:
 | **Pulse Fitness & Performance** (`America/Los_Angeles`) | Gym / Training | 1 location, 2 services, no resource groups, 1 coach Mon–Sat 06:00–18:00, 1 customer. `MinBookingNoticeMinutes=120` |
 
 The demo block is a demonstration of the data model, not a migration tool: it is the reason
-`SEED_DEMO_TENANTS=false` is the default for a client stack, since there is no tenant delete route to undo it with.
+`SEED_DEMO_TENANTS=false` is the default for a client stack, since there is still no tenant delete route to undo it
+with — `PUT /api/v1/tenants/{id}/status` switches a clinic off, which is the supported removal, and the rows stay.
 
 ---
 

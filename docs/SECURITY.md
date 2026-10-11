@@ -36,7 +36,7 @@ Passwords are never stored in plaintext or weak cryptographic hashes (MD5, SHA1)
 
 ### 1.2 Sliding Refresh Token Rotation
 - **The stored value is a digest of the credential, not the credential** (`SEC-05`). `Token` holds the lowercase hex SHA-256 of the string the client presented (`RefreshTokenProtector`), and `ReplacedByToken` holds the digest of its successor. A plain digest is the right construction here and PBKDF2 is not: the input is 64 cryptographically random bytes, so there is nothing to make expensive to guess — salt and iteration count exist for human passwords. 64 hex characters fit the `nvarchar(256)` column and the unique index that already exist, so the change cost no migration. Rows written before it hold the plaintext string: a redemption that misses the digest read looks the presented string up once, serves it, and rewrites the row — including its successor link — as digests on the way out. The table therefore empties of plaintext as sessions are used, instead of every user in the product being logged out on deploy day.
-- **`KEY-01` is the guard on that transition read, and it is two tests, both load-bearing.** No column in this database declares a collation, so every string column — `Token` and `ReplacedByToken` included — carries the database default, measured at runtime as `SQL_Latin1_General_CP1_CI_AS`; SQL Server's `=` also ignores trailing space for character types whatever the collation is. Two consequences, both measured before being fixed: **(1)** the row the string-up read reaches must not already hold a digest. Presenting `SHA-256(wire)` as the refresh token answered `200` and minted a session, which hands back to a table read exactly what digesting the column was added to take away — and it did not drain with the legacy rows, because a digest row is every row this code writes from now on. **(2)** the match must be byte-for-byte, confirmed in code and not left to the database: a case-flipped copy and a space-padded copy of a legacy plaintext credential both answered `200`. What the branch still does, unchanged: redeem a legacy credential exactly as it was issued, and leave it holding digests. `UseCollation(…_CS_AS)` on the two credential columns was measured and rejected — after these two tests no authorization decision reads case (the digest read compares two lowercase-hex values), a collation change would not have touched trailing space, and it would have cost an `ALTER COLUMN` plus a rebuild of `IX_RefreshTokens_Token` for no reachable gain. `Users.Email` stays case-insensitive on purpose: a sign-in address is not an opaque credential, and the `(TenantId, Email)` unique index is the same rule the login box promises.
+- **`KEY-01` is the guard on that transition read, and it is two tests, both load-bearing.** No column in this database declares a collation, so every string column — `Token` and `ReplacedByToken` included — carries the database default, measured at runtime as `SQL_Latin1_General_CP1_CI_AS`; SQL Server's `=` also ignores trailing space for character types whatever the collation is. Two consequences, both measured before being fixed: **(1)** the row the string-up read reaches must not already hold a digest. Presenting `SHA-256(wire)` as the refresh token answered `200` and minted a session, which hands back to a table read exactly what digesting the column was added to take away — and it did not drain with the legacy rows, because a digest row is every row this code writes from now on. **(2)** the match must be byte-for-byte, confirmed in code and not left to the database: a case-flipped copy and a space-padded copy of a legacy plaintext credential both answered `200`. What the branch still does, unchanged: redeem a legacy credential exactly as it was issued, and leave it holding digests. `UseCollation(…_CS_AS)` on the two credential columns was measured and rejected — after these two tests no authorization decision reads case (the digest read compares two lowercase-hex values), a collation change would not have touched trailing space, and it would have cost an `ALTER COLUMN` plus a rebuild of `IX_RefreshTokens_Token` for no reachable gain. `Users.Email` stays case-insensitive on purpose: a sign-in address is not an opaque credential, and since `ONB-01` the index says so server-wide — `IX_Users_Email` is unique over the whole table under that same default collation, so an `INSERT` of `OPS@example.TEST` beside a stored `ops@example.test` is refused (`Msg 2601, Level 14, State 1 … unique index 'IX_Users_Email'`, measured on LocalDB). The older `(TenantId, Email)` index that this replaced left two clinics free to hold one address and left every `TenantId IS NULL` row outside any constraint at all; §2.3 is why that stopped being harmless.
   Two things it left open, named there rather than implied, both now closed: **`SEC-05d`** — the transition branch rewrote a matched row's successor link into a digest before the reuse walk read it, so a replayed *spent legacy* row burned nothing behind it (found by breaking the guard for its own negative control; bounded to the rows the branch can still match) — the rule is the bullet immediately below this one. And **`KEY-02`** — `IdempotencyRecords.Id` carried the same CI collation and held the client's key verbatim, so two keys differing only by case were one promise: measured on the wire, `POST /api/v1/customers` with `Idempotency-Key: KEY-02-PROBE` then `key-02-probe` and a different body answered `201 Created` then `409 Conflict`. That one is closed in §3.4 of `docs/DATABASE.md`, which is where the key's identity lives.
 - Each refresh token redemption generates a new replacement refresh token and revokes the old one, and it writes that successor's digest into the spent row's `ReplacedByToken`. **A spent credential being offered a second time is therefore a signal the table can already answer** (`SEC-05b`): redemption of a row that is revoked and carries a successor now walks those links and revokes every row it reaches before it refuses. The walk runs *through* already-revoked rows rather than stopping at the first one, because that is the only shape the signal arrives in — an honest client has consumed every link behind the copy that came back, so the row the replay points at was revoked before the replay was ever seen, and the live credential sits at the far end of that run of spent rows. A row's original `RevokedAtUtc` is left as the honest client wrote it; only rows that were still live are counted as burned. The step bound (500) is a cycle guard, not a policy threshold: a link points at a row created after it and the digest column is unique-indexed, while seven days of one honest client is on the order of 168 links.
 - **`SEC-05d`: the walk points with the link as the row recorded it, and resolves both forms a link can be in.** Redeeming a legacy row upgrades it, and the upgrade turns its plaintext `ReplacedByToken` into a digest — the right thing for the row and the wrong thing for a pointer, because SHA-256 is not invertible and the successor may be a row no client has presented since the release, still holding the raw value. Starting the walk from the entity's post-upgrade value therefore burned nothing: measured, the replay was refused, the walk found no row, and the thief's next credential stayed live (`Expected counts.Live to be 0 … but found 1 (difference of 1)`). The read now hands the walk the value from before its own rewrite. And because a link is only as current as the row that wrote it, the two halves of one chain can cross the release in opposite directions — a plaintext link naming a row that has since been digested, and a digest link naming one that has not — so each step resolves a plaintext link against both forms. Three facts, one per direction: `LegacyChainBurnTests` (a spent legacy row's plaintext link must burn the plaintext row behind it), `MixedChainBurnTests` (a plaintext link naming an already-upgraded row must burn it too — this one passed before the fix and is kept because it pins the opposite half, and a fix that only walked raw values would break it), `LegacyHeadUpgradeTests` (the replayed head must be left holding digests for both its credential and its link — the leak closure the pointer fix must not undo). Each has its own control, and each fired: dropping the hand-over fails the first, resolving one form fails the second, and removing the link rewrite fails the third by naming the plaintext value still sitting in the column.
@@ -94,14 +94,22 @@ A sign-in mints a seven-day credential and, until this section, nothing counted 
 Rather than hardcoding coarse roles in controller actions (`[Authorize(Roles = "Admin")]`), BooklyHub employs a granular **Permission-Based Authorization System**:
 
 ### 2.1 Role Hierarchy & Permissions
-| Role | Capabilities |
-| :--- | :--- |
-| **`PlatformAdmin`** | System-wide configuration, tenant onboarding, cross-tenant maintenance. |
-| **`TenantOwner`** | Full control over tenant settings, billing, locations, staff, and services. |
-| **`TenantAdmin`** | Manage staff rosters, service pricing, reports, and appointments. |
-| **`Manager`** | Schedule staff shifts, approve refunds, manage reviews. |
-| **`Staff`** | View personal calendar, transition appointment statuses, add customer notes. |
-| **`Receptionist`** | Check in customers, reschedule appointments, collect payments. |
+
+There are seven system roles, not a hierarchy: `Roles.All` is the list, `Permissions.GetDefaultPermissionsForRole`
+is the grant map, and `DatabaseSeeder` writes both as rows on every run (§`DEPLOYMENT.md` §4). The table below is the
+grant map read back out of a running host — `GET /api/v1/roles` on a seeded LocalDB deployment, permission counts
+measured from its response — because a prose description of a role is worth nothing when the database holds the real
+answer.
+
+| Role | Permissions | What that buys, and what it does not |
+| :--- | :--- | :--- |
+| **`PlatformAdmin`** | 27 (`Permissions.All`) | Everything, in every tenant, and the only role that can create one. Not grantable from a tenant-side route (`grantableToATenantAccount: false`). |
+| **`TenantOwner`** | 26 | `All` minus `tenancy.manage`: the clinic's own surface, including `users.read`/`users.manage`. |
+| **`TenantAdmin`** | 26 | The same set. The two roles are distinct names with one grant map today; nothing in the code separates them. |
+| **`Manager`** | 24 | Staffing and scheduling inside the tenant, `users.*` included. No `payments.refund`, no `customers.delete`. |
+| **`Receptionist`** | 15 | Front desk: book, check in, reschedule, cancel, take a payment. No `users.read`, no `audit.read`, no `reports.read`. |
+| **`Staff`** | 10 | Read the roster and the calendar, transition their own appointments. Cannot delete or refund anything. |
+| **`Accountant`** | 5 | `appointments.read`, `payments.read`/`manage`/`refund`, `reports.read`. Seeded, grantable, and the narrowest role in the product. |
 
 ### 2.2 Declarative Permission Attributes
 Controllers use the `[HasPermission]` attribute:
@@ -111,7 +119,52 @@ Controllers use the `[HasPermission]` attribute:
 public async Task<IActionResult> BookAppointment(...)
 ```
 
-The `PermissionAuthorizationHandler` checks the user's combined permissions loaded during authentication or dynamically checked against `RolePermissions`.
+The `PermissionAuthorizationHandler` checks the permissions carried in the caller's claims, which were minted from that grant map at sign-in; a `PlatformAdmin` claim passes every check without consulting them (`PermissionAuthorization.cs:22-26`). That is why a `PlatformAdmin` acting inside a tenant has to send `X-Tenant-Id` like anyone else and is refused without it — the bypass is about *which* claims it ignores, not about which tenant it writes into.
+
+---
+
+### 2.3 Who May Create an Account, and Which Address It May Hold (`ONB-01`)
+
+Before these routes, the only `User` row in a client's database was the one `Seed:AdminPassword` created, and every
+claim in this section was enforced by nobody. The five rules below are what the onboarding surface enforces now, each
+one measured against a host running this build (`docs/DEPLOYMENT.md` §4 walks the sequence, `docs/API.md` §11 documents
+the wire shapes).
+
+**Two gates, because the two acts are different.** `tenancy.manage` puts a clinic on the platform; `users.manage`
+staffs a clinic that exists. The first is held by `PlatformAdmin` and by **no tenant role** — the token a `TenantOwner`
+signs in with carries 26 permissions and `tenancy.manage` is not among them, which is why the owner's own
+`POST /api/v1/tenants` answers `403` rather than minting a second clinic. `users.read` / `users.manage` go to
+`TenantOwner`, `TenantAdmin` and `Manager`, and stay off the three roles that serve patients: a `Receptionist`
+signs in with 15 permissions and reading the account list is not one of them (`403` measured on exactly that token).
+`GET /api/v1/roles` answers the grant table to the caller instead of leaving it in a config file, and carries
+`grantableToATenantAccount` per role — `PlatformAdmin` is the only `false` — so a caller cannot be talked into granting
+a role the server would refuse; asking for one is `422 {"rule":"RoleNotGrantable"}`.
+
+**One address, one account — across the whole server.** A sign-in resolves an email to a single account, so an address
+two tenants hold is an account whose owner is ambiguous, and the ambiguity is decided by whichever row the query planner
+reaches first. That is now a database rule rather than a convention: `IX_Users_Email` is unique and unfiltered
+(`DATABASE.md` §3.5), `POST /api/v1/users` and `POST /api/v1/tenants` both refuse a taken address with
+`422 {"rule":"EmailAlreadyRegistered"}` **before** hashing the password they were given, and the refusal is
+server-wide, not per tenant — measured by provisioning one clinic with an address and having a second clinic's owner
+refused for the same one, with no row written. Being unfiltered is the point and the cost: a soft-deleted account keeps
+owning its address, so the pre-check reads with `IgnoreQueryFilters()` and says "already names an account" instead of
+letting the collision surface as a `DbUpdateException`.
+
+**The race is closed by the index, not by the read.** Four concurrent `POST /api/v1/users` for one fresh address all
+find it free — the password hash in the middle of each write is a tenth of a second of overlap — and the measured
+outcome is exactly one `201`, three `422`, one row, and **no** `5xx`. Remove the index and the three losers throw
+`DbUpdateException` through the exception boundary; remove the collision handler that re-reads after the insert fails
+and the same mutation answers `500` for a collision its own request took part in.
+
+**What a created account cannot be.** No roles (`400`), more than `OnboardingLimits.MaxRolesPerAccount` = 3 roles
+(`400`, naming the bound), the same role twice (`400`). Never a password: no response in this surface echoes
+`PasswordHash`, and two `DOC-03` facts in `DocumentedApiShapeTests` compare the key sets of the documented samples
+against the key sets the actions actually return, so a field added to a DTO without being documented fails the build.
+
+**A caller cannot switch off the account they are signed in with.** `PUT /api/v1/users/{id}/status` is the only writer
+of `User.IsActive`, and `ACT-01` made that column stop both sign-in and refresh. There is no self-service reactivation
+anywhere in this API, so one misclick would be an outage for one person and a helpdesk ticket for whoever has to run
+SQL; `422 {"rule":"CannotDeactivateOwnAccount"}` is the refusal, with the reason in its `detail`.
 
 ---
 

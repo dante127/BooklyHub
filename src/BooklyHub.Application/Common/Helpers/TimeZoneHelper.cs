@@ -31,6 +31,32 @@ public static class TimeZoneHelper
         }
     }
 
+    /// <summary>
+    /// ONB-01: the question <see cref="ResolveTimeZone"/> cannot answer about itself. That method has to return a
+    /// zone, so an id it does not know becomes UTC (<c>:30</c>) — which is right for a reader that must not fall
+    /// over, and wrong as permission to store such an id: a clinic written as <c>Asia/Damascas</c> would answer a
+    /// whole day of slots two hours early, in a response that reports no error anywhere. So every route that
+    /// persists a <c>TimeZoneId</c> asks this first and refuses.
+    ///
+    /// The ladder is deliberately the same three steps <see cref="ResolveTimeZone"/> walks, in the same order: a
+    /// validator that disagrees with the reader is a second opinion nobody needs. Blank is false here and UTC there,
+    /// because "no zone named" is a caller mistake on a write and a tolerated absence on a read.
+    /// </summary>
+    public static bool IsKnownTimeZoneId(string? timeZoneId)
+    {
+        if (string.IsNullOrWhiteSpace(timeZoneId)) return false;
+        if (TimeZoneInfo.TryFindSystemTimeZoneById(timeZoneId, out _)) return true;
+
+        if (TimeZoneInfo.TryConvertIanaIdToWindowsId(timeZoneId, out var windowsId) &&
+            TimeZoneInfo.TryFindSystemTimeZoneById(windowsId, out _))
+        {
+            return true;
+        }
+
+        return TimeZoneInfo.TryConvertWindowsIdToIanaId(timeZoneId, out var ianaId) &&
+               TimeZoneInfo.TryFindSystemTimeZoneById(ianaId, out _);
+    }
+
     public static DateTime ToUtc(DateTime localDateTime, TimeZoneInfo timeZone)
     {
         // Handle invalid time during DST spring forward

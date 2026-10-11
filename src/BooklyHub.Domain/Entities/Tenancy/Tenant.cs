@@ -30,11 +30,19 @@ public class Tenant : AggregateRoot<Guid>, IAuditableEntity, ISoftDeletable
     {
         Id = id;
         Name = name;
-        Slug = slug.ToLowerInvariant().Trim();
+        Slug = NormalizeSlug(slug);
         TimeZoneId = timeZoneId;
         Plan = plan;
         IsActive = true;
     }
+
+    /// <summary>
+    /// ONB-01: the slug a row carries and the slug a duplicate check compares against are one function, because the
+    /// constructor below has always lowercased and trimmed what it was handed while a check written against the raw
+    /// input would not. Two spellings of that rule is how <c>" Apex "</c> becomes a second row that the unique index
+    /// calls a duplicate of <c>"apex"</c> and the route calls free.
+    /// </summary>
+    public static string NormalizeSlug(string slug) => slug.Trim().ToLowerInvariant();
 }
 
 public class TenantSetting : Entity<Guid>, ITenantEntity

@@ -30,14 +30,20 @@ public static class TenantGuard
     /// <summary>
     /// For the one call site whose condition is not the same: the public availability portal takes a tenant from the
     /// request itself as well as from the context, so it can truthfully name three places to put it.
+    ///
+    /// ONB-01: an empty Guid counts as nothing resolved, even though it technically arrived. A signed-in platform
+    /// admin who sends no <c>X-Tenant-Id</c> is given exactly that (<c>TenantResolutionMiddleware.cs:37</c>), so
+    /// before this check a tenant-side write from an admin with no header stored <c>TenantId = 00000000-…</c> — a row
+    /// no tenant's filtered read will ever return, and no route can delete. <see cref="Middlewares.IdempotencyMiddleware"/>
+    /// already reads that value as "no tenant"; this is the same decision on the side that writes rows.
     /// </summary>
     public static Guid RequireId(Guid? resolvedTenantId, string detail)
     {
-        if (!resolvedTenantId.HasValue)
+        if (resolvedTenantId is not { } tenantId || tenantId == Guid.Empty)
         {
             throw new BadHttpRequestException(detail, StatusCodes.Status400BadRequest);
         }
 
-        return resolvedTenantId.Value;
+        return tenantId;
     }
 }

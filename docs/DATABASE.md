@@ -164,12 +164,56 @@ That default is right for most of the schema and wrong in two specific places, s
 
 | Column | What it holds | Case-folding there is |
 | :--- | :--- | :--- |
-| `Users.Email` | A sign-in address a human types | **Desired.** The login box and the `(TenantId, Email)` unique index both promise an address is matched without regard to case. Do not "unify" it with the rows below. |
+| `Users.Email` | A sign-in address a human types | **Desired.** The login box and `IX_Users_Email` (§3.5) both promise an address is matched without regard to case. Do not "unify" it with the rows below. |
 | `RefreshTokens.Token`, `ReplacedByToken` | An opaque credential, or its digest | **Wrong.** Two values differing only by case are the *same* value to `=`, and the unique index refuses them as one row (measured: `Cannot insert duplicate key row in object 'dbo.RefreshTokens' with unique index 'IX_RefreshTokens_Token'`). The identity of a credential is the string that was issued, byte for byte — enforced in code (`KEY-01`, `docs/SECURITY.md` §1.2) rather than by an `ALTER COLUMN` plus an index rebuild, because after that guard no authorization decision reads case, and a collation change would not have touched trailing space either. |
 | `IdempotencyRecords.Id` | A SHA-256 digest of `{tenant}:{client key}`, lowercase hex | **Was wrong, now closed (`KEY-02`).** A client-chosen identifier whose case the client controls, and it is a **primary key**, so folding was not one loose comparison but the whole replay promise. Measured on the wire before the fix: `Idempotency-Key: KEY-02-PROBE` then `key-02-probe` with a different body → `201 Created`, then `409 Conflict {"detail":"This Idempotency-Key was already used for a different request."}` — a second, legitimate request was refused by a key it had never sent. The column is `nvarchar(256)`, so the digest fits it as-is and no migration is needed; the middleware's cache key is derived from the same function, which is the first time the cache path (ordinal) and the SQL path (case-insensitive) agreed. |
 | `Appointments.IdempotencyKey`, `Payments.IdempotencyKey` | The client key, kept verbatim on the row it bought | **Wrong for the equality, right for the column.** Both are non-unique indexes, and the verbatim string is what makes a row auditable against a client's own logs, so the fix here is the comparison, not the storage: the handlers still read the candidate set by SQL (`KEY-02`) and then confirm `IdempotencyIdentity.SameKey` byte for byte in C#. Measured before that guard: a key sent with flipped case reached the booking handler's "this key already booked something" read, matched the first booking, and answered `422 {"rule":"IdempotencyKeyReused"}` — and on the payment door the flipped charge inherited the *other* amount's receipt (`200` with `"amount":40.00` for a `70.00` request). A row written before the digest existed is still answered by the retry that wrote it, because the verbatim key round-trips. |
 
 Note that trailing space is folded by `=` for character types whatever the collation is (`SELECT CASE WHEN N'AbC' = N'AbC   ' THEN 1 END` is `1` on this database), so a case-sensitive collation alone would not have made any of these comparisons byte-exact. `IdempotencyMiddleware` `Trim()`s the header, which is why a padded key was never a third live case on the wire — but the replay store's identity no longer depends on that: a digest is over exact bytes, so `"KEY"` and `"KEY "` are two different rows there even if a client ever stopped trimming. `SameKey` is ordinal for the same reason.
+
+### 3.5 Identity Indexing: One Address, One Account (`ONB-01`)
+| Index Name | Columns | Purpose |
+| :--- | :--- | :--- |
+| `IX_Users_Email` | `(Email)` **UNIQUE**, no filter | A sign-in resolves an address to one account across the whole server (`AuthController.cs:342`), which is the promise this index enforces and the route relies on. |
+| `IX_Tenants_Slug` | `(Slug)` **UNIQUE**, no filter | Predates this change (`20260923065132_InitialCreate.cs:1177-1181`). Because it carries no filter, a soft-deleted tenant keeps owning its slug — which is why `POST /api/v1/tenants` checks with `IgnoreQueryFilters()` and says "including any tenant that has been deleted". |
+
+What `IX_Users_Email` replaced, and why the old shape was not the rule:
+
+```sql
+-- dropped by 20261011070449_MakeUserEmailUniqueServerWide
+CREATE UNIQUE INDEX [IX_Users_TenantId_Email] ON [Users] ([TenantId], [Email]) WHERE [TenantId] IS NOT NULL;
+```
+
+Two defects in one statement (`20260923065132_InitialCreate.cs:1194-1199`): the key let two clinics hold the same
+address, and the filter left every `TenantId IS NULL` row — the platform administrator's half of the table — inside no
+constraint at all. Neither half was reachable while no route could create an account; both became reachable the day
+`POST /api/v1/users` existed.
+
+The index is deliberately **not** filtered on `IsDeleted`, so a soft-deleted account keeps owning its address. That is
+the same choice `IX_Tenants_Slug` already makes, and the consequence is stated rather than hidden: `RequireEmailFreeAsync`
+reads with `IgnoreQueryFilters()` so the pre-check agrees with the index, and the caller gets
+`422 {"rule":"EmailAlreadyRegistered"}` for a deleted row instead of the collision arriving as the race wording — or,
+before that read was widened, as a `DbUpdateException`. There is no route that soft-deletes a `User`, so the state
+arrives from a hand-written `UPDATE`; `AnAddressHeldByADeletedAccount_MustBeRefusedRatherThanTaken` pins it anyway.
+
+**A deployment that already holds a duplicated address cannot apply this migration, and the failure is total rather
+than partial.** Measured on LocalDB by generating this build's SQL (`dotnet ef migrations script
+20261006081209_CoverHolidayCalendarRead 20261011070449_MakeUserEmailUniqueServerWide`) and running it against a schema
+carrying the pair — one row with `TenantId NULL` and one in a tenant, both `shared@clinic.test`, which the old filtered
+index let coexist:
+
+```
+Msg 1505, Level 16, State 1
+The CREATE UNIQUE INDEX statement terminated because a duplicate key was found for the object name 'dbo.Users'
+and the index name 'IX_Users_Email'. The duplicate key value is (shared@clinic.test).
+The statement has been terminated.
+```
+
+Because the script wraps the migration in `BEGIN TRANSACTION` … `COMMIT`, the `DROP INDEX` and the history insert roll
+back with it. After the failure the table still carries `IX_Users_TenantId_Email` and **no** `IX_Users_Email`, and
+`__EFMigrationsHistory` holds no row for `20261011070449` — the database stays at the previous build rather than
+half-applying. Deleting one of the two rows and re-running the same script applies it cleanly: `IX_Users_Email`
+present, history advanced. The pre-deploy check that finds such a pair is in `DEPLOYMENT.md` §4.
 
 ---
 

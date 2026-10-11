@@ -96,7 +96,10 @@ public sealed class ProductionSeedTests : IAsyncLifetime
         counts["staff"].Should().Be(0);
         counts["customers"].Should().Be(0, "invented patients in a live database are somebody's data, not fixture data");
 
-        counts["roles"].Should().Be(5, "the five system roles are what a sign-in is authorized against");
+        counts["roles"].Should().Be(7,
+            "ONB-01: every name in Roles.All has to be a row, because granting an account a role the database never " +
+            "wrote is a refusal the operator cannot read out of a config file — and the two roles this run started " +
+            "writing (Manager, Accountant) are named by the product's own permission map");
         counts["permissions"].Should().Be(Permissions.All.Count,
             "the role-to-permission rows the seeder writes reference these by id, so a partial permission set " +
             "would leave a role that grants less than the product says it does");
@@ -126,7 +129,7 @@ public sealed class ProductionSeedTests : IAsyncLifetime
         var counts = await CountsAsync();
 
         counts["tenants"].Should().Be(0, "an unset key has to mean the safe half, not the scripted half");
-        counts["roles"].Should().Be(5);
+        counts["roles"].Should().Be(7);
         counts["users"].Should().Be(1);
     }
 
@@ -195,5 +198,78 @@ public sealed class ProductionSeedTests : IAsyncLifetime
         counts["roles"].Should().Be(0, "refusing has to happen before the first write, or the refused run leaves a half-seeded database");
         counts["permissions"].Should().Be(0);
         counts["users"].Should().Be(0);
+    }
+
+    [Fact]
+    public async Task EveryRoleTheCodeNames_MustBeSeededWithExactlyItsPermissions()
+    {
+        await SeedAsync(SeedConfiguration(new Dictionary<string, string?> { ["Seed:DemoTenants"] = "false" }));
+
+        using var scope = _factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+        foreach (var roleName in Roles.All)
+        {
+            var granted = await db.RolePermissions.IgnoreQueryFilters()
+                .Where(rp => rp.Role!.Name == roleName)
+                .Select(rp => rp.PermissionId)
+                .ToListAsync();
+
+            granted.Should().BeEquivalentTo(Permissions.GetDefaultPermissionsForRole(roleName),
+                $"the seeder used to hand grants to three roles and leave the rest as bare rows, which is how a " +
+                $"Receptionist signed in holding nothing — and a receptionist is the first account ONB-01's " +
+                $"onboarding route gets asked to create for a client");
+        }
+    }
+
+    [Fact]
+    public async Task ADatabaseWrittenByThePreviousBuild_MustGainTheMissingReferenceRowsOnTheNextRun()
+    {
+        await SeedAsync(SeedConfiguration(new Dictionary<string, string?> { ["Seed:DemoTenants"] = "false" }));
+
+        // ONB-01 ships into deployments that are already running, and the reference pass is the only thing that can
+        // reach them: a client's database was written by a build that had no `users.*` permission and no Manager,
+        // Accountant or Receptionist grant. Deleting those rows is the faithful simulation — the seeder cannot tell
+        // them apart from a database that never had them, and that is the point.
+        var accountPermissions = new[] { Permissions.Users.Read, Permissions.Users.Manage };
+        var rebuiltRoles = new[] { Roles.Manager, Roles.Accountant, Roles.Receptionist };
+
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            var roleIds = await db.Roles.IgnoreQueryFilters()
+                .Where(r => rebuiltRoles.Contains(r.Name))
+                .Select(r => r.Id)
+                .ToListAsync();
+
+            await db.Roles.IgnoreQueryFilters().Where(r => roleIds.Contains(r.Id)).ExecuteDeleteAsync();
+            await db.Permissions.IgnoreQueryFilters().Where(p => accountPermissions.Contains(p.Id)).ExecuteDeleteAsync();
+
+            (await db.Roles.IgnoreQueryFilters().CountAsync()).Should().Be(4,
+                "the deletion has to actually leave a pre-ONB-01 shape, or this fact passes by accident");
+            (await db.Permissions.IgnoreQueryFilters().CountAsync()).Should().Be(Permissions.All.Count - 2);
+        }
+
+        await SeedAsync(SeedConfiguration(new Dictionary<string, string?> { ["Seed:DemoTenants"] = "false" }));
+
+        using var after = _factory.Services.CreateScope();
+        var dbAfter = after.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+        (await dbAfter.Permissions.IgnoreQueryFilters().CountAsync()).Should().Be(Permissions.All.Count,
+            "a permission that exists only in the code authorizes nothing: the accounts route reads its grant " +
+            "out of this table, so an existing deployment has to acquire the row on the boot after the upgrade");
+        foreach (var roleName in Roles.All)
+        {
+            var granted = await dbAfter.RolePermissions.IgnoreQueryFilters()
+                .Where(rp => rp.Role!.Name == roleName)
+                .Select(rp => rp.PermissionId)
+                .ToListAsync();
+            granted.Should().BeEquivalentTo(Permissions.GetDefaultPermissionsForRole(roleName),
+                $"and the roles the run re-created have to come back with their grants, not as bare rows");
+        }
+
+        (await dbAfter.Users.IgnoreQueryFilters().CountAsync()).Should().Be(1,
+            "convergence touches reference data only — the operator's administrator is not recreated, and a run " +
+            "that wrote a second one would be a run that changes who can sign in");
     }
 }

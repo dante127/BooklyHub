@@ -63,7 +63,14 @@ public class IdentityConfigurations :
         builder.Property(u => u.LastName).HasMaxLength(100).IsRequired();
         builder.Property(u => u.PasswordHash).IsRequired();
 
-        builder.HasIndex(u => new { u.TenantId, u.Email }).IsUnique();
+        // ONB-01: an address identifies an account across the whole server, not inside one tenant. Sign-in reads
+        // `Users` by `Email` alone (AuthController's credential lookup), and `User` is not an `ITenantEntity`, so it
+        // carries no tenant query filter — nothing in the read path ever narrows that lookup to the caller's tenant.
+        // The old `(TenantId, Email)` unique index allowed two clinics to hold the same address, and the day they
+        // did, the login read stopped being a single row. Enforcing it here is what lets CreateAccountCommand answer
+        // "this email belongs to somebody" rather than "I hope not". A deployment that already contains a duplicated
+        // address cannot apply this index: SQL Server refuses the CREATE, so DEPLOYMENT.md documents the check.
+        builder.HasIndex(u => u.Email).IsUnique();
     }
 
     public void Configure(EntityTypeBuilder<Role> builder)

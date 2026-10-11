@@ -84,6 +84,17 @@ public static class Permissions
         public const string Read = "audit.read";
     }
 
+    /// <summary>
+    /// ONB-01: the accounts of one tenant. <c>Tenancy.Manage</c> stays platform-only — it is the right gate for
+    /// creating a clinic and the wrong one for hiring its receptionist, because a tenant owner holds every other
+    /// permission in this file and none of them says "this table of logins is mine to staff".
+    /// </summary>
+    public static class Users
+    {
+        public const string Read = "users.read";
+        public const string Manage = "users.manage";
+    }
+
     public static class Tenancy
     {
         public const string Manage = "tenancy.manage";
@@ -100,6 +111,7 @@ public static class Permissions
         Resources.Read, Resources.Manage,
         Payments.Read, Payments.Manage, Payments.Refund,
         Reports.Read,
+        Users.Read, Users.Manage,
         Audit.Read,
         Tenancy.Manage
     ];
@@ -121,6 +133,7 @@ public static class Permissions
                 Schedules.Read, Schedules.Manage,
                 Resources.Read, Resources.Manage,
                 Payments.Read, Payments.Manage,
+                Users.Read, Users.Manage,
                 Reports.Read, Audit.Read
             ],
             Roles.Staff =>
